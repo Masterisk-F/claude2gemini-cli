@@ -109,41 +109,137 @@ function sendMessageEnd(res: Response, outputTokens: number): void {
  * Gemini の sendStream() ストリームを Claude SSE イベントに変換して送信する
  */
 export async function streamGeminiToClaudeSSE(
-  geminiStream: AsyncGenerator<{ type: string; value?: unknown }>,
+  geminiStream: AsyncGenerator<{ type: string; value?: any }>,
   res: Response,
   model: string,
+  toolState: any,
+  sessionId: string,
+  sessionStore: any
 ): Promise<void> {
   const messageId = `msg_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
-  let blockStarted = false;
-  const blockIndex = 0;
+  let blockIndex = 0;
 
   // message_start を送信
   sendMessageStart(res, messageId, model);
-
-  // ping を送信
   sendSSE(res, 'ping', { type: 'ping' });
 
-  for await (const chunk of geminiStream) {
+  // ツール実行待ちを判定するための Promise
+  let isToolTurnReached = false;
+  let turnPromiseResolve: () => void;
+  const turnPromise = new Promise<void>((resolve) => {
+    turnPromiseResolve = resolve;
+  });
+  toolState.resolveToolTurn = () => {
+    isToolTurnReached = true;
+    turnPromiseResolve();
+  };
+
+  const sessionData = sessionStore.getOrCreateSession(sessionId);
+  let nextPromise = sessionData.pendingNext || geminiStream.next();
+  sessionData.pendingNext = undefined;
+
+  let textBlockStarted = false;
+  let hasProducedAnyBlock = false;
+  let stopReason: string = 'end_turn';
+
+  while (true) {
+    if (isToolTurnReached) {
+      sessionData.pendingNext = nextPromise;
+      break;
+    }
+
+    const result = await Promise.race([nextPromise, turnPromise.then(() => 'TURN_ENDED')]);
+
+    if (result === 'TURN_ENDED') {
+      sessionData.pendingNext = nextPromise;
+      break;
+    }
+
+    const iter = result as IteratorResult<any>;
+    if (iter.done) {
+      sessionStore.deleteSession(sessionId);
+      break;
+    }
+
+    const chunk = iter.value;
+
     if (chunk.type === 'content' && chunk.value) {
-      // 最初のコンテンツでブロック開始
-      if (!blockStarted) {
+      if (!textBlockStarted) {
         sendContentBlockStart(res, blockIndex);
-        blockStarted = true;
+        textBlockStarted = true;
+        hasProducedAnyBlock = true;
       }
       sendTextDelta(res, blockIndex, chunk.value as string);
+    } else if (chunk.type === 'tool_call_request') {
+      if (textBlockStarted) {
+        sendContentBlockStop(res, blockIndex);
+        blockIndex++;
+        textBlockStarted = false;
+      }
+
+      const callInfo = chunk.value;
+      const callId = callInfo.callId;
+      const name = callInfo.name;
+
+      let q = toolState.callIds.get(name);
+      if (!q) {
+        q = [];
+        toolState.callIds.set(name, q);
+      }
+      q.push(callId);
+
+      let parsedArgs: Record<string, unknown> = {};
+      if (typeof callInfo.args === 'string') {
+        try {
+          parsedArgs = JSON.parse(callInfo.args);
+        } catch (e) {}
+      } else if (callInfo.args && typeof callInfo.args === 'object') {
+        parsedArgs = callInfo.args;
+      }
+
+      // SSE tool_use events
+      sendSSE(res, 'content_block_start', {
+        type: 'content_block_start',
+        index: blockIndex,
+        content_block: {
+          type: 'tool_use',
+          id: callId,
+          name: name,
+          input: {},
+        },
+      });
+
+      sendSSE(res, 'content_block_delta', {
+        type: 'content_block_delta',
+        index: blockIndex,
+        delta: {
+          type: 'input_json_delta',
+          partial_json: JSON.stringify(parsedArgs),
+        },
+      });
+
+      sendContentBlockStop(res, blockIndex);
+      blockIndex++;
+      hasProducedAnyBlock = true;
+      stopReason = 'tool_use';
     }
+
+    nextPromise = geminiStream.next();
   }
 
-  // ブロックが開始されていた場合は閉じる
-  if (blockStarted) {
+  if (textBlockStarted) {
     sendContentBlockStop(res, blockIndex);
-  } else {
-    // テキストが一切なかった場合でも空のブロックを送信
+  } else if (!hasProducedAnyBlock) {
     sendContentBlockStart(res, blockIndex);
     sendContentBlockStop(res, blockIndex);
   }
 
   // メッセージ完了
-  sendMessageEnd(res, 0);
+  sendSSE(res, 'message_delta', {
+    type: 'message_delta',
+    delta: { stop_reason: stopReason, stop_sequence: null },
+    usage: { output_tokens: 0 },
+  });
+  sendSSE(res, 'message_stop', { type: 'message_stop' });
   res.end();
 }

@@ -173,11 +173,22 @@ export async function sendPromptAndCollect(
       }
       q.push(callId);
 
+      let parsedArgs: Record<string, unknown> = {};
+      if (typeof callInfo.args === 'string') {
+        try {
+          parsedArgs = JSON.parse(callInfo.args);
+        } catch (e) {
+          console.warn(`Failed to parse args for ${name}`, callInfo.args);
+        }
+      } else if (callInfo.args && typeof callInfo.args === 'object') {
+        parsedArgs = callInfo.args as Record<string, unknown>;
+      }
+
       toolCalls.push({
         type: 'tool_use',
         id: callId,
         name: name,
-        input: callInfo.args as Record<string, unknown>,
+        input: parsedArgs,
       });
     }
 

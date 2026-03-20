@@ -19,6 +19,8 @@ export const messagesRouter = Router();
 messagesRouter.post('/', async (req: Request, res: Response) => {
   try {
     const body = req.body as ClaudeRequest;
+    console.log(`\n[POST /v1/messages] model=${body.model}, stream=${body.stream}, messagesCount=${body.messages?.length}, systemLen=${JSON.stringify(body.system)?.length}`);
+    console.log(`[Payload Size] approx ${JSON.stringify(body).length} bytes`);
 
     // 最小限のバリデーション
     if (!body.messages || !Array.isArray(body.messages) || body.messages.length === 0) {
@@ -81,14 +83,14 @@ messagesRouter.post('/', async (req: Request, res: Response) => {
       // ストリーミングモード: SSE で返す
       setupSSEHeaders(res);
 
-      const { stream } = sendPromptStream(prompt, {
+      const { stream, toolState, sessionId: newSessionId } = sendPromptStream(prompt, {
         sessionId,
         instructions: systemPrompt,
         model: body.model,
         tools: body.tools,
       });
 
-      await streamGeminiToClaudeSSE(stream, res, body.model);
+      await streamGeminiToClaudeSSE(stream, res, body.model, toolState, newSessionId, sessionStore);
     } else {
       // 非ストリーミングモード
       const result = await sendPromptAndCollect(prompt, {

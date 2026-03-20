@@ -40,6 +40,17 @@ export function convertMessagesToPrompt(messages: ClaudeMessage[]): string {
 /**
  * Claude の system パラメータを抽出する
  */
-export function extractSystemPrompt(system?: string): string | undefined {
-  return system;
+export function extractSystemPrompt(system?: any): string | undefined {
+  if (!system) return undefined;
+  if (typeof system === 'string') return system;
+  if (Array.isArray(system)) {
+    return system
+      .map((block) => {
+        if (typeof block === 'string') return block;
+        if (block?.type === 'text' && typeof block.text === 'string') return block.text;
+        return JSON.stringify(block);
+      })
+      .join('\n');
+  }
+  return String(system);
 }
