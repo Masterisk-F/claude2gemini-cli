@@ -10,7 +10,8 @@ import { Router, type Request, type Response } from 'express';
 import type { ClaudeRequest } from '../types.js';
 import { convertMessagesToPrompt, extractSystemPrompt } from '../converters/request.js';
 import { buildClaudeResponse } from '../converters/response.js';
-import { sendPromptAndCollect } from '../gemini-backend.js';
+import { setupSSEHeaders, streamGeminiToClaudeSSE } from '../converters/stream.js';
+import { sendPromptAndCollect, sendPromptStream } from '../gemini-backend.js';
 
 export const messagesRouter = Router();
 
@@ -24,7 +25,7 @@ messagesRouter.post('/', async (req: Request, res: Response) => {
         type: 'error',
         error: {
           type: 'invalid_request_error',
-          message: 'messages は必須です',
+          message: 'messages is required',
         },
       });
       return;
@@ -35,7 +36,7 @@ messagesRouter.post('/', async (req: Request, res: Response) => {
         type: 'error',
         error: {
           type: 'invalid_request_error',
-          message: 'max_tokens は必須です',
+          message: 'max_tokens is required',
         },
       });
       return;
@@ -45,35 +46,40 @@ messagesRouter.post('/', async (req: Request, res: Response) => {
     const prompt = convertMessagesToPrompt(body.messages);
     const systemPrompt = extractSystemPrompt(body.system);
 
-    // ストリーミングモードは後のフェーズで対応
     if (body.stream) {
-      res.status(501).json({
+      // ストリーミングモード: SSE で返す
+      setupSSEHeaders(res);
+
+      const { stream } = sendPromptStream(prompt, {
+        instructions: systemPrompt,
+        model: body.model,
+      });
+
+      await streamGeminiToClaudeSSE(stream, res, body.model);
+    } else {
+      // 非ストリーミングモード
+      const responseText = await sendPromptAndCollect(prompt, {
+        instructions: systemPrompt,
+        model: body.model,
+      });
+
+      const claudeResponse = buildClaudeResponse(responseText, body.model);
+      res.json(claudeResponse);
+    }
+  } catch (error) {
+    console.error('Error processing request:', error);
+    // ストリーミング中のエラーは SSE として送れないが、ヘッダ未送信時は JSON で返す
+    if (!res.headersSent) {
+      res.status(500).json({
         type: 'error',
         error: {
           type: 'api_error',
-          message: 'ストリーミングはまだ実装されていません',
+          message: error instanceof Error ? error.message : 'Internal server error',
         },
       });
-      return;
+    } else {
+      res.end();
     }
-
-    // Gemini に送信してレスポンスを収集
-    const responseText = await sendPromptAndCollect(prompt, {
-      instructions: systemPrompt,
-      model: body.model,
-    });
-
-    // Claude API 形式でレスポンスを返す
-    const claudeResponse = buildClaudeResponse(responseText, body.model);
-    res.json(claudeResponse);
-  } catch (error) {
-    console.error('Error processing request:', error);
-    res.status(500).json({
-      type: 'error',
-      error: {
-        type: 'api_error',
-        message: error instanceof Error ? error.message : 'Internal server error',
-      },
-    });
   }
 });
+

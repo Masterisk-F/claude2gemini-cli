@@ -6,8 +6,7 @@
  */
 
 import { GeminiCliAgent } from '@google/gemini-cli-sdk';
-
-let agentInstance: GeminiCliAgent | null = null;
+import type { GeminiCliSession } from '@google/gemini-cli-sdk';
 
 export interface GeminiBackendOptions {
   instructions?: string;
@@ -16,17 +15,27 @@ export interface GeminiBackendOptions {
 }
 
 /**
- * GeminiCliAgent のシングルトンインスタンスを取得する。
- * instructions が変わった場合は再生成する。
+ * GeminiCliAgent を作成する
  */
-function getAgent(options: GeminiBackendOptions): GeminiCliAgent {
-  // 毎回新しい agent を作成（system prompt が変わる可能性があるため）
-  agentInstance = new GeminiCliAgent({
+function createAgent(options: GeminiBackendOptions): GeminiCliAgent {
+  return new GeminiCliAgent({
     instructions: options.instructions || 'You are a helpful assistant.',
     model: options.model,
     cwd: options.cwd || process.cwd(),
   });
-  return agentInstance;
+}
+
+/**
+ * Gemini にプロンプトを送信し、ストリームを直接返す（ストリーミング用）
+ */
+export function sendPromptStream(
+  prompt: string,
+  options: GeminiBackendOptions = {},
+): { stream: ReturnType<GeminiCliSession['sendStream']> } {
+  const agent = createAgent(options);
+  const session = agent.session();
+  const stream = session.sendStream(prompt);
+  return { stream };
 }
 
 /**
@@ -36,9 +45,7 @@ export async function sendPromptAndCollect(
   prompt: string,
   options: GeminiBackendOptions = {},
 ): Promise<string> {
-  const agent = getAgent(options);
-  const session = agent.session();
-  const stream = session.sendStream(prompt);
+  const { stream } = sendPromptStream(prompt, options);
 
   let fullText = '';
   for await (const chunk of stream) {
@@ -50,3 +57,4 @@ export async function sendPromptAndCollect(
 
   return fullText;
 }
+
