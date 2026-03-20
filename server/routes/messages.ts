@@ -12,6 +12,7 @@ import { convertMessagesToPrompt, extractSystemPrompt } from '../converters/requ
 import { buildClaudeResponse } from '../converters/response.js';
 import { setupSSEHeaders, streamGeminiToClaudeSSE } from '../converters/stream.js';
 import { sendPromptAndCollect, sendPromptStream } from '../gemini-backend.js';
+import { sessionStore } from '../session-store.js';
 
 export const messagesRouter = Router();
 
@@ -42,8 +43,38 @@ messagesRouter.post('/', async (req: Request, res: Response) => {
       return;
     }
 
-    // Claude メッセージ → Gemini プロンプト変換
-    const prompt = convertMessagesToPrompt(body.messages);
+    // tool_result のチェック（セッション再開用）
+    let sessionId: string | undefined = undefined;
+    const lastMessage = body.messages[body.messages.length - 1];
+    
+    if (lastMessage.role === 'user' && Array.isArray(lastMessage.content)) {
+      const toolResults = lastMessage.content.filter(
+        (b) => b.type === 'tool_result'
+      ) as Extract<typeof lastMessage.content[number], { type: 'tool_result' }>[];
+      
+      if (toolResults.length > 0) {
+        for (const tr of toolResults) {
+          const resolvedSessionId = sessionStore.resolveToolCall(tr.tool_use_id, tr.content);
+          if (resolvedSessionId) {
+            sessionId = resolvedSessionId;
+          }
+        }
+        
+        if (!sessionId) {
+          res.status(400).json({
+            type: 'error',
+            error: {
+              type: 'invalid_request_error',
+              message: 'Invalid tool_use_id or session expired',
+            },
+          });
+          return;
+        }
+      }
+    }
+
+    // Claude メッセージ → Gemini プロンプト変換 (tool_result 返却時は空文字でよい)
+    const prompt = sessionId ? '' : convertMessagesToPrompt(body.messages);
     const systemPrompt = extractSystemPrompt(body.system);
 
     if (body.stream) {
@@ -51,19 +82,27 @@ messagesRouter.post('/', async (req: Request, res: Response) => {
       setupSSEHeaders(res);
 
       const { stream } = sendPromptStream(prompt, {
+        sessionId,
         instructions: systemPrompt,
         model: body.model,
+        tools: body.tools,
       });
 
       await streamGeminiToClaudeSSE(stream, res, body.model);
     } else {
       // 非ストリーミングモード
-      const responseText = await sendPromptAndCollect(prompt, {
+      const result = await sendPromptAndCollect(prompt, {
+        sessionId,
         instructions: systemPrompt,
         model: body.model,
+        tools: body.tools,
       });
 
-      const claudeResponse = buildClaudeResponse(responseText, body.model);
+      const claudeResponse = buildClaudeResponse({
+        text: result.text,
+        model: body.model,
+        toolCalls: result.toolCalls,
+      });
       res.json(claudeResponse);
     }
   } catch (error) {

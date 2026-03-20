@@ -6,27 +6,41 @@
  */
 
 import { randomUUID } from 'node:crypto';
-import type { ClaudeResponse } from '../types.js';
+import type { ClaudeContentBlock, ClaudeResponse, ClaudeStopReason, ClaudeToolUseBlock } from '../types.js';
+
+export interface BuildResponseOptions {
+  text: string;
+  model: string;
+  toolCalls?: ClaudeToolUseBlock[];
+}
 
 /**
- * 蓄積したテキストから Claude API レスポンスを構築する
+ * 蓄積したテキストとツール呼び出しから Claude API レスポンスを構築する
  */
-export function buildClaudeResponse(
-  text: string,
-  model: string,
-): ClaudeResponse {
+export function buildClaudeResponse(options: BuildResponseOptions): ClaudeResponse {
+  const content: ClaudeContentBlock[] = [];
+
+  if (options.text) {
+    content.push({
+      type: 'text',
+      text: options.text,
+    });
+  }
+
+  let stopReason: ClaudeStopReason = 'end_turn';
+
+  if (options.toolCalls && options.toolCalls.length > 0) {
+    content.push(...options.toolCalls);
+    stopReason = 'tool_use';
+  }
+
   return {
     id: `msg_${randomUUID().replace(/-/g, '').slice(0, 24)}`,
     type: 'message',
     role: 'assistant',
-    content: [
-      {
-        type: 'text',
-        text,
-      },
-    ],
-    model,
-    stop_reason: 'end_turn',
+    content,
+    model: options.model,
+    stop_reason: stopReason,
     stop_sequence: null,
     usage: {
       input_tokens: 0,
