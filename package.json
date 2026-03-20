@@ -1,0 +1,25 @@
+{
+  "name": "claude2gemini-cli",
+  "version": "0.1.0",
+  "description": "Claude API compatible proxy backed by Gemini CLI SDK",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx server/index.ts",
+    "build": "tsc",
+    "start": "node dist/server/index.js"
+  },
+  "dependencies": {
+    "@google/gemini-cli-sdk": "file:./gemini-cli/packages/sdk",
+    "express": "^5.1.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.0.0",
+    "tsx": "^4.20.3",
+    "typescript": "^5.3.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

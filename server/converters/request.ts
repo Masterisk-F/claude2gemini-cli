@@ -1,0 +1,45 @@
+/**
+ * Claude メッセージ → Gemini プロンプト変換
+ *
+ * Claude の messages 配列からテキストコンテンツを抽出し、
+ * Gemini SDK に渡すプロンプト文字列に変換する。
+ */
+
+import type { ClaudeMessage, ClaudeContentBlock } from '../types.js';
+
+/**
+ * ClaudeMessage の content からテキスト部分を抽出する
+ */
+function extractTextFromContent(content: string | ClaudeContentBlock[]): string {
+  if (typeof content === 'string') {
+    return content;
+  }
+  return content
+    .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
+    .map(block => block.text)
+    .join('\n');
+}
+
+/**
+ * Claude messages 配列から最後のユーザーメッセージのテキストを抽出する。
+ * Gemini SDK の sendStream() は単一のプロンプト文字列を受け取るため、
+ * 最後の user メッセージのみを使用する。
+ *
+ * マルチターン対応はフェーズ6で実装する。
+ */
+export function convertMessagesToPrompt(messages: ClaudeMessage[]): string {
+  // 最後の user メッセージを取得
+  const lastUserMessage = [...messages].reverse().find(m => m.role === 'user');
+  if (!lastUserMessage) {
+    throw new Error('messages に user ロールのメッセージが含まれていません');
+  }
+
+  return extractTextFromContent(lastUserMessage.content);
+}
+
+/**
+ * Claude の system パラメータを抽出する
+ */
+export function extractSystemPrompt(system?: string): string | undefined {
+  return system;
+}
