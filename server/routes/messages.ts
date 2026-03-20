@@ -90,7 +90,8 @@ messagesRouter.post('/', async (req: Request, res: Response) => {
         tools: body.tools,
       });
 
-      await streamGeminiToClaudeSSE(stream, res, body.model, toolState, newSessionId, sessionStore);
+      const allowedToolNames = body.tools?.map((t) => t.name) || [];
+      await streamGeminiToClaudeSSE(stream, res, body.model, toolState, newSessionId, sessionStore, allowedToolNames);
     } else {
       // 非ストリーミングモード
       const result = await sendPromptAndCollect(prompt, {

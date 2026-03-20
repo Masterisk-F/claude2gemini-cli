@@ -114,7 +114,8 @@ export async function streamGeminiToClaudeSSE(
   model: string,
   toolState: any,
   sessionId: string,
-  sessionStore: any
+  sessionStore: any,
+  allowedToolNames: string[]
 ): Promise<void> {
   const messageId = `msg_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
   let blockIndex = 0;
@@ -171,15 +172,21 @@ export async function streamGeminiToClaudeSSE(
       }
       sendTextDelta(res, blockIndex, chunk.value as string);
     } else if (chunk.type === 'tool_call_request') {
+      const callInfo = chunk.value;
+      const callId = callInfo.callId;
+      const name = callInfo.name;
+
+      if (!allowedToolNames.includes(name)) {
+        // 組み込みツールはクライアントに返さず、内部の処理を続行させる
+        nextPromise = geminiStream.next();
+        continue;
+      }
+
       if (textBlockStarted) {
         sendContentBlockStop(res, blockIndex);
         blockIndex++;
         textBlockStarted = false;
       }
-
-      const callInfo = chunk.value;
-      const callId = callInfo.callId;
-      const name = callInfo.name;
 
       let q = toolState.callIds.get(name);
       if (!q) {

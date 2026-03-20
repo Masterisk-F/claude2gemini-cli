@@ -165,6 +165,13 @@ export async function sendPromptAndCollect(
       const callId = callInfo.callId;
       const name = callInfo.name;
 
+      const allowedToolNames = options.tools?.map((t) => t.name) || [];
+      if (!allowedToolNames.includes(name)) {
+        // 組み込みツールはクライアントに返さず、内部処理に任せる
+        nextPromise = stream.next();
+        continue;
+      }
+
       // Queue for action()
       let q = toolState.callIds.get(name);
       if (!q) {
