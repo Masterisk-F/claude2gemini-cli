@@ -23,6 +23,8 @@ export interface GeminiBackendOptions {
 export interface ToolState {
   callIds: Map<string, string[]>;
   resolveToolTurn?: () => void;
+  expectedClientTools: number;
+  registeredClientTools: number;
 }
 
 /**
@@ -42,9 +44,6 @@ function createAgent(options: GeminiBackendOptions, toolState: ToolState, sessio
         const callId = callIds?.shift();
         if (!callId) throw new Error(`callId not found for tool ${t.name}`);
 
-        // ツール実行フェーズに到達したことを通知
-        if (toolState.resolveToolTurn) toolState.resolveToolTurn();
-
         // クライアントからの tool_result 待ち
         return new Promise((resolve, reject) => {
           sessionStore.addPendingToolCall(sessionId, {
@@ -54,6 +53,12 @@ function createAgent(options: GeminiBackendOptions, toolState: ToolState, sessio
             resolve,
             reject,
           });
+
+          // 全クライアントツールの登録完了後にストリーム停止を通知
+          toolState.registeredClientTools++;
+          if (toolState.registeredClientTools >= toolState.expectedClientTools && toolState.resolveToolTurn) {
+            toolState.resolveToolTurn();
+          }
         });
       }
     );
@@ -80,7 +85,7 @@ export function sendPromptStream(
   sessionId: string;
 } {
   const sessionId = options.sessionId || `session_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-  const toolState: ToolState = { callIds: new Map() };
+  const toolState: ToolState = { callIds: new Map(), expectedClientTools: 0, registeredClientTools: 0 };
 
   // 既存セッションが存在し、ストリームが保持されていれば再利用 (+ tool_result が送信された後)
   const session = sessionStore.getSession(sessionId);
@@ -171,6 +176,8 @@ export async function sendPromptAndCollect(
         nextPromise = stream.next();
         continue;
       }
+
+      toolState.expectedClientTools++;
 
       // Queue for action()
       let q = toolState.callIds.get(name);

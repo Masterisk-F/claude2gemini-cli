@@ -182,6 +182,8 @@ export async function streamGeminiToClaudeSSE(
         continue;
       }
 
+      toolState.expectedClientTools++;
+
       if (textBlockStarted) {
         sendContentBlockStop(res, blockIndex);
         blockIndex++;
