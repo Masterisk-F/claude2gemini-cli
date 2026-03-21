@@ -122,7 +122,7 @@ messagesRouter.post('/', async (req: Request, res: Response) => {
       // ストリーミングモード: SSE で返す
       setupSSEHeaders(res);
 
-      const { stream, toolState, sessionId: newSessionId } = sendPromptStream(prompt, {
+      const { stream, toolState, sessionId: newSessionId } = await sendPromptStream(prompt, {
         sessionId,
         instructions: systemPrompt,
         model: mappedModel,

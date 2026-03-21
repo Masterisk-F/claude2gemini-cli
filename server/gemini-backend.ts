@@ -71,23 +71,89 @@ function createAgent(options: GeminiBackendOptions, toolState: ToolState, sessio
   return new GeminiCliAgent({
     instructions: options.instructions || 'You are a helpful assistant.',
     model: options.model,
-    cwd: options.cwd || process.cwd(),
+    // proxy ホーム（仮想環境）を cwd とする。存在しない場合は process.cwd() をフォールバック。
+    cwd: options.cwd || process.env.HOME || process.cwd(),
     tools: sdkTools,
   });
+}
+
+/**
+ * GeminiCliAgent 内部の registry から、クライアント指定ツール以外の組み込みツールを消去するハック
+ * さらに、もしツール配列が空になった場合、API送信時に invalid proto エラーになるため、
+ * リクエスト送信直前でリクエストから tools プロパティを削除するモンキーパッチを適用する。
+ */
+async function disableBuiltinTools(session: GeminiCliSession, allowedToolNames: string[]) {
+  // session の初期化を強制（内部で config や toolRegistry が作られる）
+  await session.initialize();
+
+  // private property へのアクセス
+  const config = (session as any).config;
+  if (config && config.toolRegistry) {
+    const registry = config.toolRegistry;
+    const allTools = [...registry.getAllToolNames()];
+    for (const name of allTools) {
+      if (!allowedToolNames.includes(name)) {
+        console.log(`[Proxy] Unregistering built-in tool: ${name}`);
+        registry.unregisterTool(name);
+      }
+    }
+  }
+
+  // SDK内部の生成器にモンキーパッチを当てて空の [{ functionDeclarations: [] }] を消す
+  try {
+    const client = (session as any).client;
+    if (client) {
+      const generator = client.getContentGeneratorOrFail();
+      if (generator && !generator.__proxyPatched) {
+        // パッチ用ヘルパー関数
+        const removeEmptyTools = (params: any) => {
+          if (params?.config?.tools) {
+            const tools = params.config.tools;
+            if (Array.isArray(tools) && tools.length === 1 && 
+                Array.isArray(tools[0].functionDeclarations) && 
+                tools[0].functionDeclarations.length === 0) {
+              delete params.config.tools;
+            }
+          }
+        };
+
+        const originalGenerateContent = generator.generateContent?.bind(generator);
+        if (originalGenerateContent) {
+          generator.generateContent = async (params: any, promptId: string, role: string) => {
+            removeEmptyTools(params);
+            return originalGenerateContent(params, promptId, role);
+          };
+        }
+
+        const originalGenerateContentStream = generator.generateContentStream?.bind(generator);
+        if (originalGenerateContentStream) {
+          generator.generateContentStream = async function* (params: any, promptId: string, role: string) {
+            removeEmptyTools(params);
+            const stream = await originalGenerateContentStream(params, promptId, role);
+            yield* stream;
+          };
+        }
+
+        generator.__proxyPatched = true;
+      }
+    }
+  } catch (e) {
+    console.error('[Proxy] Failed to apply monkey patch for empty tools', e);
+  }
 }
 
 /**
  * Gemini にプロンプトを送信し、ストリームを直接返す（ストリーミング用）
  * 既存のセッションがあれば再開する。
  */
-export function sendPromptStream(
+export async function sendPromptStream(
   prompt: string,
   options: GeminiBackendOptions = {},
-): {
+): Promise<{
   stream: AsyncGenerator<ServerGeminiStreamEvent, any, any>;
   toolState: ToolState;
   sessionId: string;
-} {
+}> {
   const sessionId = options.sessionId || `session_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
 
   // 既存セッションが存在し、ストリームが保持されていれば再利用 (+ tool_result が送信された後)
@@ -106,6 +172,11 @@ export function sendPromptStream(
   const toolState: ToolState = { callIds: new Map(), expectedClientTools: 0, registeredClientTools: 0 };
   const agent = createAgent(options, toolState, sessionId);
   const geminiSession = agent.session();
+  
+  // 組み込みツールの強制無効化
+  const allowedToolNames = options.tools?.map((t) => t.name) || [];
+  await disableBuiltinTools(geminiSession, allowedToolNames);
+
   const stream = geminiSession.sendStream(prompt);
   
   // toolState をセッションに保存（次ターンで再利用するため）
@@ -130,7 +201,7 @@ export async function sendPromptAndCollect(
   prompt: string,
   options: GeminiBackendOptions = {},
 ): Promise<NonStreamingResult> {
-  const { stream, toolState, sessionId } = sendPromptStream(prompt, options);
+  const { stream, toolState, sessionId } = await sendPromptStream(prompt, options);
 
   let fullText = '';
   const toolCalls: ClaudeToolUseBlock[] = [];
