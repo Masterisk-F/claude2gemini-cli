@@ -44,6 +44,8 @@ function createAgent(options: GeminiBackendOptions, toolState: ToolState, sessio
         const callId = callIds?.shift();
         if (!callId) throw new Error(`callId not found for tool ${t.name}`);
 
+        console.log(`[ToolAction] Tool ${t.name} (${callId}) action called, registering pending call...`);
+
         // クライアントからの tool_result 待ち
         return new Promise((resolve, reject) => {
           sessionStore.addPendingToolCall(sessionId, {
@@ -56,7 +58,9 @@ function createAgent(options: GeminiBackendOptions, toolState: ToolState, sessio
 
           // 全クライアントツールの登録完了後にストリーム停止を通知
           toolState.registeredClientTools++;
+          console.log(`[ToolAction] Tool ${t.name} (${callId}) registered (${toolState.registeredClientTools}/${toolState.expectedClientTools})`);
           if (toolState.registeredClientTools >= toolState.expectedClientTools && toolState.resolveToolTurn) {
+            console.log(`[ToolAction] All ${toolState.expectedClientTools} client tools registered, resolving turn`);
             toolState.resolveToolTurn();
           }
         });

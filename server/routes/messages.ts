@@ -16,6 +16,25 @@ import { sessionStore } from '../session-store.js';
 
 export const messagesRouter = Router();
 
+/**
+ * Claude の tool_result.content を文字列に正規化する。
+ * content はテキスト文字列、コンテンツブロック配列、または undefined の場合がある。
+ */
+function normalizeToolResultContent(content: unknown): string {
+  if (!content) return '';
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((block: any) => {
+        if (typeof block === 'string') return block;
+        if (block?.type === 'text' && typeof block.text === 'string') return block.text;
+        return JSON.stringify(block);
+      })
+      .join('\n');
+  }
+  return JSON.stringify(content);
+}
+
 messagesRouter.post('/', async (req: Request, res: Response) => {
   try {
     const body = req.body as ClaudeRequest;
@@ -55,10 +74,17 @@ messagesRouter.post('/', async (req: Request, res: Response) => {
       ) as Extract<typeof lastMessage.content[number], { type: 'tool_result' }>[];
       
       if (toolResults.length > 0) {
+        console.log(`[ToolResult] ${toolResults.length} tool_result(s) received: ${toolResults.map(tr => tr.tool_use_id).join(', ')}`);
+        
         for (const tr of toolResults) {
-          const resolvedSessionId = sessionStore.resolveToolCall(tr.tool_use_id, tr.content);
+          // Claude の tool_result.content はブロック配列の場合がある → テキストに正規化
+          const resultContent = normalizeToolResultContent(tr.content);
+          console.log(`[ToolResult] Resolving ${tr.tool_use_id}, content length: ${resultContent.length}`);
+          const resolvedSessionId = sessionStore.resolveToolCall(tr.tool_use_id, resultContent);
           if (resolvedSessionId) {
             sessionId = resolvedSessionId;
+          } else {
+            console.warn(`[ToolResult] FAILED to resolve ${tr.tool_use_id} - not found in sessionStore`);
           }
         }
         
