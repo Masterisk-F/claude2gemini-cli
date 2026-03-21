@@ -23,7 +23,7 @@ Claude2Gemini-CLI is a proxy server that makes [Google Gemini CLI SDK](https://g
 
 ## Will my Gemini subscription be suspended?
 
-This project uses the **Gemini CLI SDK**, which in turn uses the standard Gemini API under the hood.
+This proxy uses the **Gemini CLI SDK**, which is included in the `gemini-cli` package itself and accesses Google's servers in the standard `gemini-cli` way.
 
 > [!WARNING]
 > **Use at your own risk.** This proxy essentially automates API calls to Google's Gemini service. While the Gemini CLI SDK itself is an official Google project, using it as a backend for third-party Claude-compatible clients is **not an officially supported use case**. Google may change their terms of service, rate limits, or API access policies at any time.
