@@ -89,21 +89,29 @@ export function sendPromptStream(
   sessionId: string;
 } {
   const sessionId = options.sessionId || `session_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-  const toolState: ToolState = { callIds: new Map(), expectedClientTools: 0, registeredClientTools: 0 };
 
   // 既存セッションが存在し、ストリームが保持されていれば再利用 (+ tool_result が送信された後)
   const session = sessionStore.getSession(sessionId);
   if (session && session.stream) {
-    // ツール使用完了後の再開フローでは、新しいプロンプトは送信せず既存ストリームを消費する
+    // 元の toolState を再利用（action クロージャと同一オブジェクトを共有するため）
+    const toolState = session.toolState as ToolState;
+    toolState.callIds.clear();
+    toolState.expectedClientTools = 0;
+    toolState.registeredClientTools = 0;
+    console.log(`[sendPromptStream] Resuming session ${sessionId} with existing toolState`);
     return { stream: session.stream, toolState, sessionId };
   }
 
-  // 新規またはセッション情報なしの場合は新規 Agent を作成して送信
+  // 新規セッション: Agent を作成して送信
+  const toolState: ToolState = { callIds: new Map(), expectedClientTools: 0, registeredClientTools: 0 };
   const agent = createAgent(options, toolState, sessionId);
   const geminiSession = agent.session();
   const stream = geminiSession.sendStream(prompt);
   
-  sessionStore.setStream(sessionId, stream);
+  // toolState をセッションに保存（次ターンで再利用するため）
+  const sessionData = sessionStore.getOrCreateSession(sessionId);
+  sessionData.stream = stream;
+  sessionData.toolState = toolState;
 
   return { stream, toolState, sessionId };
 }
