@@ -64,6 +64,17 @@ messagesRouter.post('/', async (req: Request, res: Response) => {
       return;
     }
 
+    if (!body.model || typeof body.model !== 'string') {
+      res.status(400).json({
+        type: 'error',
+        error: {
+          type: 'invalid_request_error',
+          message: 'model is required',
+        },
+      });
+      return;
+    }
+
     // tool_result のチェック（セッション再開用）
     let sessionId: string | undefined = undefined;
     const lastMessage = body.messages[body.messages.length - 1];
@@ -137,8 +148,7 @@ messagesRouter.post('/', async (req: Request, res: Response) => {
       res.json(claudeResponse);
     }
   } catch (error) {
-    console.error('Error processing request:', error);
-    // ストリーミング中のエラーは SSE として送れないが、ヘッダ未送信時は JSON で返す
+    console.error('[Error]', error instanceof Error ? error.message : error);
     if (!res.headersSent) {
       res.status(500).json({
         type: 'error',
@@ -147,7 +157,16 @@ messagesRouter.post('/', async (req: Request, res: Response) => {
           message: error instanceof Error ? error.message : 'Internal server error',
         },
       });
-    } else {
+    } else if (!res.writableEnded) {
+      // ストリーミング中のエラーは SSE イベントとして送信
+      const errorPayload = JSON.stringify({
+        type: 'error',
+        error: {
+          type: 'api_error',
+          message: error instanceof Error ? error.message : 'Internal server error',
+        },
+      });
+      res.write(`event: error\ndata: ${errorPayload}\n\n`);
       res.end();
     }
   }
