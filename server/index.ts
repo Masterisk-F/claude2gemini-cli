@@ -1,3 +1,6 @@
+import { setupProxyEnv } from './env-setup.js';
+setupProxyEnv(); // 他のモジュールが読み込まれる前に環境変数を上書き
+
 import express from 'express';
 import { messagesRouter } from './routes/messages.js';
 
@@ -15,6 +18,15 @@ app.get('/health', (_req, res) => {
   res.json({ status: 'ok' });
 });
 
-app.listen(PORT, () => {
+const server = app.listen(PORT);
+server.on('listening', () => {
   console.log(`Claude2Gemini proxy listening on port ${PORT}`);
+});
+server.on('error', (err: NodeJS.ErrnoException) => {
+  if (err.code === 'EADDRINUSE') {
+    console.error(`[Error] Port ${PORT} is already in use. Is another proxy instance running?`);
+  } else {
+    console.error(`[Error] Failed to start proxy:`, err.message);
+  }
+  process.exit(1);
 });
