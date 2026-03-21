@@ -37,20 +37,56 @@ function extractTextFromContent(content: string | ClaudeContentBlock[]): string 
 }
 
 /**
- * Claude messages 配列から最後のユーザーメッセージのテキストを抽出する。
- * Gemini SDK の sendStream() は単一のプロンプト文字列を受け取るため、
- * 最後の user メッセージのみを使用する。
- *
- * マルチターン対応はフェーズ6で実装する。
+ * ClaudeMessage の content を構造化テキストに変換する。
+ * tool_use と tool_result ブロックも含めることで、会話履歴の文脈を保持する。
+ */
+function formatContentForPrompt(content: string | ClaudeContentBlock[]): string {
+  if (typeof content === 'string') {
+    return content;
+  }
+  const parts: string[] = [];
+  for (const block of content) {
+    if (block.type === 'text') {
+      parts.push(block.text);
+    } else if (block.type === 'tool_use') {
+      parts.push(`[Tool Call: ${block.name}(${JSON.stringify(block.input)})]`);
+    } else if (block.type === 'tool_result') {
+      const resultText = typeof block.content === 'string'
+        ? block.content
+        : Array.isArray(block.content)
+          ? block.content.map((b: any) => b.type === 'text' ? b.text : JSON.stringify(b)).join('\n')
+          : '';
+      parts.push(`[Tool Result (${block.tool_use_id}): ${resultText}]`);
+    }
+  }
+  return parts.join('\n');
+}
+
+/**
+ * Claude messages 配列を Gemini のプロンプト文字列に変換する。
+ * 単一の user メッセージの場合はテキストをそのまま返す。
+ * 複数メッセージ（マルチターン）の場合はロール付きの会話テキストにまとめる。
  */
 export function convertMessagesToPrompt(messages: ClaudeMessage[]): string {
-  // 最後の user メッセージを取得
-  const lastUserMessage = [...messages].reverse().find(m => m.role === 'user');
-  if (!lastUserMessage) {
+  if (messages.length === 0) {
     throw new Error('messages に user ロールのメッセージが含まれていません');
   }
 
-  return extractTextFromContent(lastUserMessage.content);
+  // 単一メッセージの場合はシンプルにテキストのみ返す
+  if (messages.length === 1 && messages[0].role === 'user') {
+    return extractTextFromContent(messages[0].content);
+  }
+
+  // マルチターン: ロール付きの会話テキストに変換
+  const parts: string[] = [];
+  for (const msg of messages) {
+    const roleLabel = msg.role === 'user' ? 'User' : 'Assistant';
+    const text = formatContentForPrompt(msg.content);
+    if (text) {
+      parts.push(`${roleLabel}: ${text}`);
+    }
+  }
+  return parts.join('\n\n');
 }
 
 /**
