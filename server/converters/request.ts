@@ -8,6 +8,22 @@
 import type { ClaudeMessage, ClaudeContentBlock } from '../types.js';
 
 /**
+ * Claude モデル名を Gemini モデル名に変換する。
+ * Claude Code は処理の途中で軽量モデル（haiku 等）を裏で呼び出すため、
+ * そのままのモデル名を Gemini API に渡すと ModelNotFoundError になる。
+ */
+export function mapModelName(model: string): string {
+  const lower = model.toLowerCase();
+  if (lower.includes('sonnet') || lower.includes('opus')) {
+    return 'gemini-3.1-pro-preview';
+  }
+  if (lower.includes('haiku') || !lower.includes('gemini')) {
+    return 'gemini-2.5-flash';
+  }
+  return model;
+}
+
+/**
  * ClaudeMessage の content からテキスト部分を抽出する
  */
 function extractTextFromContent(content: string | ClaudeContentBlock[]): string {

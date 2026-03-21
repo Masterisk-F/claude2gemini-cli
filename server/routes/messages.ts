@@ -8,7 +8,7 @@
 
 import { Router, type Request, type Response } from 'express';
 import type { ClaudeRequest } from '../types.js';
-import { convertMessagesToPrompt, extractSystemPrompt } from '../converters/request.js';
+import { convertMessagesToPrompt, extractSystemPrompt, mapModelName } from '../converters/request.js';
 import { buildClaudeResponse } from '../converters/response.js';
 import { setupSSEHeaders, streamGeminiToClaudeSSE } from '../converters/stream.js';
 import { sendPromptAndCollect, sendPromptStream } from '../gemini-backend.js';
@@ -78,6 +78,8 @@ messagesRouter.post('/', async (req: Request, res: Response) => {
     // Claude メッセージ → Gemini プロンプト変換 (tool_result 返却時は空文字でよい)
     const prompt = sessionId ? '' : convertMessagesToPrompt(body.messages);
     const systemPrompt = extractSystemPrompt(body.system);
+    const mappedModel = mapModelName(body.model);
+    console.log(`[Model Mapping] ${body.model} -> ${mappedModel}`);
 
     if (body.stream) {
       // ストリーミングモード: SSE で返す
@@ -86,7 +88,7 @@ messagesRouter.post('/', async (req: Request, res: Response) => {
       const { stream, toolState, sessionId: newSessionId } = sendPromptStream(prompt, {
         sessionId,
         instructions: systemPrompt,
-        model: body.model,
+        model: mappedModel,
         tools: body.tools,
       });
 
@@ -97,7 +99,7 @@ messagesRouter.post('/', async (req: Request, res: Response) => {
       const result = await sendPromptAndCollect(prompt, {
         sessionId,
         instructions: systemPrompt,
-        model: body.model,
+        model: mappedModel,
         tools: body.tools,
       });
 
