@@ -39,7 +39,7 @@ This project uses the **Gemini CLI SDK**, which in turn uses the standard Gemini
 
 - **Node.js** >= 20
 - **npm**
-- A valid **Gemini API key** (set via `GEMINI_API_KEY` environment variable or Gemini CLI auth)
+- A **Google account** with access to Gemini
 
 ### Clone & Install
 
@@ -65,6 +65,17 @@ npm install
 npm run build
 cd ..
 ```
+
+### Authenticate with Google (required before first run)
+
+This proxy uses **Gemini CLI's authentication** internally. You must log in with your Google account via Gemini CLI before starting the proxy:
+
+```bash
+cd gemini-cli
+npx gemini  # Follow the browser-based login prompt
+```
+
+Once authenticated, the credentials are cached locally and reused by the proxy automatically. You only need to do this once (unless your session expires).
 
 ### Run the Proxy
 
