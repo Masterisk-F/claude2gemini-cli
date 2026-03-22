@@ -14,10 +14,14 @@ import type { ClaudeMessage, ClaudeContentBlock } from '../types.js';
  */
 export function mapModelName(model: string): string {
   const lower = model.toLowerCase();
-  if (lower.includes('sonnet') || lower.includes('opus')) {
+  if (lower.includes('opus')) {
     return 'gemini-3.1-pro-preview';
   }
-  if (lower.includes('haiku') || !lower.includes('gemini')) {
+  if (lower.includes('sonnet')) {
+    return 'gemini-3-flash-preview';
+  }
+  if (!lower.includes('gemini')) {
+    // 'haiku' comes here
     return 'gemini-2.5-flash';
   }
   return model;
