@@ -260,13 +260,12 @@ export async function streamGeminiToClaudeSSE(
 
     // 429 エラーを判別
     const isRateLimit = 
-      errorMsg.includes('429') || 
       errorMsg.includes('QUOTA_EXHAUSTED') || 
       errorMsg.includes('RESOURCE_EXHAUSTED') ||
       (error as any)?.status === 429 ||
       (error as any)?.name === 'TerminalQuotaError';
 
-    const errorType = isRateLimit ? 'overloaded_error' : 'api_error';
+    const errorType = isRateLimit ? 'rate_limit_error' : 'api_error';
     const clientMessage = isRateLimit ? 'Gemini API quota exhausted or rate limit exceeded.' : 'Internal server error';
 
     if (!res.writableEnded) {

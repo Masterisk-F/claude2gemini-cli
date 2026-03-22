@@ -127,6 +127,7 @@ messagesRouter.post('/', async (req: Request, res: Response) => {
         model: mappedModel,
         tools: body.tools,
       });
+      sessionId = newSessionId; // sessionId を outer scope に反映
 
       const allowedToolNames = body.tools?.map((t) => t.name) || [];
       await streamGeminiToClaudeSSE(stream, res, body.model, toolState, newSessionId, sessionStore, allowedToolNames);
@@ -138,6 +139,7 @@ messagesRouter.post('/', async (req: Request, res: Response) => {
         model: mappedModel,
         tools: body.tools,
       });
+      sessionId = result.sessionId; // sessionId を outer scope に反映
 
       const claudeResponse = buildClaudeResponse({
         text: result.text,
@@ -158,14 +160,13 @@ messagesRouter.post('/', async (req: Request, res: Response) => {
 
     // 429 エラー (クォータ超過等) を判別
     const isRateLimit = 
-      errorMsg.includes('429') || 
       errorMsg.includes('QUOTA_EXHAUSTED') || 
       errorMsg.includes('RESOURCE_EXHAUSTED') ||
       (error as any)?.status === 429 ||
       (error as any)?.name === 'TerminalQuotaError';
 
-    const statusCode = isRateLimit ? 529 : 500;
-    const errorType = isRateLimit ? 'overloaded_error' : 'api_error';
+    const statusCode = isRateLimit ? 429 : 500;
+    const errorType = isRateLimit ? 'rate_limit_error' : 'api_error';
     const clientMessage = isRateLimit ? 'Gemini API quota exhausted or rate limit exceeded.' : 'Internal server error';
 
     if (!res.headersSent) {
