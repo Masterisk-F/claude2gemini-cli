@@ -36,6 +36,7 @@ function normalizeToolResultContent(content: unknown): string {
 }
 
 messagesRouter.post('/', async (req: Request, res: Response) => {
+  let sessionId: string | undefined = undefined;
   try {
     const body = req.body as ClaudeRequest;
     console.log(`\n[POST /v1/messages] model=${body.model}, stream=${body.stream}, messagesCount=${body.messages?.length}, systemLen=${JSON.stringify(body.system)?.length}`);
@@ -76,7 +77,6 @@ messagesRouter.post('/', async (req: Request, res: Response) => {
     }
 
     // tool_result のチェック（セッション再開用）
-    let sessionId: string | undefined = undefined;
     const lastMessage = body.messages[body.messages.length - 1];
     
     if (lastMessage.role === 'user' && Array.isArray(lastMessage.content)) {
@@ -87,6 +87,7 @@ messagesRouter.post('/', async (req: Request, res: Response) => {
       if (toolResults.length > 0) {
         console.log(`[ToolResult] ${toolResults.length} tool_result(s) received: ${toolResults.map(tr => tr.tool_use_id).join(', ')}`);
         
+        let resolvedCount = 0;
         for (const tr of toolResults) {
           // Claude の tool_result.content はブロック配列の場合がある → テキストに正規化
           const resultContent = normalizeToolResultContent(tr.content);
@@ -94,20 +95,18 @@ messagesRouter.post('/', async (req: Request, res: Response) => {
           const resolvedSessionId = sessionStore.resolveToolCall(tr.tool_use_id, resultContent);
           if (resolvedSessionId) {
             sessionId = resolvedSessionId;
+            resolvedCount++;
           } else {
             console.warn(`[ToolResult] FAILED to resolve ${tr.tool_use_id} - not found in sessionStore`);
           }
         }
         
-        if (!sessionId) {
-          res.status(400).json({
-            type: 'error',
-            error: {
-              type: 'invalid_request_error',
-              message: 'Invalid tool_use_id or session expired',
-            },
-          });
-          return;
+        if (resolvedCount === 0) {
+          console.warn(`[ToolResult] All tool results failed to resolve. Falling back to stateless request.`);
+          // sessionId は undefined のままとなり、以降で convertMessagesToPrompt() によりフルプロンプトが生成される
+        } else if (resolvedCount < toolResults.length) {
+          // 一部だけ解決できた場合（通常は発生しにくいが）
+          console.warn(`[ToolResult] Partially resolved tool results.`);
         }
       }
     }
@@ -148,13 +147,33 @@ messagesRouter.post('/', async (req: Request, res: Response) => {
       res.json(claudeResponse);
     }
   } catch (error) {
-    console.error('[Error]', error instanceof Error ? error.message : error);
+    const errorMsg = error instanceof Error ? error.message : String(error);
+    console.error('[Error]', errorMsg);
+    
+    // エラー発生時はセッションを強制的に破棄する (残留した壊れたストリームの再利用を防ぐため)
+    if (sessionId) {
+      sessionStore.deleteSession(sessionId);
+      console.log(`[Error] Session ${sessionId} deleted due to error.`);
+    }
+
+    // 429 エラー (クォータ超過等) を判別
+    const isRateLimit = 
+      errorMsg.includes('429') || 
+      errorMsg.includes('QUOTA_EXHAUSTED') || 
+      errorMsg.includes('RESOURCE_EXHAUSTED') ||
+      (error as any)?.status === 429 ||
+      (error as any)?.name === 'TerminalQuotaError';
+
+    const statusCode = isRateLimit ? 529 : 500;
+    const errorType = isRateLimit ? 'overloaded_error' : 'api_error';
+    const clientMessage = isRateLimit ? 'Gemini API quota exhausted or rate limit exceeded.' : 'Internal server error';
+
     if (!res.headersSent) {
-      res.status(500).json({
+      res.status(statusCode).json({
         type: 'error',
         error: {
-          type: 'api_error',
-          message: error instanceof Error ? error.message : 'Internal server error',
+          type: errorType,
+          message: clientMessage,
         },
       });
     } else if (!res.writableEnded) {
@@ -162,8 +181,8 @@ messagesRouter.post('/', async (req: Request, res: Response) => {
       const errorPayload = JSON.stringify({
         type: 'error',
         error: {
-          type: 'api_error',
-          message: error instanceof Error ? error.message : 'Internal server error',
+          type: errorType,
+          message: clientMessage,
         },
       });
       res.write(`event: error\ndata: ${errorPayload}\n\n`);
