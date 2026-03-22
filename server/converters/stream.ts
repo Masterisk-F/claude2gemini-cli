@@ -244,16 +244,14 @@ export async function streamGeminiToClaudeSSE(
       sendContentBlockStop(res, blockIndex);
     }
 
-    if (!isToolTurnReached) {
-      // メッセージ完了
-      sendSSE(res, 'message_delta', {
-        type: 'message_delta',
-        delta: { stop_reason: stopReason, stop_sequence: null },
-        usage: { output_tokens: 0 },
-      });
-      sendSSE(res, 'message_stop', { type: 'message_stop' });
-      res.end();
-    }
+    // メッセージ完了 (ツール使用時も stop_reason: 'tool_use' として常に送信する)
+    sendSSE(res, 'message_delta', {
+      type: 'message_delta',
+      delta: { stop_reason: stopReason, stop_sequence: null },
+      usage: { output_tokens: 0 },
+    });
+    sendSSE(res, 'message_stop', { type: 'message_stop' });
+    res.end();
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error);
     console.error('[Stream Error]', errorMsg);
