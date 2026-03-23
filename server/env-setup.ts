@@ -66,6 +66,26 @@ export function setupProxyEnv() {
     }
   }
 
+  // gemini-cli 固有のシステムプロンプトが LLM に渡らないように各セクションを無効化する
+  const disabledPromptSections = [
+    'agentSkills',
+    'agentContexts',
+    'primaryWorkflows',
+    'planningWorkflow',
+    'operationalGuidelines',
+    'preamble',
+    'coreMandates',
+    'sandbox',
+    'git',
+    'finalReminder',
+    'hookContext',
+  ];
+
+  for (const section of disabledPromptSections) {
+    const envKey = `GEMINI_PROMPT_${section.toUpperCase()}`;
+    process.env[envKey] = '0';
+  }
+
   console.log(`[Proxy] Overriding HOME to virtual directory: ${proxyHome}`);
   process.env.HOME = proxyHome;
 }
