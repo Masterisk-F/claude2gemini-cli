@@ -23,6 +23,7 @@ export interface SessionData {
   pendingNext?: Promise<IteratorResult<ServerGeminiStreamEvent, any>>;
   pendingToolCalls: Map<string, PendingToolCall>; // toolCallId -> PendingToolCall
   toolState?: any; // gemini-backend.ts の ToolState を保持（循環参照回避のため any）
+  accountId?: string;
 }
 
 class SessionStore {

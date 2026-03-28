@@ -3,6 +3,7 @@ setupProxyEnv(); // 他のモジュールが読み込まれる前に環境変数
 
 import express from 'express';
 import { messagesRouter } from './routes/messages.js';
+import { accountPool } from './account-pool.js';
 
 const app = express();
 const PORT = parseInt(process.env.PORT || '8080', 10);
@@ -19,8 +20,15 @@ app.get('/health', (_req, res) => {
 });
 
 const server = app.listen(PORT);
-server.on('listening', () => {
+server.on('listening', async () => {
+  await accountPool.initialize();
+  const count = accountPool.getAccountCount();
   console.log(`Claude2Gemini proxy listening on port ${PORT}`);
+  if (count > 0) {
+    console.log(`[AccountPool] ${count} accounts are ready for round-robin.`);
+  } else {
+    console.log(`[AccountPool] Using default ~/.gemini account.`);
+  }
 });
 server.on('error', (err: NodeJS.ErrnoException) => {
   if (err.code === 'EADDRINUSE') {

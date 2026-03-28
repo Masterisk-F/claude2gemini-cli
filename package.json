@@ -6,7 +6,10 @@
   "scripts": {
     "dev": "tsx server/index.ts",
     "build": "tsc",
-    "start": "node dist/server/index.js"
+    "start": "node dist/server/index.js",
+    "account:add": "tsx cli/manage-accounts.ts add",
+    "account:list": "tsx cli/manage-accounts.ts list",
+    "account:remove": "tsx cli/manage-accounts.ts remove"
   },
   "dependencies": {
     "@google/gemini-cli-sdk": "file:./gemini-cli/packages/sdk",

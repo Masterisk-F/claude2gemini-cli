@@ -3,62 +3,62 @@ import path from 'node:path';
 import fs from 'node:fs';
 
 /**
- * プロキシ用の隔離された環境を構築する。
- * 
- * - ~/.gemini の認証情報などを /tmp にシンボリックリンクする
- * - GEMINI.md や settings.json の環境固有設定を読み込ませないようにする
- * - process.env.HOME を一時ディレクトリに書き換える
+ * 指定されたIDに基づいた仮想HOMEディレクトリを構築する
+ * @param proxyHomeId アカウントIDなどの識別子
+ * @param credentials oauth_creds.json に書き出す内容（オプション）
  */
-export function setupProxyEnv() {
+export function buildProxyHome(proxyHomeId: string, credentials?: any): string {
   const username = os.userInfo().username;
-  const proxyHome = path.join(os.tmpdir(), `claude2gemini-env-${username}`);
+  const proxyHome = path.join(os.tmpdir(), `claude2gemini-env-${username}-${proxyHomeId}`);
   const proxyGemini = path.join(proxyHome, '.gemini');
 
   if (!fs.existsSync(proxyGemini)) {
     fs.mkdirSync(proxyGemini, { recursive: true });
   }
 
-  const realHome = os.homedir();
-  const realGemini = path.join(realHome, '.gemini');
+  // 1. 認証情報のセットアップ
+  const oauthPath = path.join(proxyGemini, 'oauth_creds.json');
+  if (credentials) {
+    // 明示的な認証情報がある場合はファイルとして書き出す
+    fs.writeFileSync(oauthPath, JSON.stringify(credentials, null, 2), { mode: 0o600 });
+  } else {
+    // 認証情報がない場合は、本来の ~/.gemini から必要なファイルをシンボリックリンクする（後方互換用）
+    const realHome = os.homedir();
+    const realGemini = path.join(realHome, '.gemini');
 
-  // ~/.gemini ディレクトリが存在すれば、認証関連のファイルをシンボリックリンクする
-  if (fs.existsSync(realGemini)) {
-    const files = fs.readdirSync(realGemini);
-    for (const file of files) {
-      if (file === 'GEMINI.md' || file === 'settings.json') {
-        continue;
-      }
+    if (fs.existsSync(realGemini)) {
+      const files = fs.readdirSync(realGemini);
+      for (const file of files) {
+        // 個別の設定ファイルはシンボリックリンクせず、プロキシ側で用意する
+        if (file === 'GEMINI.md' || file === 'settings.json' || file === 'system.md') {
+          continue;
+        }
 
-      const src = path.join(realGemini, file);
-      const dest = path.join(proxyGemini, file);
+        const src = path.join(realGemini, file);
+        const dest = path.join(proxyGemini, file);
 
-      if (!fs.existsSync(dest)) {
-        try {
-          const stat = fs.statSync(src);
-          // Windows などでの互換性のため symlinkType を指定するなら 'dir' / 'file' を切り替える
-          const type = stat.isDirectory() ? 'dir' : 'file';
-          fs.symlinkSync(src, dest, type);
-        } catch (error) {
-          console.warn(`[Proxy Env] Failed to symlink ${file}:`, error instanceof Error ? error.message : String(error));
+        if (!fs.existsSync(dest)) {
+          try {
+            const stat = fs.statSync(src);
+            const type = stat.isDirectory() ? 'dir' : 'file';
+            fs.symlinkSync(src, dest, type);
+          } catch (error) {
+            console.warn(`[Proxy Env] Failed to symlink ${file}:`, error instanceof Error ? error.message : String(error));
+          }
         }
       }
     }
   }
 
-  // 組み込みツールとスキルの無効化を補助するため、ダミーの settings.json を配置する
+  // 2. 共通設定の配置 (settings.json)
   const configDest = path.join(proxyGemini, 'settings.json');
   if (!fs.existsSync(configDest)) {
     try {
       const settings = {
-        tools: {
-          core: [],
-        },
-        skills: {
-          enabled: false,
-        },
-        experimental: {
-          enableAgents: false,
-        },
+        tools: { core: [] },
+        skills: { enabled: false },
+        experimental: { enableAgents: false },
+        security: { auth: { selectedType: 'oauth-personal' } }
       };
       fs.writeFileSync(configDest, JSON.stringify(settings, null, 2));
     } catch (error) {
@@ -66,9 +66,7 @@ export function setupProxyEnv() {
     }
   }
 
-  // gemini-cli のシステムプロンプトを完全に置き換えるため、空の system.md を配置する。
-  // GEMINI_SYSTEM_MD にパスを指定すると、gemini-cli は内蔵プロンプトのアセンブリを
-  // 完全にスキップし、このファイルの内容だけをシステムプロンプトとして使用する。
+  // 3. システムプロンプトの無効化 (system.md)
   const systemMdPath = path.join(proxyGemini, 'system.md');
   if (!fs.existsSync(systemMdPath)) {
     try {
@@ -77,7 +75,18 @@ export function setupProxyEnv() {
       console.warn(`[Proxy Env] Failed to create system.md:`, error);
     }
   }
-  process.env.GEMINI_SYSTEM_MD = systemMdPath;
+
+  return proxyHome;
+}
+
+/**
+ * プロキシ用の隔離された環境を構築し、現在のプロセスに適用する（互換性用）
+ */
+export function setupProxyEnv() {
+  const proxyHome = buildProxyHome('default');
+  
+  // gemini-cli がシステムプロンプトとしてこの空ファイルを強制使用するように設定
+  process.env.GEMINI_SYSTEM_MD = path.join(proxyHome, '.gemini', 'system.md');
 
   console.log(`[Proxy] Overriding HOME to virtual directory: ${proxyHome}`);
   process.env.HOME = proxyHome;

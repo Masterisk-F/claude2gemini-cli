@@ -2,5 +2,7 @@ node_modules/
 dist/
 *.js.map
 *.d.ts
+data/
+.gemini-test-env*
 
 # gemini-cli のビルド成果物はサブモジュール内なので追跡不要

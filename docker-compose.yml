@@ -10,8 +10,11 @@ services:
     volumes:
       # コンテナ内の認証情報を永続化する名前付きボリューム
       - gemini-data:/root/.gemini
+      # 複数アカウントの情報を保存するボリューム
+      - gemini-accounts:/app/data
       # 開発時はソースコードをバインドマウントすると便利ですが、必要に応じてコメントアウトを外してください
       # - ./:/app 
 
 volumes:
   gemini-data:
+  gemini-accounts:

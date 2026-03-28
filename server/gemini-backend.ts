@@ -1,3 +1,4 @@
+import path from 'node:path';
 /**
  * Gemini CLI SDK ラッパー
  *
@@ -11,9 +12,11 @@ import type { ServerGeminiStreamEvent } from '@google/gemini-cli-core';
 import type { ClaudeToolDefinition, ClaudeToolUseBlock } from './types.js';
 import { convertClaudeToolToZodSchema } from './converters/tool-schema.js';
 import { sessionStore } from './session-store.js';
+import { accountPool } from './account-pool.js';
 
 export interface GeminiBackendOptions {
   sessionId?: string;
+  accountId?: string;
   instructions?: string;
   model?: string;
   cwd?: string;
@@ -68,13 +71,29 @@ function createAgent(options: GeminiBackendOptions, toolState: ToolState, sessio
     );
   });
 
-  return new GeminiCliAgent({
-    instructions: options.instructions || 'You are a helpful assistant.',
-    model: options.model,
-    // proxy ホーム（仮想環境）を cwd とする。存在しない場合は process.cwd() をフォールバック。
-    cwd: options.cwd || process.env.HOME || process.cwd(),
-    tools: sdkTools,
-  });
+  const originalHome = process.env.HOME;
+  const originalSystemMd = process.env.GEMINI_SYSTEM_MD;
+  
+  try {
+    // アカウント指定がある場合は環境変数を一時的に書き換えて Agent を構築する
+    if (options.accountId) {
+      const accountHome = accountPool.getAccountHome(options.accountId);
+      process.env.HOME = accountHome;
+      process.env.GEMINI_SYSTEM_MD = path.join(accountHome, '.gemini', 'system.md');
+    }
+
+    return new GeminiCliAgent({
+      instructions: options.instructions || 'You are a helpful assistant.',
+      model: options.model,
+      // proxy ホーム（仮想環境）を cwd とする。存在しない場合は process.cwd() をフォールバック。
+      cwd: options.cwd || process.env.HOME || process.cwd(),
+      tools: sdkTools,
+    });
+  } finally {
+    // 他の並列リクエストに影響を与えないよう即座に復元する
+    process.env.HOME = originalHome;
+    process.env.GEMINI_SYSTEM_MD = originalSystemMd;
+  }
 }
 
 /**
