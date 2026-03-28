@@ -15,7 +15,7 @@ Historically, the proxy ran the Gemini CLI SDK in-process. However, the SDK uses
 
 ```mermaid
 flowchart TD
-    subgraph Parent Process (Express Server)
+    subgraph Parent_Process ["Parent Process (Express Server)"]
         A[POST /v1/messages] --> B[messages.ts]
         B -->|Round-Robin| C[AccountPool]
         B -->|Session Routing| D[SessionStore]
@@ -23,7 +23,7 @@ flowchart TD
         E -->|UNIX Socket| F[IPC stream / SSE conversion]
     end
 
-    subgraph Child Processes (Node.js Workers)
+    subgraph Child_Processes ["Child Processes (Node.js Workers)"]
         G[ChildWorker Account A]
         H[ChildWorker Account B]
         
