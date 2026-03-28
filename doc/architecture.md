@@ -94,6 +94,10 @@ The core request handler for `POST /v1/messages`. Responsibilities:
 5. **Response dispatch** — Routes to streaming (SSE) or non-streaming path
 6. **Error handling** — Returns Claude-compatible error responses; sends SSE `event: error` during active streams
 
+### `server/context.ts`
+
+Manages the `AsyncLocalStorage` context required to isolate globally accessed environment variables per request. This prevents race conditions where the Gemini SDK reads from the global `process.env.GEMINI_CLI_HOME` during concurrent handling of multiple accounts. This module sets up a transparent Proxy over `global.process.env`.
+
 ### `server/gemini-backend.ts`
 
 Manages the Gemini CLI SDK lifecycle:
@@ -210,6 +214,22 @@ toolState.registeredClientTools = 0;
 ```
 
 This ensures action closures and stream consumers always share the same state across all turns.
+
+---
+
+## Multi-Account Concurrency & Context Isolation
+
+To support multiple accounts efficiently without modifying the internal code of the compiled `gemini-cli-sdk` dependency, the proxy utilizes a combination of **AsyncLocalStorage** and a **Proxy** over `global.process.env`.
+
+The Gemini CLI SDK relies on the `process.env.GEMINI_CLI_HOME` global variable to locate authentication and configuration files. In a concurrent server environment handling multiple accounts simultaneously, directly mutating `process.env` causes destructive race conditions (Account Context Contamination).
+
+### Environment Hook Architecture:
+
+1. **Context Initialization**: `server/context.ts` initializes an `AsyncLocalStorage<AppContext>` and hooks `global.process.env` with a `Proxy`.
+2. **Transparent Interception**: When the SDK attempts to read `process.env.GEMINI_CLI_HOME` (e.g. during token refresh or initialization), the Proxy intercepts the call. It retrieves the specific `cliHome` path from the active asynchronous context (`contextStorage.getStore()`).
+3. **Request Lifecycle Wrapping**: In `server/routes/messages.ts`, the entire lifecycle of a request (from routing, to agent initialization, to SSE streaming) is wrapped in `contextStorage.run({ cliHome: accountHome }, ...)`.
+
+This architecture guarantees that the underlying SDK transparently receives the correct, isolated `GEMINI_CLI_HOME` directory for the active account, completely eliminating cross-contamination without relying on global mutexes (which would destroy throughput).
 
 ---
 
