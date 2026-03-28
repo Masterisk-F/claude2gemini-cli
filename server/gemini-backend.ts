@@ -95,6 +95,8 @@ function createAgent(options: GeminiBackendOptions, toolState: ToolState, sessio
   });
 }
 
+import { contextStorage } from './context.js';
+
 // mutex: 一度に1つの初期化のみ実行
 let initMutex: Promise<void> = Promise.resolve();
 
@@ -109,21 +111,20 @@ async function initializeWithAccount(
   initMutex = new Promise<void>(resolve => { releaseMutex = resolve; });
   await prevMutex;
 
-  const originalCliHome = process.env['GEMINI_CLI_HOME'];
   try {
-    if (accountId) {
-      const accountHome = accountPool.getAccountHome(accountId);
-      process.env['GEMINI_CLI_HOME'] = accountHome;
-    }
-    // initialize() を明示的に呼び出し（GEMINI_CLI_HOME が正しい状態で認証情報を読み込む）
-    await session.initialize();
-  } finally {
-    // 初期化完了後に復元
-    if (originalCliHome !== undefined) {
-      process.env['GEMINI_CLI_HOME'] = originalCliHome;
+    const accountHome = accountId ? accountPool.getAccountHome(accountId) : undefined;
+    
+    // アカウント指定がある場合は、依存するSDKのためにプロセス環境変数を一時的にフックされたコンテキストで渡す
+    if (accountHome) {
+      await new Promise<void>((resolve, reject) => {
+        contextStorage.run({ cliHome: accountHome }, () => {
+          session.initialize().then(resolve).catch(reject);
+        });
+      });
     } else {
-      delete process.env['GEMINI_CLI_HOME'];
+      await session.initialize();
     }
+  } finally {
     releaseMutex!();
   }
 
