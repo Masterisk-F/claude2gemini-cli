@@ -106,6 +106,34 @@ curl http://localhost:8080/health
 # → {"status":"ok"}
 ```
 
+## Running with Docker
+
+You can run Claude2Gemini-CLI in a Docker container using the provided `docker-compose.yml` and `Dockerfile`.
+
+### 1. Build and Start the Container
+
+```bash
+docker compose up -d --build
+```
+The proxy will be accessible at `http://localhost:8080`.
+
+### 2. Initial Authentication
+
+Because the Gemini CLI uses a browser-based OAuth flow that is not directly available inside a container, you must perform the authentication manally on first run.
+
+Run the following command to start an interactive shell where you can authenticate:
+
+```bash
+docker compose run --rm -it claude2gemini bash -c "cd gemini-cli && npx gemini"
+```
+
+1. You will see a message containing an authorization URL.
+2. Open that URL in your host machine's web browser.
+3. Sign in to your Google Account and copy the provided authorization code.
+4. Paste the code into the terminal and press Enter.
+
+Once authenticated, the credentials will be securely saved into the `.gemini` directory, which is persisted across container restarts via a Docker volume (`gemini-data`). You will not need to authenticate again unless your session expires.
+
 ## License
 
 This project is provided as-is for educational and experimental purposes.
