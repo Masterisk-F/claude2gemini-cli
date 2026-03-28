@@ -163,7 +163,16 @@ export async function streamGeminiToClaudeSSE(
             type: 'tool_use',
             id: callId,
             name: name,
-            input: msg.args,
+            input: {},
+          },
+        });
+
+        sendSSE(res, 'content_block_delta', {
+          type: 'content_block_delta',
+          index: blockIndex,
+          delta: {
+            type: 'input_json_delta',
+            partial_json: JSON.stringify(msg.args),
           },
         });
 
