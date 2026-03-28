@@ -89,11 +89,11 @@ export function classifyError(error: unknown): { statusCode: number; errorType: 
 
 function mapModelName(model: string): string {
   if (model.includes('claude-3-7-sonnet') || model.includes('claude-3-5-sonnet') || model.includes('claude-sonnet-4-6')) {
-    return 'gemini-2.5-pro';
+    return 'gemini-2.0-flash';
   } else if (model.includes('claude-3-5-haiku') || model.includes('claude-3-haiku')) {
-    return 'gemini-2.5-flash';
+    return 'gemini-2.0-flash';
   } else if (model.includes('claude-3-opus')) {
-    return 'gemini-2.5-pro';
+    return 'gemini-2.0-pro-exp-02-05';
   }
   return model;
 }
