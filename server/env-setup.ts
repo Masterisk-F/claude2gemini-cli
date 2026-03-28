@@ -88,6 +88,6 @@ export function setupProxyEnv() {
   // gemini-cli がシステムプロンプトとしてこの空ファイルを強制使用するように設定
   process.env.GEMINI_SYSTEM_MD = path.join(proxyHome, '.gemini', 'system.md');
 
-  console.log(`[Proxy] Overriding HOME to virtual directory: ${proxyHome}`);
-  process.env.HOME = proxyHome;
+  console.log(`[Proxy] Setting GEMINI_CLI_HOME to virtual directory: ${proxyHome}`);
+  process.env['GEMINI_CLI_HOME'] = proxyHome;
 }

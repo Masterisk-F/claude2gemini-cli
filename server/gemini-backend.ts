@@ -71,29 +71,49 @@ function createAgent(options: GeminiBackendOptions, toolState: ToolState, sessio
     );
   });
 
-  const originalHome = process.env.HOME;
-  const originalSystemMd = process.env.GEMINI_SYSTEM_MD;
-  
-  try {
-    // アカウント指定がある場合は環境変数を一時的に書き換えて Agent を構築する
-    if (options.accountId) {
-      const accountHome = accountPool.getAccountHome(options.accountId);
-      process.env.HOME = accountHome;
-      process.env.GEMINI_SYSTEM_MD = path.join(accountHome, '.gemini', 'system.md');
-    }
+  return new GeminiCliAgent({
+    instructions: options.instructions || 'You are a helpful assistant.',
+    model: options.model,
+    // proxy ホーム（仮想環境）を cwd とする。存在しない場合は process.cwd() をフォールバック。
+    cwd: options.cwd || process.env['GEMINI_CLI_HOME'] || process.cwd(),
+    tools: sdkTools,
+  });
+}
 
-    return new GeminiCliAgent({
-      instructions: options.instructions || 'You are a helpful assistant.',
-      model: options.model,
-      // proxy ホーム（仮想環境）を cwd とする。存在しない場合は process.cwd() をフォールバック。
-      cwd: options.cwd || process.env.HOME || process.cwd(),
-      tools: sdkTools,
-    });
+// mutex: 一度に1つの初期化のみ実行
+let initMutex: Promise<void> = Promise.resolve();
+
+async function initializeWithAccount(
+  session: GeminiCliSession,
+  accountId: string | undefined,
+  allowedToolNames: string[],
+): Promise<void> {
+  // 直列化：前の初期化が終わるまで待つ
+  const prevMutex = initMutex;
+  let releaseMutex: () => void;
+  initMutex = new Promise<void>(resolve => { releaseMutex = resolve; });
+  await prevMutex;
+
+  const originalCliHome = process.env['GEMINI_CLI_HOME'];
+  try {
+    if (accountId) {
+      const accountHome = accountPool.getAccountHome(accountId);
+      process.env['GEMINI_CLI_HOME'] = accountHome;
+    }
+    // initialize() を明示的に呼び出し（GEMINI_CLI_HOME が正しい状態で認証情報を読み込む）
+    await session.initialize();
   } finally {
-    // 他の並列リクエストに影響を与えないよう即座に復元する
-    process.env.HOME = originalHome;
-    process.env.GEMINI_SYSTEM_MD = originalSystemMd;
+    // 初期化完了後に復元
+    if (originalCliHome !== undefined) {
+      process.env['GEMINI_CLI_HOME'] = originalCliHome;
+    } else {
+      delete process.env['GEMINI_CLI_HOME'];
+    }
+    releaseMutex!();
   }
+
+  // 初期化後にツールレジストリを操作（環境変数に依存しないため mutex 外で実行可能）
+  disableBuiltinTools(session, allowedToolNames);
 }
 
 /**
@@ -101,10 +121,7 @@ function createAgent(options: GeminiBackendOptions, toolState: ToolState, sessio
  * さらに、もしツール配列が空になった場合、API送信時に invalid proto エラーになるため、
  * リクエスト送信直前でリクエストから tools プロパティを削除するモンキーパッチを適用する。
  */
-async function disableBuiltinTools(session: GeminiCliSession, allowedToolNames: string[]) {
-  // session の初期化を強制（内部で config や toolRegistry が作られる）
-  await session.initialize();
-
+function disableBuiltinTools(session: GeminiCliSession, allowedToolNames: string[]) {
   // private property へのアクセス
   const config = (session as any).config;
   if (config && config.toolRegistry) {
@@ -192,9 +209,9 @@ export async function sendPromptStream(
   const agent = createAgent(options, toolState, sessionId);
   const geminiSession = agent.session();
   
-  // 組み込みツールの強制無効化
+  // mutex 付きで初期化 → 組み込みツール無効化（責務を分離）
   const allowedToolNames = options.tools?.map((t) => t.name) || [];
-  await disableBuiltinTools(geminiSession, allowedToolNames);
+  await initializeWithAccount(geminiSession, options.accountId, allowedToolNames);
 
   const stream = geminiSession.sendStream(prompt);
   

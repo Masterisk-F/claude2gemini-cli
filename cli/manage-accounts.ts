@@ -46,6 +46,7 @@ async function ask(question: string): Promise<string> {
 
 async function askMultiLine(question: string): Promise<string> {
   console.log(question);
+  console.log('(入力を終了するには Ctrl+D を押してください)');
   const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout,
@@ -54,11 +55,10 @@ async function askMultiLine(question: string): Promise<string> {
   return new Promise((resolve) => {
     let lines: string[] = [];
     rl.on('line', (line) => {
-      if (line.trim() === '') {
-        rl.close();
-        resolve(lines.join('\n'));
-      }
       lines.push(line);
+    });
+    rl.on('close', () => {
+      resolve(lines.join('\n'));
     });
   });
 }
@@ -71,7 +71,7 @@ async function addAccount() {
     return;
   }
 
-  const credsRaw = await askMultiLine('Paste your credentials (content of oauth_creds.json).\nPress Enter on an empty line to finish:');
+  const credsRaw = await askMultiLine('Paste your credentials (content of oauth_creds.json):\n');
   
   let credentials;
   try {
