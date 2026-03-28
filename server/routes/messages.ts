@@ -42,7 +42,8 @@ export function classifyError(error: unknown): { statusCode: number; errorType: 
   const isRateLimit =
     errorMsg.includes('QUOTA_EXHAUSTED') ||
     errorMsg.includes('RESOURCE_EXHAUSTED') ||
-    (error as any)?.status === 429;
+    (error as any)?.status === 429 ||
+    (error as any)?.name === 'TerminalQuotaError';
 
   if (isRateLimit) {
     return { statusCode: 429, errorType: 'rate_limit_error', clientMessage: `Gemini API quota exhausted or rate limit exceeded.` };

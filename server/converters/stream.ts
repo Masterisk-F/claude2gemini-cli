@@ -248,9 +248,9 @@ export async function streamGeminiToClaudeSSE(
 
     if (textBlockStarted) {
       sendContentBlockStop(res, blockIndex);
-    } else if (!hasProducedAnyBlock) {
-      sendContentBlockStart(res, blockIndex);
-      sendContentBlockStop(res, blockIndex);
+    } else if (!hasProducedAnyBlock && !isToolTurnReached) {
+      // 何も生成されなかった場合はエラーとして扱う
+      throw new GeminiApiError('Gemini API returned an empty response', 500);
     }
 
     // メッセージ完了 (ツール使用時も stop_reason: 'tool_use' として常に送信する)
