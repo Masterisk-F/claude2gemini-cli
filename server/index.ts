@@ -1,9 +1,7 @@
-import { setupProxyEnv } from './env-setup.js';
-setupProxyEnv(); // 他のモジュールが読み込まれる前に環境変数を上書き
-
 import express from 'express';
 import { messagesRouter } from './routes/messages.js';
 import { accountPool } from './account-pool.js';
+import { childManager } from './child-manager.js';
 
 const app = express();
 const PORT = parseInt(process.env.PORT || '8080', 10);
@@ -28,6 +26,14 @@ server.on('listening', async () => {
     console.log(`[AccountPool] ${count} accounts are ready for round-robin.`);
   } else {
     console.log(`[AccountPool] Using default ~/.gemini account.`);
+  }
+
+  // 子プロセス起動
+  const accounts = accountPool.getAccountIds();
+  if (accounts.length > 0) {
+    await childManager.spawnAll(accounts);
+  } else {
+    await childManager.spawnAll(['default']);
   }
 });
 server.on('error', (err: NodeJS.ErrnoException) => {

@@ -108,91 +108,47 @@ function sendMessageEnd(res: Response, outputTokens: number): void {
 }
 
 /**
- * Gemini の sendStream() ストリームを Claude SSE イベントに変換して送信する
+ * Child プロセスからのストリーム (ChildMessage) を Claude SSE イベントに変換して送信する
  */
 export async function streamGeminiToClaudeSSE(
-  geminiStream: AsyncGenerator<{ type: string; value?: any }>,
+  childStream: AsyncGenerator<any>,
   res: Response,
   model: string,
-  toolState: any,
   sessionId: string,
-  sessionStore: any,
+  sessionStore: typeof import('../session-store.js').sessionStore,
   allowedToolNames: string[]
 ): Promise<void> {
   const messageId = `msg_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
   let blockIndex = 0;
 
-  // message_start を送信
   sendMessageStart(res, messageId, model);
   sendSSE(res, 'ping', { type: 'ping' });
 
-  // ツール実行待ちを判定するための Promise
-  let isToolTurnReached = false;
-  let turnPromiseResolve: () => void;
-  const turnPromise = new Promise<void>((resolve) => {
-    turnPromiseResolve = resolve;
-  });
-  toolState.resolveToolTurn = () => {
-    isToolTurnReached = true;
-    turnPromiseResolve();
-  };
-
-  const sessionData = sessionStore.getOrCreateSession(sessionId);
-  let nextPromise = sessionData.pendingNext || geminiStream.next();
-  sessionData.pendingNext = undefined;
-
   let textBlockStarted = false;
   let hasProducedAnyBlock = false;
-  let stopReason: string = 'end_turn';
 
   try {
-    while (true) {
-      if (isToolTurnReached) {
-        sessionData.pendingNext = nextPromise;
-        break;
-      }
-
-      const result = await Promise.race([nextPromise, turnPromise.then(() => 'TURN_ENDED')]);
-
-      if (result === 'TURN_ENDED') {
-        sessionData.pendingNext = nextPromise;
-        break;
-      }
-
-      const iter = result as IteratorResult<any>;
-      if (iter.done) {
-        sessionStore.deleteSession(sessionId);
-        break;
-      }
-
-      const chunk = iter.value;
-
-      if (chunk.type === 'content' && chunk.value) {
-        if (!textBlockStarted) {
-          sendContentBlockStart(res, blockIndex);
-          textBlockStarted = true;
-          hasProducedAnyBlock = true;
+    for await (const msg of childStream) {
+      if (msg.type === 'stream_event') {
+        const chunk = msg.event;
+        if (chunk.type === 'content' && chunk.value) {
+          if (!textBlockStarted) {
+            sendContentBlockStart(res, blockIndex);
+            textBlockStarted = true;
+            hasProducedAnyBlock = true;
+          }
+          sendTextDelta(res, blockIndex, chunk.value);
         }
-        sendTextDelta(res, blockIndex, chunk.value as string);
-      } else if (chunk.type === 'error') {
-        // Gemini API エラー: GeminiApiError をスローして catch ブロックで処理
-        const errValue = (chunk as any).value?.error as { message?: string; status?: number } | undefined;
-        throw new GeminiApiError(
-          errValue?.message || 'Gemini API error',
-          errValue?.status,
-        );
-      } else if (chunk.type === 'tool_call_request') {
-        const callInfo = chunk.value;
-        const callId = callInfo.callId;
-        const name = callInfo.name;
+      } else if (msg.type === 'tool_call') {
+        const callId = msg.callId;
+        const name = msg.name;
 
         if (!allowedToolNames.includes(name)) {
-          // 組み込みツールはクライアントに返さず、内部の処理を続行させる
-          nextPromise = geminiStream.next();
           continue;
         }
 
-        toolState.expectedClientTools++;
+        // Parent 側のセッションストアに toolCallId -> sessionId のマッピングを登録
+        sessionStore.addPendingToolCall(sessionId, callId);
 
         if (textBlockStarted) {
           sendContentBlockStop(res, blockIndex);
@@ -200,23 +156,6 @@ export async function streamGeminiToClaudeSSE(
           textBlockStarted = false;
         }
 
-        let q = toolState.callIds.get(name);
-        if (!q) {
-          q = [];
-          toolState.callIds.set(name, q);
-        }
-        q.push(callId);
-
-        let parsedArgs: Record<string, unknown> = {};
-        if (typeof callInfo.args === 'string') {
-          try {
-            parsedArgs = JSON.parse(callInfo.args);
-          } catch (e) {}
-        } else if (callInfo.args && typeof callInfo.args === 'object') {
-          parsedArgs = callInfo.args;
-        }
-
-        // SSE tool_use events
         sendSSE(res, 'content_block_start', {
           type: 'content_block_start',
           index: blockIndex,
@@ -224,48 +163,45 @@ export async function streamGeminiToClaudeSSE(
             type: 'tool_use',
             id: callId,
             name: name,
-            input: {},
-          },
-        });
-
-        sendSSE(res, 'content_block_delta', {
-          type: 'content_block_delta',
-          index: blockIndex,
-          delta: {
-            type: 'input_json_delta',
-            partial_json: JSON.stringify(parsedArgs),
+            input: msg.args,
           },
         });
 
         sendContentBlockStop(res, blockIndex);
         blockIndex++;
         hasProducedAnyBlock = true;
-        stopReason = 'tool_use';
-      }
+      } else if (msg.type === 'turn_end') {
+        if (textBlockStarted) {
+          sendContentBlockStop(res, blockIndex);
+          blockIndex++;
+          textBlockStarted = false;
+        }
 
-      nextPromise = geminiStream.next();
+        sendSSE(res, 'message_delta', {
+          type: 'message_delta',
+          delta: {
+            stop_reason: msg.stopReason,
+            stop_sequence: null,
+          }
+        });
+
+        break; // 完全終了
+      } else if (msg.type === 'error' || msg.type === 'fatal_error') {
+        if (textBlockStarted) {
+          sendContentBlockStop(res, blockIndex);
+          textBlockStarted = false;
+        }
+        throw new GeminiApiError(msg.message, msg.status);
+      }
     }
 
-    if (textBlockStarted) {
-      sendContentBlockStop(res, blockIndex);
-    } else if (!hasProducedAnyBlock && !isToolTurnReached) {
-      // 何も生成されなかった場合はエラーとして扱う
+    if (!hasProducedAnyBlock) {
       throw new GeminiApiError('Gemini API returned an empty response', 500);
     }
 
-    // メッセージ完了 (ツール使用時も stop_reason: 'tool_use' として常に送信する)
-    sendSSE(res, 'message_delta', {
-      type: 'message_delta',
-      delta: { stop_reason: stopReason, stop_sequence: null },
-      usage: { output_tokens: 0 },
-    });
-    sendSSE(res, 'message_stop', { type: 'message_stop' });
-    res.end();
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error);
     console.error('[Stream Error]', errorMsg);
-    
-    sessionStore.deleteSession(sessionId);
 
     const { errorType, clientMessage } = classifyError(error);
 
@@ -278,6 +214,10 @@ export async function streamGeminiToClaudeSSE(
         },
       });
       res.write(`event: error\ndata: ${errorPayload}\n\n`);
+    }
+  } finally {
+    if (!res.writableEnded) {
+      sendSSE(res, 'message_stop', { type: 'message_stop' });
       res.end();
     }
   }

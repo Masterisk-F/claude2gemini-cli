@@ -83,16 +83,3 @@ export function buildProxyHome(proxyHomeId: string, credentials?: any): string {
 
   return proxyHome;
 }
-
-/**
- * プロキシ用の隔離された環境を構築し、現在のプロセスに適用する（互換性用）
- */
-export function setupProxyEnv() {
-  const proxyHome = buildProxyHome('default');
-  
-  // gemini-cli がシステムプロンプトとしてこの空ファイルを強制使用するように設定
-  process.env.GEMINI_SYSTEM_MD = path.join(proxyHome, '.gemini', 'system.md');
-
-  console.log(`[Proxy] Setting GEMINI_CLI_HOME to virtual directory: ${proxyHome}`);
-  process.env['GEMINI_CLI_HOME'] = proxyHome;
-}
