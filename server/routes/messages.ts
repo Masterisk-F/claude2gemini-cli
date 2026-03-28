@@ -88,12 +88,18 @@ export function classifyError(error: unknown): { statusCode: number; errorType: 
 }
 
 function mapModelName(model: string): string {
-  if (model.includes('claude-3-7-sonnet') || model.includes('claude-3-5-sonnet') || model.includes('claude-sonnet-4-6')) {
-    return 'gemini-2.0-flash';
-  } else if (model.includes('claude-3-5-haiku') || model.includes('claude-3-haiku')) {
-    return 'gemini-2.0-flash';
-  } else if (model.includes('claude-3-opus')) {
-    return 'gemini-2.0-pro-exp-02-05';
+  const lower = model.toLowerCase();
+  if (lower.includes('opus')) {
+    return 'gemini-3.1-pro-preview';
+  }
+  if (lower.includes('sonnet')) {
+    return 'gemini-3-flash-preview';
+  }
+  if (lower.includes('haiku')) {
+    return 'gemini-2.5-flash-lite';
+  }
+  if (!lower.includes('gemini')) {
+    return 'gemini-3-flash-preview';
   }
   return model;
 }
