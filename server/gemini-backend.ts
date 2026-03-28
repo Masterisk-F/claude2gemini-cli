@@ -74,8 +74,8 @@ function createAgent(options: GeminiBackendOptions, toolState: ToolState, sessio
   return new GeminiCliAgent({
     instructions: options.instructions || 'You are a helpful assistant.',
     model: options.model,
-    // proxy ホーム（仮想環境）を cwd とする。存在しない場合は process.cwd() をフォールバック。
-    cwd: options.cwd || process.env['GEMINI_CLI_HOME'] || process.cwd(),
+    // アカウント指定がある場合はそのホームを、なければ GEMINI_CLI_HOME を、存在しない場合は process.cwd() をフォールバック。
+    cwd: options.cwd || (options.accountId ? accountPool.getAccountHome(options.accountId) : process.env['GEMINI_CLI_HOME']) || process.cwd(),
     tools: sdkTools,
   });
 }

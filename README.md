@@ -89,7 +89,7 @@ npm run account:add
 ```
 1. Enter a **label** for the account (e.g., your email address).
 2. Paste the **entire JSON content** of your `oauth_creds.json`.
-3. Press **Enter twice** to finish.
+3. Press **Ctrl+D** to finish.
 
 The proxy will automatically start using the new account for incoming requests.
 

@@ -8,7 +8,12 @@ import fs from 'node:fs';
  * @param credentials oauth_creds.json に書き出す内容（オプション）
  */
 export function buildProxyHome(proxyHomeId: string, credentials?: any): string {
-  const username = os.userInfo().username;
+  let username = 'default';
+  try {
+    username = os.userInfo().username;
+  } catch (e) {
+    // Dockerコンテナなどでユーザー情報が取得できない場合のフォールバック
+  }
   const proxyHome = path.join(os.tmpdir(), `claude2gemini-env-${username}-${proxyHomeId}`);
   const proxyGemini = path.join(proxyHome, '.gemini');
 

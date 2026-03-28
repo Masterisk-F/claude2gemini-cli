@@ -19,8 +19,9 @@ function loadAccounts(): Account[] {
   try {
     return JSON.parse(content);
   } catch (e) {
-    console.error('Failed to parse accounts.json:', e);
-    return [];
+    console.error(`\n❌ Error: Failed to parse ${ACCOUNTS_FILE}. The file may be corrupted.`);
+    console.error('Please resolve the issue manually to prevent data loss.');
+    process.exit(1);
   }
 }
 
