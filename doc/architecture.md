@@ -120,7 +120,7 @@ Converts Claude message arrays into Gemini prompt strings:
 - **Single user message** → Plain text extraction
 - **Multi-turn** → Role-labeled conversation text (`User: ...`, `Assistant: ...`)
 - **Tool blocks** → Text representations (`[Tool Call: name({...})]`, `[Tool Result: ...]`)
-- **Model name mapping** — `mapModelName()` converts Claude model names to Gemini equivalents (sonnet/opus → `gemini-3.1-pro-preview`, haiku → `gemini-2.5-flash`)
+- **Model name mapping** — `mapModelName()` converts Claude model names to Gemini equivalents (opus → `gemini-3.1-pro-preview`, sonnet → `gemini-3-flash-preview`, haiku → `gemini-2.5-flash-lite`)
 - **System prompt extraction** — `extractSystemPrompt()` normalizes various system prompt formats
 
 ### `server/converters/response.ts`

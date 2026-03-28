@@ -20,9 +20,11 @@ export function mapModelName(model: string): string {
   if (lower.includes('sonnet')) {
     return 'gemini-3-flash-preview';
   }
+  if (lower.includes('haiku')) {
+    return 'gemini-2.5-flash-lite';
+  }
   if (!lower.includes('gemini')) {
-    // 'haiku' comes here
-    return 'gemini-2.5-flash';
+    return 'gemini-3-flash-preview';
   }
   return model;
 }
