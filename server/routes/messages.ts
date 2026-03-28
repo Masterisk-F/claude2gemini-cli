@@ -24,7 +24,8 @@ export function classifyError(error: unknown): { statusCode: number; errorType: 
   if (error instanceof GeminiApiError && error.status) {
     const status = error.status;
     if (status === 429) {
-      return { statusCode: 429, errorType: 'rate_limit_error', clientMessage: `Gemini API rate limit: ${errorMsg}` };
+      // Claude Code は 500 をリトライするため、429 も 500 として返す
+      return { statusCode: 500, errorType: 'overloaded_error', clientMessage: `Gemini API rate limit: ${errorMsg}` };
     }
     if (status === 400) {
       return { statusCode: 400, errorType: 'invalid_request_error', clientMessage: `Gemini API bad request: ${errorMsg}` };
@@ -46,7 +47,8 @@ export function classifyError(error: unknown): { statusCode: number; errorType: 
     (error as any)?.name === 'TerminalQuotaError';
 
   if (isRateLimit) {
-    return { statusCode: 429, errorType: 'rate_limit_error', clientMessage: `Gemini API quota exhausted or rate limit exceeded.` };
+    // Claude Code は 500 をリトライするため、429 も 500 として返す
+    return { statusCode: 500, errorType: 'overloaded_error', clientMessage: `Gemini API quota exhausted or rate limit exceeded.` };
   }
 
   return { statusCode: 500, errorType: 'api_error', clientMessage: `Internal server error: ${errorMsg}` };
