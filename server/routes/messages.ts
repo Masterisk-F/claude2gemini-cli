@@ -11,9 +11,48 @@ import type { ClaudeRequest } from '../types.js';
 import { convertMessagesToPrompt, extractSystemPrompt, mapModelName } from '../converters/request.js';
 import { buildClaudeResponse } from '../converters/response.js';
 import { setupSSEHeaders, streamGeminiToClaudeSSE } from '../converters/stream.js';
-import { sendPromptAndCollect, sendPromptStream } from '../gemini-backend.js';
+import { sendPromptAndCollect, sendPromptStream, GeminiApiError } from '../gemini-backend.js';
 import { sessionStore } from '../session-store.js';
 
+/**
+ * Gemini API エラーを Claude API 形式のエラーに分類する。
+ * GeminiApiError の HTTP ステータスから適切な Claude エラータイプを決定する。
+ */
+export function classifyError(error: unknown): { statusCode: number; errorType: string; clientMessage: string } {
+  const errorMsg = error instanceof Error ? error.message : String(error);
+
+  if (error instanceof GeminiApiError && error.status) {
+    const status = error.status;
+    if (status === 429) {
+      // Claude Code は 500 をリトライするため、429 も 500 として返す
+      return { statusCode: 500, errorType: 'overloaded_error', clientMessage: `Gemini API rate limit: ${errorMsg}` };
+    }
+    if (status === 400) {
+      return { statusCode: 400, errorType: 'invalid_request_error', clientMessage: `Gemini API bad request: ${errorMsg}` };
+    }
+    if (status === 401 || status === 403) {
+      return { statusCode: 401, errorType: 'authentication_error', clientMessage: `Gemini API auth error: ${errorMsg}` };
+    }
+    if (status === 404) {
+      return { statusCode: 404, errorType: 'not_found_error', clientMessage: `Gemini API not found: ${errorMsg}` };
+    }
+    return { statusCode: status >= 500 ? 500 : status, errorType: 'api_error', clientMessage: `Gemini API error: ${errorMsg}` };
+  }
+
+  // 文字列マッチによるフォールバック（GeminiApiError 以外の例外用）
+  const isRateLimit =
+    errorMsg.includes('QUOTA_EXHAUSTED') ||
+    errorMsg.includes('RESOURCE_EXHAUSTED') ||
+    (error as any)?.status === 429 ||
+    (error as any)?.name === 'TerminalQuotaError';
+
+  if (isRateLimit) {
+    // Claude Code は 500 をリトライするため、429 も 500 として返す
+    return { statusCode: 500, errorType: 'overloaded_error', clientMessage: `Gemini API quota exhausted or rate limit exceeded.` };
+  }
+
+  return { statusCode: 500, errorType: 'api_error', clientMessage: `Internal server error: ${errorMsg}` };
+}
 export const messagesRouter = Router();
 
 /**
@@ -146,28 +185,35 @@ messagesRouter.post('/', async (req: Request, res: Response) => {
         model: body.model,
         toolCalls: result.toolCalls,
       });
+
+      // Gemini が何も生成せずに終了した場合はエラーとして扱う
+      if (claudeResponse.content.length === 0) {
+        console.warn('[Warning] Gemini returned empty response, treating as error');
+        if (sessionId) {
+          sessionStore.deleteSession(sessionId);
+        }
+        res.status(500).json({
+          type: 'error',
+          error: {
+            type: 'api_error',
+            message: 'Gemini API returned an empty response',
+          },
+        });
+        return;
+      }
+
       res.json(claudeResponse);
     }
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error);
     console.error('[Error]', errorMsg);
     
-    // エラー発生時はセッションを強制的に破棄する (残留した壊れたストリームの再利用を防ぐため)
     if (sessionId) {
       sessionStore.deleteSession(sessionId);
       console.log(`[Error] Session ${sessionId} deleted due to error.`);
     }
 
-    // 429 エラー (クォータ超過等) を判別
-    const isRateLimit = 
-      errorMsg.includes('QUOTA_EXHAUSTED') || 
-      errorMsg.includes('RESOURCE_EXHAUSTED') ||
-      (error as any)?.status === 429 ||
-      (error as any)?.name === 'TerminalQuotaError';
-
-    const statusCode = isRateLimit ? 429 : 500;
-    const errorType = isRateLimit ? 'rate_limit_error' : 'api_error';
-    const clientMessage = isRateLimit ? 'Gemini API quota exhausted or rate limit exceeded.' : 'Internal server error';
+    const { statusCode, errorType, clientMessage } = classifyError(error);
 
     if (!res.headersSent) {
       res.status(statusCode).json({
@@ -178,7 +224,6 @@ messagesRouter.post('/', async (req: Request, res: Response) => {
         },
       });
     } else if (!res.writableEnded) {
-      // ストリーミング中のエラーは SSE イベントとして送信
       const errorPayload = JSON.stringify({
         type: 'error',
         error: {
