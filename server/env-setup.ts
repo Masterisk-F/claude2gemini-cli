@@ -66,25 +66,18 @@ export function setupProxyEnv() {
     }
   }
 
-  // gemini-cli 固有のシステムプロンプトが LLM に渡らないように各セクションを無効化する
-  const disabledPromptSections = [
-    'agentSkills',
-    'agentContexts',
-    'primaryWorkflows',
-    'planningWorkflow',
-    'operationalGuidelines',
-    'preamble',
-    'coreMandates',
-    'sandbox',
-    'git',
-    'finalReminder',
-    'hookContext',
-  ];
-
-  for (const section of disabledPromptSections) {
-    const envKey = `GEMINI_PROMPT_${section.toUpperCase()}`;
-    process.env[envKey] = '0';
+  // gemini-cli のシステムプロンプトを完全に置き換えるため、空の system.md を配置する。
+  // GEMINI_SYSTEM_MD にパスを指定すると、gemini-cli は内蔵プロンプトのアセンブリを
+  // 完全にスキップし、このファイルの内容だけをシステムプロンプトとして使用する。
+  const systemMdPath = path.join(proxyGemini, 'system.md');
+  if (!fs.existsSync(systemMdPath)) {
+    try {
+      fs.writeFileSync(systemMdPath, '');
+    } catch (error) {
+      console.warn(`[Proxy Env] Failed to create system.md:`, error);
+    }
   }
+  process.env.GEMINI_SYSTEM_MD = systemMdPath;
 
   console.log(`[Proxy] Overriding HOME to virtual directory: ${proxyHome}`);
   process.env.HOME = proxyHome;
