@@ -7,6 +7,8 @@
 
 import { randomUUID } from 'node:crypto';
 import type { Response } from 'express';
+import { GeminiApiError } from '../gemini-backend.js';
+import { classifyError } from '../routes/messages.js';
 
 /**
  * SSE レスポンスヘッダを設定する
@@ -172,6 +174,13 @@ export async function streamGeminiToClaudeSSE(
           hasProducedAnyBlock = true;
         }
         sendTextDelta(res, blockIndex, chunk.value as string);
+      } else if (chunk.type === 'error') {
+        // Gemini API エラー: GeminiApiError をスローして catch ブロックで処理
+        const errValue = (chunk as any).value?.error as { message?: string; status?: number } | undefined;
+        throw new GeminiApiError(
+          errValue?.message || 'Gemini API error',
+          errValue?.status,
+        );
       } else if (chunk.type === 'tool_call_request') {
         const callInfo = chunk.value;
         const callId = callInfo.callId;
@@ -258,15 +267,7 @@ export async function streamGeminiToClaudeSSE(
     
     sessionStore.deleteSession(sessionId);
 
-    // 429 エラーを判別
-    const isRateLimit = 
-      errorMsg.includes('QUOTA_EXHAUSTED') || 
-      errorMsg.includes('RESOURCE_EXHAUSTED') ||
-      (error as any)?.status === 429 ||
-      (error as any)?.name === 'TerminalQuotaError';
-
-    const errorType = isRateLimit ? 'rate_limit_error' : 'api_error';
-    const clientMessage = isRateLimit ? 'Gemini API quota exhausted or rate limit exceeded.' : 'Internal server error';
+    const { errorType, clientMessage } = classifyError(error);
 
     if (!res.writableEnded) {
       const errorPayload = JSON.stringify({

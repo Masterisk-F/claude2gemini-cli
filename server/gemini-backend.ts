@@ -12,6 +12,21 @@ import type { ClaudeToolDefinition, ClaudeToolUseBlock } from './types.js';
 import { convertClaudeToolToZodSchema } from './converters/tool-schema.js';
 import { sessionStore } from './session-store.js';
 
+/**
+ * Gemini API からのエラーを表すカスタムエラークラス。
+ * SDK がストリームイベントとして返すエラーをキャプチャし、
+ * HTTP ステータスコード情報を保持する。
+ */
+export class GeminiApiError extends Error {
+  constructor(
+    message: string,
+    public readonly status?: number,
+  ) {
+    super(message);
+    this.name = 'GeminiApiError';
+  }
+}
+
 export interface GeminiBackendOptions {
   sessionId?: string;
   instructions?: string;
@@ -248,6 +263,13 @@ export async function sendPromptAndCollect(
     if (chunk.type === 'content' && chunk.value) {
       // text は文字列 (SDK v0.36)
       fullText += chunk.value as string;
+    } else if (chunk.type === 'error') {
+      // Gemini API エラー: StructuredError を含むイベント
+      const errValue = (chunk as any).value?.error as { message?: string; status?: number } | undefined;
+      throw new GeminiApiError(
+        errValue?.message || 'Gemini API error',
+        errValue?.status,
+      );
     } else if (chunk.type === 'tool_call_request') {
       const callInfo = chunk.value;
       const callId = callInfo.callId;
