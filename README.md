@@ -66,16 +66,40 @@ npm run build
 cd ..
 ```
 
-### Authenticate with Google (required before first run)
+### Authenticate with Gemini (Multi-Account Support)
 
-This proxy uses **Gemini CLI's authentication** internally. You must log in with your Google account via Gemini CLI before starting the proxy:
+This proxy supports **multiple Gemini accounts** and distributes requests using a round-robin strategy. You can manage multiple authentication credentials via an interactive CLI tool.
+
+#### 1. Prepare your credentials
+Before adding an account to the proxy, you need an authorized `oauth_creds.json` file. You can generate one on any machine (including your host) by running:
 
 ```bash
 cd gemini-cli
-npx gemini  # Follow the browser-based login prompt
+npx gemini auth login
+# Follow the browser-based login prompt.
+# This creates ~/.gemini/oauth_creds.json
 ```
 
-Once authenticated, the credentials are cached locally and reused by the proxy automatically. You only need to do this once (unless your session expires).
+#### 2. Add accounts to the proxy
+Use the built-in management tool to add the contents of your `oauth_creds.json` to the proxy's account pool:
+
+```bash
+# Start the interactive add process
+npm run account:add
+```
+1. Enter a **label** for the account (e.g., your email address).
+2. Paste the **entire JSON content** of your `oauth_creds.json`.
+3. Press **Ctrl+D** to finish.
+
+The proxy will automatically start using the new account for incoming requests.
+
+#### 3. Manage accounts
+- **List registered accounts**: `npm run account:list`
+- **Remove an account**: `npm run account:remove`
+
+Registered accounts are stored securely in `data/accounts.json` (this directory is in `.gitignore`).
+
+---
 
 ### Run the Proxy
 
@@ -87,7 +111,7 @@ npm run dev
 PORT=3000 npm run dev
 ```
 
-The server starts on `http://localhost:8080` by default.
+The server starts on `http://localhost:8080` by default. If no accounts are registered in the pool, it will automatically fall back to using the default `~/.gemini` directory on your host machine.
 
 ### Configure your Claude client
 
@@ -106,33 +130,34 @@ curl http://localhost:8080/health
 # → {"status":"ok"}
 ```
 
+---
+
 ## Running with Docker
 
-You can run Claude2Gemini-CLI in a Docker container using the provided `docker-compose.yml` and `Dockerfile`.
+You can run Claude2Gemini-CLI in a Docker container. Accounts are persisted in a Docker volume.
 
 ### 1. Build and Start the Container
 
 ```bash
 docker compose up -d --build
 ```
-The proxy will be accessible at `http://localhost:8080`.
 
-### 2. Initial Authentication
+### 2. Manage Accounts in Docker
 
-Because the Gemini CLI uses a browser-based OAuth flow that is not directly available inside a container, you must perform the authentication manally on first run.
-
-Run the following command to start an interactive shell where you can authenticate:
+Since the management CLI is interactive, you must use `docker compose exec` to run it inside the container:
 
 ```bash
-docker compose run --rm -it claude2gemini bash -c "cd gemini-cli && npx gemini"
+# Add a new account
+docker compose exec -it claude2gemini npm run account:add
+
+# List accounts
+docker compose exec -it claude2gemini npm run account:list
+
+# Remove an account
+docker compose exec -it claude2gemini npm run account:remove
 ```
 
-1. You will see a message containing an authorization URL.
-2. Open that URL in your host machine's web browser.
-3. Sign in to your Google Account and copy the provided authorization code.
-4. Paste the code into the terminal and press Enter.
-
-Once authenticated, the credentials will be securely saved into the `.gemini` directory, which is persisted across container restarts via a Docker volume (`gemini-data`). You will not need to authenticate again unless your session expires.
+Registered account data is persisted via the `gemini-accounts` volume.
 
 ## License
 

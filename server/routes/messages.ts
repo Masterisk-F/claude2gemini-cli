@@ -13,6 +13,7 @@ import { buildClaudeResponse } from '../converters/response.js';
 import { setupSSEHeaders, streamGeminiToClaudeSSE } from '../converters/stream.js';
 import { sendPromptAndCollect, sendPromptStream, GeminiApiError } from '../gemini-backend.js';
 import { sessionStore } from '../session-store.js';
+import { accountPool } from '../account-pool.js';
 
 /**
  * Gemini API エラーを Claude API 形式のエラーに分類する。
@@ -150,6 +151,23 @@ messagesRouter.post('/', async (req: Request, res: Response) => {
       }
     }
 
+    // セッションに紐付くアカウントIDを取得または新規割り当て
+    let accountId: string | undefined = undefined;
+    if (sessionId) {
+      const existingSession = sessionStore.getSession(sessionId);
+      if (existingSession && existingSession.accountId) {
+        accountId = existingSession.accountId;
+        console.log(`[Session] Reusing account ${accountId} for session ${sessionId}`);
+      }
+    }
+
+    if (!accountId) {
+      accountId = accountPool.nextAccount(); // undefined の場合はフォールバック
+      if (accountId) {
+        console.log(`[Session] Assigned account ${accountId} for ${sessionId ? 'existing session ' + sessionId : 'new session'}`);
+      }
+    }
+
     // Claude メッセージ → Gemini プロンプト変換 (tool_result 返却時は空文字でよい)
     const prompt = sessionId ? '' : convertMessagesToPrompt(body.messages);
     const systemPrompt = extractSystemPrompt(body.system);
@@ -162,11 +180,18 @@ messagesRouter.post('/', async (req: Request, res: Response) => {
 
       const { stream, toolState, sessionId: newSessionId } = await sendPromptStream(prompt, {
         sessionId,
+        accountId,
         instructions: systemPrompt,
         model: mappedModel,
         tools: body.tools,
       });
       sessionId = newSessionId; // sessionId を outer scope に反映
+
+      // セッションにアカウントIDを保存
+      if (accountId) {
+        const sessionData = sessionStore.getOrCreateSession(newSessionId);
+        sessionData.accountId = accountId;
+      }
 
       const allowedToolNames = body.tools?.map((t) => t.name) || [];
       await streamGeminiToClaudeSSE(stream, res, body.model, toolState, newSessionId, sessionStore, allowedToolNames);
@@ -174,11 +199,18 @@ messagesRouter.post('/', async (req: Request, res: Response) => {
       // 非ストリーミングモード
       const result = await sendPromptAndCollect(prompt, {
         sessionId,
+        accountId,
         instructions: systemPrompt,
         model: mappedModel,
         tools: body.tools,
       });
       sessionId = result.sessionId; // sessionId を outer scope に反映
+
+      // セッションにアカウントIDを保存
+      if (accountId) {
+        const sessionData = sessionStore.getOrCreateSession(result.sessionId);
+        sessionData.accountId = accountId;
+      }
 
       const claudeResponse = buildClaudeResponse({
         text: result.text,
