@@ -67,6 +67,10 @@ interface SessionData {
     pendingNext?: Promise<IteratorResult<ServerGeminiStreamEvent, any>>;
     pendingToolCalls: Map<string, PendingToolCall>;
     toolState?: ToolState;
+    lastUsage?: {
+        input_tokens: number;
+        output_tokens: number;
+    };
 }
 
 const sessionStore = new Map<string, SessionData>();
@@ -378,6 +382,14 @@ async function consumeStream(
                     status: errValue?.status
                 });
                 return; // エラー時は関数終了
+            } else if (chunk.type === 'finished') {
+                const usage = chunk.value?.usageMetadata;
+                if (usage) {
+                    sessionData.lastUsage = {
+                        input_tokens: usage.promptTokenCount || 0,
+                        output_tokens: usage.candidatesTokenCount || 0,
+                    };
+                }
             } else if (chunk.type === 'tool_call_request') {
                 const callInfo = chunk.value;
                 const callId = callInfo.callId;
@@ -420,7 +432,12 @@ async function consumeStream(
             return;
         }
 
-        sendEvent({ type: 'turn_end', sessionId, stopReason });
+        sendEvent({
+            type: 'turn_end',
+            sessionId,
+            stopReason,
+            usage: sessionData.lastUsage,
+        });
 
     } catch (error) {
         console.error(`[Child Worker ${accountId}] Stream loop error:`, error);
