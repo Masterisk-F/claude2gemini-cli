@@ -36,8 +36,12 @@ function buildClaudeResponse({
   model: string;
   toolCalls: ClaudeToolUseBlock[];
 }) {
+  if (!text && toolCalls.length === 0) {
+    throw new Error('Gemini API returned an empty response');
+  }
+
   const content: any[] = [];
-  if (text || toolCalls.length === 0) {
+  if (text) {
     content.push({ type: 'text', text });
   }
 
@@ -269,6 +273,11 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
       res.json(claudeResponse);
     }
   } catch (error) {
+    if (res.headersSent) {
+      console.error(`[API Error after headers]`, error instanceof Error ? error.message : String(error));
+      return;
+    }
+
     const errorMsg = error instanceof Error ? error.message : String(error);
     console.error(`[API Error]`, errorMsg);
 
