@@ -105,7 +105,7 @@ function mapModelName(model: string): string {
 }
 
 // === NEW getSessionStream buffer logic ===
-async function* getSessionStream(accountId: string, sessionId: string): AsyncGenerator<ChildMessage> {
+function getSessionStream(accountId: string, sessionId: string): AsyncGenerator<ChildMessage> {
   let resolveNext: ((msg: ChildMessage) => void) | null = null;
   const buffer: ChildMessage[] = [];
 
@@ -120,25 +120,29 @@ async function* getSessionStream(accountId: string, sessionId: string): AsyncGen
     }
   });
 
-  try {
-    while (true) {
-      let msg: ChildMessage;
-      if (buffer.length > 0) {
-        msg = buffer.shift()!;
-      } else {
-        msg = await new Promise<ChildMessage>((resolve) => {
-          resolveNext = resolve;
-        });
-      }
-      yield msg;
+  async function* generator(): AsyncGenerator<ChildMessage> {
+    try {
+      while (true) {
+        let msg: ChildMessage;
+        if (buffer.length > 0) {
+          msg = buffer.shift()!;
+        } else {
+          msg = await new Promise<ChildMessage>((resolve) => {
+            resolveNext = resolve;
+          });
+        }
+        yield msg;
 
-      if (msg.type === 'turn_end' || msg.type === 'error' || msg.type === 'fatal_error') {
-        break;
+        if (msg.type === 'turn_end' || msg.type === 'error' || msg.type === 'fatal_error') {
+          break;
+        }
       }
+    } finally {
+      cleanup();
     }
-  } finally {
-    cleanup();
   }
+
+  return generator();
 }
 
 // POST /v1/messages
@@ -158,6 +162,7 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
     let isResuming = false;
     let accountId: string | undefined = undefined;
     let sessionId: string | undefined = undefined;
+    let stream: AsyncGenerator<ChildMessage> | undefined = undefined;
 
     const lastMessage = body.messages[body.messages.length - 1];
     if (lastMessage.role === 'user' && Array.isArray(lastMessage.content)) {
@@ -175,6 +180,9 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
             const sessionData = sessionStore.getSession(sessionId);
             if (sessionData && sessionData.accountId) {
               accountId = sessionData.accountId;
+              if (!stream) {
+                stream = getSessionStream(accountId, sessionId);
+              }
               await childManager.sendRequest(accountId, {
                 type: 'tool_result',
                 sessionId,
@@ -214,6 +222,10 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
       throw new Error("No accounts available in pool");
     }
 
+    if (!stream) {
+      stream = getSessionStream(accountId, sessionId);
+    }
+
     if (!isResuming) {
       const promptRequest: ParentMessage = {
         type: 'request',
@@ -227,7 +239,6 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
       await childManager.sendRequest(accountId, promptRequest);
     }
 
-    const stream = getSessionStream(accountId, sessionId);
     const allowedToolNames = body.tools?.map((t: any) => t.name) || [];
 
     if (body.stream) {
