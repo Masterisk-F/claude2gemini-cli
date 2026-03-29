@@ -162,7 +162,7 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
     let isResuming = false;
     let accountId: string | undefined = undefined;
     let sessionId: string | undefined = undefined;
-    let stream: AsyncGenerator<ChildMessage> | undefined = undefined;
+    const pendingToolResults: { toolCallId: string; result: string }[] = [];
 
     const lastMessage = body.messages[body.messages.length - 1];
     if (lastMessage.role === 'user' && Array.isArray(lastMessage.content)) {
@@ -172,7 +172,6 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
         console.log(`[ToolResult] ${toolResults.length} tool_result(s) received`);
 
         for (const tr of toolResults) {
-          const resultContent = normalizeToolResultContent(tr.content);
           const resolvedSessionId = sessionStore.resolveToolCall(tr.tool_use_id);
 
           if (resolvedSessionId) {
@@ -180,27 +179,15 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
             const sessionData = sessionStore.getSession(sessionId);
             if (sessionData && sessionData.accountId) {
               accountId = sessionData.accountId;
-              if (!stream) {
-                stream = getSessionStream(accountId, sessionId);
-              }
-              await childManager.sendRequest(accountId, {
-                type: 'tool_result',
-                sessionId,
-                toolCallId: tr.tool_use_id,
-                result: resultContent
-              });
-              isResuming = true;
             }
+            pendingToolResults.push({
+              toolCallId: tr.tool_use_id,
+              result: normalizeToolResultContent(tr.content),
+            });
+            isResuming = true;
           } else {
             console.warn(`[ToolResult] FAILED to resolve ${tr.tool_use_id} - falling back to stateless`);
           }
-        }
-
-        if (isResuming && accountId && sessionId) {
-          await childManager.sendRequest(accountId, {
-            type: 'resume_stream',
-            sessionId
-          });
         }
       }
     }
@@ -219,14 +206,29 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
     }
 
     if (!accountId) {
-      throw new Error("No accounts available in pool");
+      throw new Error('No accounts available in pool');
     }
 
-    if (!stream) {
-      stream = getSessionStream(accountId, sessionId);
-    }
+    // ストリームの初期化を一箇所に集約（最初のリクエスト送信前に行う）
+    const stream = getSessionStream(accountId, sessionId);
 
-    if (!isResuming) {
+    if (isResuming) {
+      // 解決済みの tool_result を順次送信
+      for (const ptr of pendingToolResults) {
+        await childManager.sendRequest(accountId, {
+          type: 'tool_result',
+          sessionId,
+          toolCallId: ptr.toolCallId,
+          result: ptr.result,
+        });
+      }
+      // ストリーム再開をリクエスト
+      await childManager.sendRequest(accountId, {
+        type: 'resume_stream',
+        sessionId,
+      });
+    } else {
+      // 通常の新規リクエストを送信
       const promptRequest: ParentMessage = {
         type: 'request',
         id: `req-${Date.now()}`,
@@ -234,7 +236,7 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
         system: extractSystemPrompt(body.system),
         messages: body.messages,
         model: mapModelName(body.model),
-        tools: body.tools
+        tools: body.tools,
       };
       await childManager.sendRequest(accountId, promptRequest);
     }
