@@ -380,7 +380,6 @@ async function consumeStream(
                 return; // エラー時は関数終了
             } else if (chunk.type === 'tool_call_request') {
                 const callInfo = chunk.value;
-                console.log(`[Child Worker ${accountId}] [DEBUG] tool_call_request raw:`, JSON.stringify(callInfo, null, 2));
                 const callId = callInfo.callId;
                 const name = callInfo.name;
 

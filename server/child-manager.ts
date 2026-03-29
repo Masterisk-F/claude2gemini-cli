@@ -122,17 +122,11 @@ class ChildManager extends EventEmitter {
         console.log(`[ChildManager] Connection established for ${accountId}`);
     }
 
-    /**
-     * 複数アカウントのプロセスを一括起動
-     */
     async spawnAll(accountIds: string[]): Promise<void> {
         const promises = accountIds.map(id => this.spawnChild(id));
         await Promise.all(promises);
     }
 
-    /**
-     * 指定したアカウントの子プロセスへメッセージを送信する
-     */
     async sendRequest(accountId: string, message: ParentMessage): Promise<void> {
         const conn = this.children.get(accountId);
         if (!conn) {
