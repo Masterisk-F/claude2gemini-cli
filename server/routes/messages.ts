@@ -171,6 +171,7 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
 
       if (toolResults.length > 0) {
         console.log(`[ToolResult] ${toolResults.length} tool_result(s) received`);
+        const sessionsToResume = new Map<string, string>(); // sessionId -> accountId
 
         for (const tr of toolResults) {
           const resultContent = normalizeToolResultContent(tr.content);
@@ -187,6 +188,7 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
                 toolCallId: tr.tool_use_id,
                 result: resultContent
               });
+              sessionsToResume.set(sessionId, accountId);
               isResuming = true;
             }
           } else {
@@ -194,10 +196,10 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
           }
         }
 
-        if (isResuming && accountId && sessionId) {
-          await childManager.sendRequest(accountId, {
+        for (const [sId, aId] of sessionsToResume.entries()) {
+          await childManager.sendRequest(aId, {
             type: 'resume_stream',
-            sessionId
+            sessionId: sId
           });
         }
       }
