@@ -49,9 +49,13 @@ class AccountPool {
 
     const account = this.accounts[this.currentIndex];
     this.currentIndex = (this.currentIndex + 1) % this.accounts.length;
-    
+
     console.log(`[AccountPool] Assigned account: ${account.label} (${account.id})`);
     return account.id;
+  }
+
+  getAccountIds(): string[] {
+    return this.accounts.map(a => a.id);
   }
 
   getAccountHome(accountId: string): string {

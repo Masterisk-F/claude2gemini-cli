@@ -7,72 +7,34 @@ Claude2Gemini-CLI is a translation proxy that bridges two fundamentally differen
 - **Claude Messages API** — Stateless, request/response model. Every HTTP request contains the full conversation history.
 - **Gemini CLI SDK** — Stateful agent loop. A single `sendStream()` call runs an internal loop that automatically handles tool execution via callbacks.
 
-The proxy reconciles these differences by converting Claude's stateless requests into Gemini's stateful sessions, using Promise-based suspension to bridge the tool execution gap.
+Historically, the proxy ran the Gemini CLI SDK in-process. However, the SDK uses a global module-level cache for authentication clients. To safely support multiple accounts operating concurrently, the proxy now uses a **Parent/Child Process Isolation** architecture.
 
 ---
 
 ## Component Architecture
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                     Express Server (index.ts)                   │
-│                        Port 8080                                │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌───────────────────────────────────────────────────────────┐  │
-│  │              POST /v1/messages (routes/messages.ts)        │  │
-│  │                                                           │  │
-│  │  1. Validate request (model, messages, max_tokens)        │  │
-│  │  2. Detect tool_result messages → session resume          │  │
-│  │  3. Convert messages → prompt                             │  │
-│  │  4. Dispatch to streaming or non-streaming path           │  │
-│  └───────────────┬────────────────────┬──────────────────────┘  │
-│                  │                    │                          │
-│         ┌────────▼────────┐  ┌───────▼─────────┐               │
-│         │  Non-Streaming  │  │   Streaming      │               │
-│         │  response.ts    │  │   stream.ts      │               │
-│         └────────┬────────┘  └───────┬──────────┘               │
-│                  │                    │                          │
-│         ┌────────▼────────────────────▼──────────────────────┐  │
-│         │           gemini-backend.ts                         │  │
-│         │                                                    │  │
-│         │  • createAgent() — SDK agent + tool registration   │  │
-│         │  • sendPromptStream() — session creation/resume    │  │
-│         │  • sendPromptAndCollect() — non-streaming wrapper  │  │
-│         └────────────────────┬───────────────────────────────┘  │
-│                              │                                  │
-│         ┌────────────────────▼───────────────────────────────┐  │
-│         │           session-store.ts                          │  │
-│         │                                                    │  │
-│         │  • Session lifecycle (create, resume, delete)       │  │
-│         │  • Pending tool call tracking (toolCallId → Promise)│  │
-│         │  • AsyncGenerator stream preservation               │  │
-│         │  • ToolState persistence across turns               │  │
-│         └────────────────────────────────────────────────────┘  │
-│                                                                 │
-│  ┌──── Converters ──────────────────────────────────────────┐   │
-│  │                                                          │   │
-│  │  request.ts       — Claude messages → Gemini prompt text │   │
-│  │  response.ts      — Gemini output → Claude JSON response │   │
-│  │  stream.ts        — Gemini events → Claude SSE events    │   │
-│  │  tool-schema.ts   — JSON Schema → Zod schema conversion  │   │
-│  │                                                          │   │
-│  └──────────────────────────────────────────────────────────┘   │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                    ┌─────────▼──────────┐
-                    │  Gemini CLI SDK    │
-                    │  (git submodule)   │
-                    │                    │
-                    │  GeminiCliAgent    │
-                    │  GeminiCliSession  │
-                    │  sendStream()      │
-                    └─────────┬──────────┘
-                              │
-                    ┌─────────▼──────────┐
-                    │  Google Gemini API │
-                    └────────────────────┘
+```mermaid
+flowchart TD
+    subgraph Parent_Process ["Parent Process (Express Server)"]
+        A[POST /v1/messages] --> B[messages.ts]
+        B -->|Round-Robin| C[AccountPool]
+        B -->|Session Routing| D[SessionStore]
+        B --> E[ChildManager]
+        E -->|UNIX Socket| F[IPC stream / SSE conversion]
+    end
+
+    subgraph Child_Processes ["Child Processes (Node.js Workers)"]
+        G[ChildWorker Account A]
+        H[ChildWorker Account B]
+        
+        G -.->|SDK instance| G1[GeminiCliAgent]
+        H -.->|SDK instance| H1[GeminiCliAgent]
+    end
+    
+    E == NDJSON IPC ==> G
+    E == NDJSON IPC ==> H
+    G1 -.->|Network| I[Google Gemini API]
+    H1 -.->|Network| I
 ```
 
 ---
@@ -81,135 +43,130 @@ The proxy reconciles these differences by converting Claude's stateless requests
 
 ### `server/index.ts`
 
-Express application entry point. Configures JSON body parsing (200MB limit for large conversation histories), registers the `/v1/messages` route, and provides a `/health` endpoint.
+Express application entry point. Configures JSON body parsing (200MB limit for large conversation histories), registers the `/v1/messages` route, and initializes the `accountPool` and `childManager` upon startup.
+
+### `server/child-manager.ts`
+
+Manages the lifecycle of child worker processes.
+- Spawns a dedicated Node.js child process (`child-worker.ts`) for each configured account.
+- Connects to each worker via UNIX Domain Sockets.
+- Handles message routing (Parent ↔ Child) and auto-restarts workers if they crash.
+
+### `server/child-worker.ts`
+
+The isolated execution boundary for the Gemini CLI SDK.
+- Restricts `process.env.GEMINI_CLI_HOME` to a specific temporary account directory.
+- Runs a UNIX socket server to receive instructions (NDJSON) from the Parent process.
+- Instantiates `GeminiCliAgent`, executes SDK flows, and intercepts `ServerGeminiStreamEvent`.
+- Forwards output chunks, tool requests, and errors back to the Parent process.
+
+### `server/ipc-protocol.ts`
+
+Defines TypeScript interfaces for NDJSON communication between Parent and Child processes.
+- **ParentMessage**: `request`, `tool_result`, `resume_stream`
+- **ChildMessage**: `stream_event`, `tool_call`, `turn_end`, `error`, `fatal_error`, `ready`
 
 ### `server/routes/messages.ts`
 
 The core request handler for `POST /v1/messages`. Responsibilities:
-
 1. **Request validation** — Checks `messages`, `max_tokens`, and `model` fields
-2. **Tool result detection** — Inspects the last message for `tool_result` blocks to determine if this is a session resume
-3. **Session resume** — Resolves pending tool call Promises via `SessionStore.resolveToolCall()`
-4. **Prompt conversion** — Delegates to `convertMessagesToPrompt()` for new conversations
-5. **Response dispatch** — Routes to streaming (SSE) or non-streaming path
-6. **Error handling** — Returns Claude-compatible error responses; sends SSE `event: error` during active streams
-
-### `server/gemini-backend.ts`
-
-Manages the Gemini CLI SDK lifecycle:
-
-- **`createAgent()`** — Creates a `GeminiCliAgent` with dynamically registered tools. Each tool's `action` callback returns a Promise that suspends the SDK's internal agent loop until the Claude client sends back a `tool_result`.
-- **`sendPromptStream()`** — Creates a new agent session or resumes an existing one. On resume, the same `ToolState` object is reused (counters and callIds reset) to maintain closure compatibility with action callbacks.
-- **`sendPromptAndCollect()`** — Non-streaming wrapper that consumes the AsyncGenerator and collects text + tool calls.
+2. **Tool result routing** — Inspects the last message for `tool_result` blocks. Lookups pending tool calls in `SessionStore` and forwards results via `ChildManager`.
+3. **Session resume** — Sends a `resume_stream` IPC message to instruct the Child Worker to continue consumption of an active SDK stream.
+4. **Response dispatch** — Consumes `ChildMessage` streams and routes to formatting functions.
+5. **Error handling** — Returns Claude-compatible error responses.
 
 ### `server/session-store.ts`
 
-In-memory state management for active tool execution sessions:
-
-| Data | Purpose |
-|------|---------|
-| `SessionData.stream` | The Gemini SDK's `AsyncGenerator` — preserved across HTTP requests |
-| `SessionData.pendingToolCalls` | Map of `toolCallId → { resolve, reject }` Promises |
-| `SessionData.toolState` | Shared `ToolState` object for closure compatibility |
-| `toolCallToSessionId` | Reverse index: `toolCallId → sessionId` for stateless lookups |
+Lightweight state management for the Parent process:
+- Directs clients back to the correct child worker by maintaining a map of `sessionId → accountId`.
+- Resolves stateless tool results to their original sessions via a reverse index: `toolCallId → sessionId`.
 
 ### `server/converters/request.ts`
 
 Converts Claude message arrays into Gemini prompt strings:
-
-- **Single user message** → Plain text extraction
-- **Multi-turn** → Role-labeled conversation text (`User: ...`, `Assistant: ...`)
-- **Tool blocks** → Text representations (`[Tool Call: name({...})]`, `[Tool Result: ...]`)
-- **Model name mapping** — `mapModelName()` converts Claude model names to Gemini equivalents (opus → `gemini-3.1-pro-preview`, sonnet → `gemini-3-flash-preview`, haiku → `gemini-2.5-flash-lite`)
-- **System prompt extraction** — `extractSystemPrompt()` normalizes various system prompt formats
-
-### `server/converters/response.ts`
-
-Builds Claude-compatible JSON responses from Gemini output. Handles both text-only and tool-use responses, generating appropriate `stop_reason` (`end_turn` vs `tool_use`).
+- **Role-labeled conversation text** (`User: ...`, `Assistant: ...`)
+- **Tool blocks** → Text representations (`[Tool Call: ...]`)
+- **Model name mapping** — Converts Claude model names to Gemini equivalents (e.g. sonnet → `gemini-3-flash-preview`)
 
 ### `server/converters/stream.ts`
 
-The most complex converter. Transforms Gemini's `ServerGeminiStreamEvent` async generator into Claude SSE events in real-time:
+Transforms NDJSON IPC events emitted by `ChildWorker` into standard Claude SSE events in real-time:
 
 ```
-Gemini Event Flow                    Claude SSE Event Flow
-─────────────────                    ─────────────────────
+IPC Event (ChildMessage)             Claude SSE Event Flow
+────────────────────────             ─────────────────────
                                      event: message_start
-content (text)           ──────►     event: content_block_start (text)
-                                     event: content_block_delta (text_delta) × N
+stream_event (content)   ──────►     event: content_block_start (text)
+                                     event: content_block_delta (text_delta)
                                      event: content_block_stop
 
-tool_call_request        ──────►     event: content_block_start (tool_use)
+tool_call                ──────►     event: content_block_start (tool_use)
                                      event: content_block_delta (input_json_delta)
                                      event: content_block_stop
 
-stream done / tool turn  ──────►     event: message_delta (stop_reason)
+turn_end                 ──────►     event: message_delta (stop_reason)
                                      event: message_stop
 ```
 
-Key behaviors:
-- **Built-in tool filtering** — Gemini's internal tools (e.g., `google:run_shell_command`) are silently consumed; only client-defined tools are forwarded as `tool_use` events
-- **Tool turn synchronization** — Uses `ToolState.expectedClientTools` / `registeredClientTools` counters to detect when all parallel tool calls have been registered before resolving the turn
-
-### `server/converters/tool-schema.ts`
-
-Converts Claude's JSON Schema tool definitions into Zod schemas at runtime. Supports:
-
-- Primitive types: `string`, `number`, `integer`, `boolean`
-- Complex types: `object` (recursive), `array`
-- Enums: `enum` arrays
-- Required fields and optional properties
-
-### `server/types.ts`
-
-TypeScript type definitions for Claude API request/response structures, SSE event types, and tool-related interfaces.
+To combat race conditions, `stream.ts` implements a buffer layer within `getSessionStream` that caches IPC messages arriving before the Parent has initiated `await new Promise(...)` pulling loops.
 
 ---
 
-## Core Design: Tool Use Bridge
+## Core Design: Tool Use and Process Bridging
 
-The most challenging aspect of this proxy is bridging the tool execution models:
+The most challenging aspect of this proxy is bridging the synchronous Claude tool paradigm with the stateful, callback-based SDK across a process boundary.
 
+### Execution Flow
+
+```mermaid
+sequenceDiagram
+    participant C as Claude Client
+    participant P as Parent Router
+    participant Ch as Child Worker (account-A)
+    participant SDK as Gemini SDK
+    
+    C->>P: POST /v1/messages {prompt, tools}
+    P->>P: Select account "A"
+    P->>Ch: IPC: { type: "request", prompt, ... }
+    
+    Note over Ch,SDK: Child process isolation
+    Ch->>SDK: createAgent().sendStream()
+    
+    loop Stream Output
+        SDK-->>Ch: Stream event (content)
+        Ch->>P: IPC: { type: "stream_event", ... }
+        P->>C: SSE content_block_delta
+    end
+    
+    SDK-->>Ch: tool_call_request
+    Ch->>P: IPC: { type: "tool_call", args: {...} }
+    P->>P: Register in SessionStore
+    P->>C: SSE tool_use block
+    
+    SDK-->>Ch: turn_end
+    Ch->>P: IPC: { type: "turn_end", stopReason: "tool_use" }
+    P->>C: SSE message_stop
+    
+    Note over Ch: Child Worker halts stream loop,<br>SDK Action Promise is pending
+    
+    C->>P: POST /v1/messages {tool_result}
+    P->>P: Lookup SessionStore -> account "A"
+    P->>Ch: IPC: { type: "tool_result", result: "..." }
+    Note over Ch,SDK: SDK tool callback resolves
+    
+    P->>Ch: IPC: { type: "resume_stream" }
+    Note over Ch: Child Worker resumes stream loop
+    
+    SDK-->>Ch: Next chunk / turn_end
+    Ch->>P: IPC: { type: "turn_end", stopReason: "end_turn" }
+    P->>C: SSE message_stop
 ```
-Claude Client                    Proxy                         Gemini SDK
-────────────                     ─────                         ──────────
-1. Send request with tools  ──►
-                                 2. Create agent with tools
-                                    (action = Promise)
-                                 3. Call sendStream(prompt) ──► 4. Agent processes prompt
-                                                                5. Decides to call a tool
-                                                           ◄──  6. Triggers action callback
-                                 7. action() creates Promise
-                                    and stores resolve() in
-                                    SessionStore
-                                 8. Sends tool_use SSE     ──►
-◄── 9. Receives tool_use
-10. Executes tool locally
-11. Sends tool_result      ──►
-                                12. Looks up resolve() in
-                                    SessionStore
-                                13. resolve(result)        ──► 14. Agent loop resumes
-                                                                15. Processes result
-                                                                16. Generates response
-                                                           ◄── 17. Streams response
-                            ◄── 18. Forwards as SSE
-```
 
-### Multi-Turn ToolState Consistency
+### Multi-Account Concurrency & Isolation
 
-A critical invariant: the `ToolState` object referenced by `createAgent()`'s action closures **must be the same object** used by `stream.ts` when consuming the generator.
-
-On session resume (turn 2+), `sendPromptStream()` retrieves the **original** `ToolState` from `SessionData` instead of creating a new one. Only the counters and `callIds` map are reset:
-
-```typescript
-// Resume path in sendPromptStream()
-const toolState = session.toolState as ToolState;
-toolState.callIds.clear();
-toolState.expectedClientTools = 0;
-toolState.registeredClientTools = 0;
-```
-
-This ensures action closures and stream consumers always share the same state across all turns.
+- **Bypassing Global Caches**: The Gemini CLI SDK uses file-system global config reads and cache modules per Node.js memory space. Previously, the proxy attempted to isolate these using an `AsyncLocalStorage` proxy over `process.env`.
+- **Absolute Process Separation**: Currently, every account gets its own fully-isolated Node.js `fork()`, ensuring the global Node.js module cache is 100% safe.
+- **Resilience**: If a Child Worker encounters an unexpected error or exits, `ChildManager` immediately reconstructs it, preventing process-level corruption from bleeding into other active accounts.
 
 ---
 
@@ -217,6 +174,5 @@ This ensures action closures and stream consumers always share the same state ac
 
 - **No image/file content** — Only text content blocks are supported
 - **No conversation caching** — Gemini SDK manages its own conversation state; multi-turn history is flattened into prompt text
-- **In-memory sessions** — Sessions are lost on server restart
-- **Single-process** — No horizontal scaling support (session state is process-local)
-- **Built-in tool leakage** — Gemini may internally invoke tools like `google:run_shell_command` or `web_fetch` that are outside the client's defined tool set; these are filtered but may affect response quality
+- **In-memory sessions** — Parent sessions and Child streams are lost on proxy restart
+- **Single-node** — Designed for single-server execution; multiple proxies would require external session orchestration (e.g. Redis).
