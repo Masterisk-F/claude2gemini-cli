@@ -51,6 +51,10 @@ class ChildManager extends EventEmitter {
                 console.error(`[ChildManager] Child worker for ${accountId} exited with code ${code}.`);
                 this.children.delete(accountId);
                 this.emit('child_exit', accountId);
+                // 自動再起動（非同期・エラーはログのみ）
+                this.spawnChild(accountId).catch((err) => {
+                    console.error(`[ChildManager] Failed to restart child for ${accountId}:`, err);
+                });
             });
 
             let resolveReady: () => void;
