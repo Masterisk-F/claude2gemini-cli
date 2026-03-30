@@ -173,6 +173,14 @@ class ChildManager extends EventEmitter {
     }
 
     /**
+     * 子プロセス終了イベントのリスナーを登録
+     */
+    onChildExit(handler: (accountId: string) => void): (() => void) {
+        this.on('child_exit', handler);
+        return () => this.off('child_exit', handler);
+    }
+
+    /**
      * プロセスを終了する
      */
     killAll(): void {

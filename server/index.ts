@@ -42,5 +42,19 @@ server.on('error', (err: NodeJS.ErrnoException) => {
   } else {
     console.error(`[Error] Failed to start proxy:`, err.message);
   }
+  childManager.killAll();
   process.exit(1);
+});
+
+// 終了シグナルハンドラ: 子プロセスを確実に終了させる
+process.on('SIGINT', () => {
+  console.log('\n[Shutdown] Received SIGINT, killing child processes...');
+  childManager.killAll();
+  process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+  console.log('\n[Shutdown] Received SIGTERM, killing child processes...');
+  childManager.killAll();
+  process.exit(0);
 });

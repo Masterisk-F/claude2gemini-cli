@@ -126,6 +126,24 @@ async function* getSessionStream(accountId: string, sessionId: string): AsyncGen
     }
   });
 
+  // 子プロセス終了時のハンドラを登録
+  const exitCleanup = childManager.onChildExit((exitedAccountId) => {
+    if (exitedAccountId === accountId) {
+      // 子プロセスが終了したらエラーメッセージを生成
+      const exitMsg: ChildMessage = {
+        type: 'fatal_error',
+        sessionId,
+        message: 'Child process exited unexpectedly'
+      };
+      if (resolveNext) {
+        resolveNext(exitMsg);
+        resolveNext = null;
+      } else {
+        buffer.push(exitMsg);
+      }
+    }
+  });
+
   try {
     while (true) {
       let msg: ChildMessage;
@@ -144,6 +162,7 @@ async function* getSessionStream(accountId: string, sessionId: string): AsyncGen
     }
   } finally {
     cleanup();
+    exitCleanup();
   }
 }
 
@@ -222,6 +241,11 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
       throw new Error("No accounts available in pool");
     }
 
+    // 先にストリームリスナーを登録してからリクエストを送信
+    // (リクエスト送信とリスナー登録の競合でメッセージが失われるのを防ぐ)
+    const stream = getSessionStream(accountId, sessionId);
+    const allowedToolNames = body.tools?.map((t: any) => t.name) || [];
+
     if (!isResuming) {
       const promptRequest: ParentMessage = {
         type: 'request',
@@ -234,9 +258,6 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
       };
       await childManager.sendRequest(accountId, promptRequest);
     }
-
-    const stream = getSessionStream(accountId, sessionId);
-    const allowedToolNames = body.tools?.map((t: any) => t.name) || [];
 
     if (body.stream) {
       setupSSEHeaders(res);

@@ -70,6 +70,7 @@ export type ChildMessage =
     }
     | {
         type: 'fatal_error';
+        sessionId: string;
         message: string;
     };
 
