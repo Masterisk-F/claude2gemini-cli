@@ -1,4 +1,4 @@
-import { fork, type ChildProcess } from 'node:child_process';
+import { fork, spawn, type ChildProcess } from 'node:child_process';
 import net from 'node:net';
 import path from 'node:path';
 import os from 'node:os';
@@ -38,14 +38,26 @@ class ChildManager extends EventEmitter {
         const spawnPromise = (async () => {
             const socketPath = path.join(os.tmpdir(), `c2g-worker-${os.userInfo().username}-${accountId}.sock`);
 
-            // 子プロセスを起動 (tsx 環境であれば自動的に引き継がれる)
-            const child = fork(CHILD_WORKER_SCRIPT, [
-                `--account-id=${accountId}`,
-                `--socket=${socketPath}`
-            ], {
-                // 標準出力・標準エラー出力を親プロセスに引き継ぐ
-                stdio: ['ignore', 'inherit', 'inherit', 'ipc']
-            });
+            // 子プロセスを起動
+            let child: ChildProcess;
+            if (ext === '.ts') {
+                // TypeScript環境の場合は tsx を使用
+                child = spawn('npx', ['tsx', CHILD_WORKER_SCRIPT,
+                    `--account-id=${accountId}`,
+                    `--socket=${socketPath}`
+                ], {
+                    stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
+                    shell: true // npx を使うために shell: true が必要な場合がある
+                });
+            } else {
+                // ビルド済みの場合は通常の fork
+                child = fork(CHILD_WORKER_SCRIPT, [
+                    `--account-id=${accountId}`,
+                    `--socket=${socketPath}`
+                ], {
+                    stdio: ['ignore', 'inherit', 'inherit', 'ipc']
+                });
+            }
 
             child.on('exit', (code) => {
                 console.error(`[ChildManager] Child worker for ${accountId} exited with code ${code}.`);

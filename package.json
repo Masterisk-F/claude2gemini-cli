@@ -4,6 +4,7 @@
   "description": "Claude API compatible proxy backed by Gemini CLI SDK",
   "type": "module",
   "scripts": {
+    "test": "vitest",
     "dev": "tsx server/index.ts",
     "build": "tsc",
     "start": "node dist/server/index.js",
@@ -19,8 +20,11 @@
   "devDependencies": {
     "@types/express": "^5.0.0",
     "@types/node": "^22.0.0",
+    "@types/supertest": "^7.2.0",
+    "supertest": "^7.2.2",
     "tsx": "^4.20.3",
-    "typescript": "^5.3.3"
+    "typescript": "^5.3.3",
+    "vitest": "^4.1.2"
   },
   "engines": {
     "node": ">=20"

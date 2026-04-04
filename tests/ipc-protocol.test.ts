@@ -1,5 +1,4 @@
-import test from 'node:test';
-import assert from 'node:assert';
+import { test, expect } from 'vitest';
 import { serializeIPCMessage, parseIPCMessage, type ParentMessage, type ChildMessage } from '../server/ipc-protocol.js';
 
 test('IPC Protocol: serialize and parse ParentMessage', () => {
@@ -12,10 +11,10 @@ test('IPC Protocol: serialize and parse ParentMessage', () => {
     };
 
     const serialized = serializeIPCMessage(msg);
-    assert.strictEqual(serialized.endsWith('\n'), true, 'Must end with newline');
+    expect(serialized.endsWith('\n')).toBe(true);
 
     const parsed = parseIPCMessage<ParentMessage>(serialized);
-    assert.deepStrictEqual(parsed, msg);
+    expect(parsed).toEqual(msg);
 });
 
 test('IPC Protocol: serialize and parse ChildMessage', () => {
@@ -27,7 +26,7 @@ test('IPC Protocol: serialize and parse ChildMessage', () => {
 
     const serialized = serializeIPCMessage(msg);
     const parsed = parseIPCMessage<ChildMessage>(serialized);
-    assert.deepStrictEqual(parsed, msg);
+    expect(parsed).toEqual(msg);
 });
 
 test('IPC Protocol: turn_end message', () => {
@@ -39,5 +38,5 @@ test('IPC Protocol: turn_end message', () => {
 
     const serialized = serializeIPCMessage(msg);
     const parsed = parseIPCMessage<ChildMessage>(serialized);
-    assert.deepStrictEqual(parsed, msg);
+    expect(parsed).toEqual(msg);
 });

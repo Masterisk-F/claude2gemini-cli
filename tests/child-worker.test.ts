@@ -1,5 +1,4 @@
-import test from 'node:test';
-import assert from 'node:assert';
+import { test, expect } from 'vitest';
 import { spawn } from 'node:child_process';
 import net from 'node:net';
 import readline from 'node:readline';
@@ -10,44 +9,37 @@ test('Child Worker: startup, ready event, and handle request', async () => {
     const accountId = 'test-worker';
 
     // Child Worker 起動
-    const child = spawn('npx', ['tsx', 'server/child-worker.ts', `--account-id=${accountId}`, `--socket=${socketPath}`], {
-        stdio: 'ignore'
+    const child = spawn('./node_modules/.bin/tsx', ['server/child-worker.ts', `--account-id=${accountId}`, `--socket=${socketPath}`], {
+        stdio: 'inherit'
     });
 
     try {
-        // ソケットが作成されるまで待機
-        await new Promise((resolve, reject) => {
-            let retries = 0;
-            const interval = setInterval(() => {
+        let client: net.Socket | null = null;
+        let receivedReady = false;
+        let receivedResponse = false;
+        const messages: ChildMessage[] = [];
+
+        // ソケットが作成されるまでリトライしながら接続
+        const connect = async () => {
+            for (let i = 0; i < 100; i++) {
                 try {
-                    const client = net.connect(socketPath, () => {
-                        clearInterval(interval);
-                        resolve(client);
-                    });
-                    client.on('error', () => {
-                        retries++;
-                        if (retries > 100) {
-                            clearInterval(interval);
-                            reject(new Error('Socket connection timeout'));
-                        }
+                    return await new Promise<net.Socket>((resolve, reject) => {
+                        const s = net.connect(socketPath);
+                        s.on('connect', () => resolve(s));
+                        s.on('error', reject);
                     });
                 } catch (e) {
-                    // Ignore
+                    await new Promise(r => setTimeout(r, 100));
                 }
-            }, 100);
-        });
+            }
+            throw new Error('Socket connection timeout after 100 retries');
+        };
 
-        const client = net.createConnection(socketPath);
-
+        client = await connect();
         const rl = readline.createInterface({
             input: client,
             crlfDelay: Infinity
         });
-
-        let receivedReady = false;
-        let receivedResponse = false;
-
-        const messages: ChildMessage[] = [];
 
         rl.on('line', (line) => {
             if (!line.trim()) return;
@@ -56,7 +48,6 @@ test('Child Worker: startup, ready event, and handle request', async () => {
 
             if (msg.type === 'ready') {
                 receivedReady = true;
-                // Ready 受信後にリクエストを送信
                 const req: ParentMessage = {
                     type: 'request',
                     id: 'req-1',
@@ -64,27 +55,27 @@ test('Child Worker: startup, ready event, and handle request', async () => {
                     model: 'gemini-1.5-flash',
                     messages: [{ role: 'user', content: 'Hello API' }]
                 };
-                client.write(serializeIPCMessage(req));
+                client?.write(serializeIPCMessage(req));
             } else if (msg.type === 'error') {
-                // credential がないため、認証エラーなどが返るはず
                 receivedResponse = true;
             }
         });
 
-        // 最大10秒間、ready と response を待つ
-        await new Promise((resolve) => setTimeout(resolve, 10000));
+        // ready と response を待つ
+        const startTime = Date.now();
+        while (!(receivedReady && receivedResponse) && Date.now() - startTime < 15000) {
+            await new Promise((resolve) => setTimeout(resolve, 100));
+        }
 
-        assert.strictEqual(receivedReady, true, 'Did not receive ready event from child worker');
-        assert.strictEqual(receivedResponse, true, 'Did not receive error response for invalid credentials from child worker');
+        expect(receivedReady).toBe(true);
+        expect(receivedResponse).toBe(true);
     } finally {
-        // クリーンアップ
         child.kill();
         try {
-            import('node:fs').then(fs => {
-                if (fs.existsSync(socketPath)) {
-                    fs.unlinkSync(socketPath);
-                }
-            });
+            const fs = await import('node:fs');
+            if (fs.existsSync(socketPath)) {
+                fs.unlinkSync(socketPath);
+            }
         } catch (e) { }
     }
-});
+}, 25000);
