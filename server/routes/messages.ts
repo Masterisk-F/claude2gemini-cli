@@ -111,7 +111,7 @@ function mapModelName(model: string): string {
 }
 
 // === NEW getSessionStream buffer logic ===
-async function* getSessionStream(accountId: string, sessionId: string): AsyncGenerator<ChildMessage> {
+function getSessionStream(accountId: string, sessionId: string): AsyncGenerator<ChildMessage> {
   let resolveNext: ((msg: ChildMessage) => void) | null = null;
   const buffer: ChildMessage[] = [];
 
@@ -144,26 +144,30 @@ async function* getSessionStream(accountId: string, sessionId: string): AsyncGen
     }
   });
 
-  try {
-    while (true) {
-      let msg: ChildMessage;
-      if (buffer.length > 0) {
-        msg = buffer.shift()!;
-      } else {
-        msg = await new Promise<ChildMessage>((resolve) => {
-          resolveNext = resolve;
-        });
-      }
-      yield msg;
+  async function* generator(): AsyncGenerator<ChildMessage> {
+    try {
+      while (true) {
+        let msg: ChildMessage;
+        if (buffer.length > 0) {
+          msg = buffer.shift()!;
+        } else {
+          msg = await new Promise<ChildMessage>((resolve) => {
+            resolveNext = resolve;
+          });
+        }
+        yield msg;
 
-      if (msg.type === 'turn_end' || msg.type === 'error' || msg.type === 'fatal_error') {
-        break;
+        if (msg.type === 'turn_end' || msg.type === 'error' || msg.type === 'fatal_error') {
+          break;
+        }
       }
+    } finally {
+      cleanup();
+      exitCleanup();
     }
-  } finally {
-    cleanup();
-    exitCleanup();
   }
+
+  return generator();
 }
 
 // POST /v1/messages
@@ -183,6 +187,7 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
     let isResuming = false;
     let accountId: string | undefined = undefined;
     let sessionId: string | undefined = undefined;
+    const pendingToolResults: { toolCallId: string; result: string }[] = [];
 
     const lastMessage = body.messages[body.messages.length - 1];
     if (lastMessage.role === 'user' && Array.isArray(lastMessage.content)) {
@@ -193,7 +198,6 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
         const sessionsToResume = new Map<string, string>(); // sessionId -> accountId
 
         for (const tr of toolResults) {
-          const resultContent = normalizeToolResultContent(tr.content);
           const resolvedSessionId = sessionStore.resolveToolCall(tr.tool_use_id);
 
           if (resolvedSessionId) {
@@ -201,25 +205,15 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
             const sessionData = sessionStore.getSession(sessionId);
             if (sessionData && sessionData.accountId) {
               accountId = sessionData.accountId;
-              await childManager.sendRequest(accountId, {
-                type: 'tool_result',
-                sessionId,
-                toolCallId: tr.tool_use_id,
-                result: resultContent
-              });
-              sessionsToResume.set(sessionId, accountId);
-              isResuming = true;
             }
+            pendingToolResults.push({
+              toolCallId: tr.tool_use_id,
+              result: normalizeToolResultContent(tr.content),
+            });
+            isResuming = true;
           } else {
             console.warn(`[ToolResult] FAILED to resolve ${tr.tool_use_id} - falling back to stateless`);
           }
-        }
-
-        for (const [sId, aId] of sessionsToResume.entries()) {
-          await childManager.sendRequest(aId, {
-            type: 'resume_stream',
-            sessionId: sId
-          });
         }
       }
     }
@@ -238,15 +232,29 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
     }
 
     if (!accountId) {
-      throw new Error("No accounts available in pool");
+      throw new Error('No accounts available in pool');
     }
 
-    // 先にストリームリスナーを登録してからリクエストを送信
-    // (リクエスト送信とリスナー登録の競合でメッセージが失われるのを防ぐ)
+    // ストリームの初期化を一箇所に集約（最初のリクエスト送信前に行う）
     const stream = getSessionStream(accountId, sessionId);
-    const allowedToolNames = body.tools?.map((t: any) => t.name) || [];
 
-    if (!isResuming) {
+    if (isResuming) {
+      // 解決済みの tool_result を順次送信
+      for (const ptr of pendingToolResults) {
+        await childManager.sendRequest(accountId, {
+          type: 'tool_result',
+          sessionId,
+          toolCallId: ptr.toolCallId,
+          result: ptr.result,
+        });
+      }
+      // ストリーム再開をリクエスト
+      await childManager.sendRequest(accountId, {
+        type: 'resume_stream',
+        sessionId,
+      });
+    } else {
+      // 通常の新規リクエストを送信
       const promptRequest: ParentMessage = {
         type: 'request',
         id: `req-${Date.now()}`,
@@ -254,10 +262,12 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
         system: extractSystemPrompt(body.system),
         messages: body.messages,
         model: mapModelName(body.model),
-        tools: body.tools
+        tools: body.tools,
       };
       await childManager.sendRequest(accountId, promptRequest);
     }
+
+    const allowedToolNames = body.tools?.map((t: any) => t.name) || [];
 
     if (body.stream) {
       setupSSEHeaders(res);
