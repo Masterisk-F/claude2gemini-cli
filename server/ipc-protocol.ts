@@ -57,6 +57,10 @@ export type ChildMessage =
         type: 'turn_end';
         sessionId: string;
         stopReason: string; // ClaudeStopReason ('end_turn' | 'max_tokens' | 'tool_use' | 'stop_sequence')
+        usage?: {
+            input_tokens: number;
+            output_tokens: number;
+        };
     }
     | {
         type: 'error';
@@ -66,6 +70,7 @@ export type ChildMessage =
     }
     | {
         type: 'fatal_error';
+        sessionId: string;
         message: string;
     };
 

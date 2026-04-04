@@ -20,6 +20,7 @@ interface ChildConnection {
 
 class ChildManager extends EventEmitter {
     private children = new Map<string, ChildConnection>();
+    private spawnPromises = new Map<string, Promise<void>>();
 
     /**
      * 単一のアカウントIDに対する子プロセスとソケット接続を確立する
@@ -29,110 +30,122 @@ class ChildManager extends EventEmitter {
             return;
         }
 
-        const socketPath = path.join(os.tmpdir(), `c2g-worker-${os.userInfo().username}-${accountId}.sock`);
+        const existingPromise = this.spawnPromises.get(accountId);
+        if (existingPromise) {
+            return existingPromise;
+        }
 
-        // 子プロセスを起動 (tsx 環境であれば自動的に引き継がれる)
-        const child = fork(CHILD_WORKER_SCRIPT, [
-            `--account-id=${accountId}`,
-            `--socket=${socketPath}`
-        ], {
-            // 標準出力・標準エラー出力を親プロセスに引き継ぐ
-            stdio: ['ignore', 'inherit', 'inherit', 'ipc']
-        });
+        const spawnPromise = (async () => {
+            const socketPath = path.join(os.tmpdir(), `c2g-worker-${os.userInfo().username}-${accountId}.sock`);
 
-        child.on('exit', (code) => {
-            console.error(`[ChildManager] Child worker for ${accountId} exited with code ${code}.`);
-            this.children.delete(accountId);
-            this.emit('child_exit', accountId);
-        });
+            // 子プロセスを起動 (tsx 環境であれば自動的に引き継がれる)
+            const child = fork(CHILD_WORKER_SCRIPT, [
+                `--account-id=${accountId}`,
+                `--socket=${socketPath}`
+            ], {
+                // 標準出力・標準エラー出力を親プロセスに引き継ぐ
+                stdio: ['ignore', 'inherit', 'inherit', 'ipc']
+            });
 
-        let resolveReady: () => void;
-        let rejectReady: (err: Error) => void;
-        const readyPromise = new Promise<void>((resolve, reject) => {
-            resolveReady = resolve;
-            rejectReady = reject;
-        });
+            child.on('exit', (code) => {
+                console.error(`[ChildManager] Child worker for ${accountId} exited with code ${code}.`);
+                this.children.delete(accountId);
+                this.emit('child_exit', accountId);
+                // 自動再起動（非同期・エラーはログのみ）
+                this.spawnChild(accountId).catch((err) => {
+                    console.error(`[ChildManager] Failed to restart child for ${accountId}:`, err);
+                });
+            });
 
-        // ソケットへの接続を試行 (一定間隔でリトライ)
-        const connectToSocket = async () => {
-            let retries = 0;
-            const maxRetries = 100; // 10秒
+            let resolveReady: () => void;
+            let rejectReady: (err: Error) => void;
+            const readyPromise = new Promise<void>((resolve, reject) => {
+                resolveReady = resolve;
+                rejectReady = reject;
+            });
 
-            while (retries < maxRetries) {
-                try {
-                    const socket = await new Promise<net.Socket>((resolve, reject) => {
-                        const client = net.createConnection(socketPath, () => {
-                            resolve(client);
+            // ソケットへの接続を試行 (一定間隔でリトライ)
+            const connectToSocket = async () => {
+                let retries = 0;
+                const maxRetries = 100; // 10秒
+
+                while (retries < maxRetries) {
+                    try {
+                        const socket = await new Promise<net.Socket>((resolve, reject) => {
+                            const client = net.createConnection(socketPath, () => {
+                                resolve(client);
+                            });
+                            client.on('error', reject);
                         });
-                        client.on('error', reject);
-                    });
 
-                    // 接続成功
-                    const rl = readline.createInterface({
-                        input: socket,
-                        crlfDelay: Infinity
-                    });
+                        // 接続成功
+                        const rl = readline.createInterface({
+                            input: socket,
+                            crlfDelay: Infinity
+                        });
 
-                    rl.on('line', (line) => {
-                        if (!line.trim()) return;
-                        try {
-                            const msg = JSON.parse(line) as ChildMessage;
-                            if (msg.type === 'ready') {
-                                resolveReady();
-                            } else {
-                                this.emit(`message:${accountId}`, msg);
+                        rl.on('line', (line) => {
+                            if (!line.trim()) return;
+                            try {
+                                const msg = JSON.parse(line) as ChildMessage;
+                                if (msg.type === 'ready') {
+                                    resolveReady();
+                                } else {
+                                    this.emit(`message:${accountId}`, msg);
+                                }
+                            } catch (err) {
+                                console.error(`[ChildManager] Parse error from ${accountId}:`, err);
                             }
-                        } catch (err) {
-                            console.error(`[ChildManager] Parse error from ${accountId}:`, err);
-                        }
-                    });
+                        });
 
-                    socket.on('error', (err) => {
-                        console.error(`[ChildManager] Socket error for ${accountId}:`, err);
-                    });
+                        socket.on('error', (err) => {
+                            console.error(`[ChildManager] Socket error for ${accountId}:`, err);
+                        });
 
-                    socket.on('close', () => {
-                        console.error(`[ChildManager] Socket closed for ${accountId}`);
-                    });
+                        socket.on('close', () => {
+                            console.error(`[ChildManager] Socket closed for ${accountId}`);
+                        });
 
-                    this.children.set(accountId, {
-                        process: child,
-                        socket,
-                        rl,
-                        ready: readyPromise
-                    });
+                        this.children.set(accountId, {
+                            process: child,
+                            socket,
+                            rl,
+                            ready: readyPromise
+                        });
 
-                    return;
+                        return;
 
-                } catch (err) {
-                    retries++;
-                    await new Promise((resume) => setTimeout(resume, 100)); // 100ms待機してリトライ
+                    } catch (err) {
+                        retries++;
+                        await new Promise((resume) => setTimeout(resume, 100)); // 100ms待機してリトライ
+                    }
                 }
+
+                rejectReady(new Error(`[ChildManager] Failed to connect to socket for ${accountId} after 100 retries`));
+            };
+
+            connectToSocket().catch((err) => {
+                console.error(err);
+                child.kill();
+            });
+
+            try {
+                await readyPromise;
+                console.log(`[ChildManager] Connection established for ${accountId}`);
+            } finally {
+                this.spawnPromises.delete(accountId);
             }
+        })();
 
-            rejectReady(new Error(`[ChildManager] Failed to connect to socket for ${accountId} after 100 retries`));
-        };
-
-        connectToSocket().catch((err) => {
-            console.error(err);
-            child.kill();
-        });
-
-        await readyPromise;
-        console.log(`[ChildManager] Connection established for ${accountId}`);
+        this.spawnPromises.set(accountId, spawnPromise);
+        return spawnPromise;
     }
 
-    /**
-     * 複数アカウントのプロセスを一括起動
-     */
     async spawnAll(accountIds: string[]): Promise<void> {
         const promises = accountIds.map(id => this.spawnChild(id));
         await Promise.all(promises);
     }
 
-    /**
-     * 指定したアカウントの子プロセスへメッセージを送信する
-     */
     async sendRequest(accountId: string, message: ParentMessage): Promise<void> {
         const conn = this.children.get(accountId);
         if (!conn) {
@@ -157,6 +170,14 @@ class ChildManager extends EventEmitter {
         const eventName = `message:${accountId}`;
         this.on(eventName, handler);
         return () => this.off(eventName, handler);
+    }
+
+    /**
+     * 子プロセス終了イベントのリスナーを登録
+     */
+    onChildExit(handler: (accountId: string) => void): (() => void) {
+        this.on('child_exit', handler);
+        return () => this.off('child_exit', handler);
     }
 
     /**

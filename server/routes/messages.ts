@@ -31,13 +31,19 @@ function buildClaudeResponse({
   text,
   model,
   toolCalls,
+  usage,
 }: {
   text: string;
   model: string;
   toolCalls: ClaudeToolUseBlock[];
+  usage?: { input_tokens: number; output_tokens: number };
 }) {
+  if (!text && toolCalls.length === 0) {
+    throw new Error('Gemini API returned an empty response');
+  }
+
   const content: any[] = [];
-  if (text || toolCalls.length === 0) {
+  if (text) {
     content.push({ type: 'text', text });
   }
 
@@ -56,8 +62,8 @@ function buildClaudeResponse({
     stop_reason: stopReason,
     stop_sequence: null,
     usage: {
-      input_tokens: 0,
-      output_tokens: 0,
+      input_tokens: usage?.input_tokens || 0,
+      output_tokens: usage?.output_tokens || 0,
     },
   };
 }
@@ -120,6 +126,24 @@ function getSessionStream(accountId: string, sessionId: string): AsyncGenerator<
     }
   });
 
+  // 子プロセス終了時のハンドラを登録
+  const exitCleanup = childManager.onChildExit((exitedAccountId) => {
+    if (exitedAccountId === accountId) {
+      // 子プロセスが終了したらエラーメッセージを生成
+      const exitMsg: ChildMessage = {
+        type: 'fatal_error',
+        sessionId,
+        message: 'Child process exited unexpectedly'
+      };
+      if (resolveNext) {
+        resolveNext(exitMsg);
+        resolveNext = null;
+      } else {
+        buffer.push(exitMsg);
+      }
+    }
+  });
+
   async function* generator(): AsyncGenerator<ChildMessage> {
     try {
       while (true) {
@@ -139,6 +163,7 @@ function getSessionStream(accountId: string, sessionId: string): AsyncGenerator<
       }
     } finally {
       cleanup();
+      exitCleanup();
     }
   }
 
@@ -170,6 +195,7 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
 
       if (toolResults.length > 0) {
         console.log(`[ToolResult] ${toolResults.length} tool_result(s) received`);
+        const sessionsToResume = new Map<string, string>(); // sessionId -> accountId
 
         for (const tr of toolResults) {
           const resolvedSessionId = sessionStore.resolveToolCall(tr.tool_use_id);
@@ -250,6 +276,7 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
     } else {
       let fullText = '';
       const toolCalls: ClaudeToolUseBlock[] = [];
+      let turnEndUsage: { input_tokens: number; output_tokens: number } | undefined;
 
       for await (const msg of stream) {
         if (msg.type === 'stream_event') {
@@ -269,6 +296,7 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
         } else if (msg.type === 'error' || msg.type === 'fatal_error') {
           throw new GeminiApiError(msg.message, 'status' in msg ? msg.status : undefined);
         } else if (msg.type === 'turn_end') {
+          turnEndUsage = msg.usage;
           break;
         }
       }
@@ -277,11 +305,17 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
         text: fullText,
         model: body.model,
         toolCalls,
+        usage: turnEndUsage,
       });
 
       res.json(claudeResponse);
     }
   } catch (error) {
+    if (res.headersSent) {
+      console.error(`[API Error after headers]`, error instanceof Error ? error.message : String(error));
+      return;
+    }
+
     const errorMsg = error instanceof Error ? error.message : String(error);
     console.error(`[API Error]`, errorMsg);
 

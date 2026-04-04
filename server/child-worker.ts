@@ -52,6 +52,7 @@ interface ToolState {
     resolveToolTurn?: () => void;
     expectedClientTools: number;
     registeredClientTools: number;
+    hasYieldedFinished: boolean;
 }
 
 interface PendingToolCall {
@@ -67,6 +68,10 @@ interface SessionData {
     pendingNext?: Promise<IteratorResult<ServerGeminiStreamEvent, any>>;
     pendingToolCalls: Map<string, PendingToolCall>;
     toolState?: ToolState;
+    lastUsage?: {
+        input_tokens: number;
+        output_tokens: number;
+    };
 }
 
 const sessionStore = new Map<string, SessionData>();
@@ -237,9 +242,15 @@ async function handleParentMessage(msg: ParentMessage, sendEvent: (msg: ChildMes
                 toolState.callIds.clear();
                 toolState.expectedClientTools = 0;
                 toolState.registeredClientTools = 0;
+                toolState.hasYieldedFinished = false;
             } else {
                 // 新規作成
-                toolState = { callIds: new Map(), expectedClientTools: 0, registeredClientTools: 0 };
+                toolState = {
+                    callIds: new Map(),
+                    expectedClientTools: 0,
+                    registeredClientTools: 0,
+                    hasYieldedFinished: false
+                };
                 sessionData.toolState = toolState;
 
                 const sdkTools = tools?.map((t) => tool(
@@ -263,7 +274,9 @@ async function handleParentMessage(msg: ParentMessage, sendEvent: (msg: ChildMes
                             });
 
                             toolState!.registeredClientTools++;
-                            if (toolState!.registeredClientTools >= toolState!.expectedClientTools && toolState!.resolveToolTurn) {
+                            if (toolState!.hasYieldedFinished &&
+                                toolState!.registeredClientTools >= toolState!.expectedClientTools &&
+                                toolState!.resolveToolTurn) {
                                 toolState!.resolveToolTurn();
                             }
                         });
@@ -378,9 +391,20 @@ async function consumeStream(
                     status: errValue?.status
                 });
                 return; // エラー時は関数終了
+            } else if (chunk.type === 'finished') {
+                const usage = chunk.value?.usageMetadata;
+                if (usage) {
+                    sessionData.lastUsage = {
+                        input_tokens: usage.promptTokenCount || 0,
+                        output_tokens: usage.candidatesTokenCount || 0,
+                    };
+                }
+                toolState.hasYieldedFinished = true;
+                if (toolState.registeredClientTools >= toolState.expectedClientTools && toolState.resolveToolTurn) {
+                    toolState.resolveToolTurn();
+                }
             } else if (chunk.type === 'tool_call_request') {
                 const callInfo = chunk.value;
-                console.log(`[Child Worker ${accountId}] [DEBUG] tool_call_request raw:`, JSON.stringify(callInfo, null, 2));
                 const callId = callInfo.callId;
                 const name = callInfo.name;
 
@@ -421,7 +445,12 @@ async function consumeStream(
             return;
         }
 
-        sendEvent({ type: 'turn_end', sessionId, stopReason });
+        sendEvent({
+            type: 'turn_end',
+            sessionId,
+            stopReason,
+            usage: sessionData.lastUsage,
+        });
 
     } catch (error) {
         console.error(`[Child Worker ${accountId}] Stream loop error:`, error);

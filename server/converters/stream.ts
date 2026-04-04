@@ -191,7 +191,10 @@ export async function streamGeminiToClaudeSSE(
           delta: {
             stop_reason: msg.stopReason,
             stop_sequence: null,
-          }
+          },
+          usage: {
+            output_tokens: msg.usage?.output_tokens || 0,
+          },
         });
 
         break; // 完全終了

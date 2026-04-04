@@ -86,7 +86,7 @@ Lightweight state management for the Parent process:
 Converts Claude message arrays into Gemini prompt strings:
 - **Role-labeled conversation text** (`User: ...`, `Assistant: ...`)
 - **Tool blocks** → Text representations (`[Tool Call: ...]`)
-- **Model name mapping** — Converts Claude model names to Gemini equivalents (e.g. sonnet → `gemini-2.0-flash`)
+- **Model name mapping** — Converts Claude model names to Gemini equivalents (e.g. sonnet → `gemini-3-flash-preview`)
 
 ### `server/converters/stream.ts`
 
