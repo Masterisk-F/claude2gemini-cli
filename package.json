@@ -10,7 +10,7 @@
     "account:add": "tsx cli/manage-accounts.ts add",
     "account:list": "tsx cli/manage-accounts.ts list",
     "account:remove": "tsx cli/manage-accounts.ts remove",
-    "test": "vitest run"
+    "test": "vitest run --config ./vitest.config.ts"
   },
   "dependencies": {
     "@google/gemini-cli-sdk": "file:./gemini-cli/packages/sdk",
