@@ -126,6 +126,34 @@ export async function streamGeminiToClaudeSSE(
 
   let textBlockStarted = false;
   let hasProducedAnyBlock = false;
+  // 問題1: web_search 実行回数のカウンター
+  let webSearchRequests = 0;
+  // 問題2(A案): 得到済みソース情報を保持し、次のテキストブロックに citations を付与する
+  let pendingCitations: any[] = [];
+
+  // 次のテキストブロック開始時に citations があれば付けて送信する
+  const sendTextBlockStart = (index: number) => {
+    if (pendingCitations.length > 0) {
+      // ⚠️ 案A: 全ソースをテキストブロックに一括付与
+      sendSSE(res, 'content_block_start', {
+        type: 'content_block_start',
+        index,
+        content_block: {
+          type: 'text',
+          text: '',
+          citations: pendingCitations.map(src => ({
+            type: 'web_search_result_location',
+            url: src.url,
+            title: src.title,
+            encrypted_index: src.encrypted_content,
+            cited_text: '',
+          })),
+        },
+      });
+    } else {
+      sendContentBlockStart(res, index);
+    }
+  };
 
   try {
     for await (const msg of childStream) {
@@ -133,7 +161,7 @@ export async function streamGeminiToClaudeSSE(
         const chunk = msg.event;
         if (chunk.type === 'content' && chunk.value) {
           if (!textBlockStarted) {
-            sendContentBlockStart(res, blockIndex);
+            sendTextBlockStart(blockIndex);
             textBlockStarted = true;
             hasProducedAnyBlock = true;
           }
@@ -186,6 +214,9 @@ export async function streamGeminiToClaudeSSE(
           textBlockStarted = false;
         }
 
+        // 問題1: web_search 実行毎にカウントをインクリメント
+        webSearchRequests++;
+
         sendSSE(res, 'content_block_start', {
           type: 'content_block_start',
           index: blockIndex,
@@ -229,6 +260,10 @@ export async function streamGeminiToClaudeSSE(
         sendContentBlockStop(res, blockIndex);
         blockIndex++;
         hasProducedAnyBlock = true;
+        // 問題2(A案): 次のテキストブロック用にソース情報を保持
+        if (Array.isArray(msg.result)) {
+          pendingCitations = msg.result;
+        }
       } else if (msg.type === 'turn_end') {
         if (textBlockStarted) {
           sendContentBlockStop(res, blockIndex);
@@ -242,8 +277,10 @@ export async function streamGeminiToClaudeSSE(
             stop_reason: msg.stopReason,
             stop_sequence: null,
           },
+          // 問題1: web_search 実行数を含める
           usage: {
             output_tokens: msg.usage?.output_tokens || 0,
+            ...(webSearchRequests > 0 ? { server_tool_use: { web_search_requests: webSearchRequests } } : {}),
           },
         });
 

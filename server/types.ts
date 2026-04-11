@@ -63,6 +63,10 @@ export interface ClaudeRequest {
 export interface ClaudeUsage {
   input_tokens: number;
   output_tokens: number;
+  /** web_search ツール使用時にのみ付与されるサーバーツール使用量 */
+  server_tool_use?: {
+    web_search_requests: number;
+  };
 }
 
 export type ClaudeStopReason = 'end_turn' | 'max_tokens' | 'stop_sequence' | 'tool_use';

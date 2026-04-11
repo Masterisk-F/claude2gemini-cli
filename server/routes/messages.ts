@@ -31,10 +31,12 @@ function buildClaudeResponse({
   contentBlocks,
   model,
   usage,
+  webSearchRequests,
 }: {
   contentBlocks: any[];
   model: string;
   usage?: { input_tokens: number; output_tokens: number };
+  webSearchRequests?: number;
 }) {
   if (contentBlocks.length === 0) {
     throw new Error('Gemini API returned an empty response');
@@ -42,6 +44,15 @@ function buildClaudeResponse({
 
   const hasClientToolUse = contentBlocks.some(b => b.type === 'tool_use');
   const stopReason = hasClientToolUse ? 'tool_use' : 'end_turn';
+
+  // web_search が使用された場合にのみ server_tool_use フィールドを付与する
+  const usageField: any = {
+    input_tokens: usage?.input_tokens || 0,
+    output_tokens: usage?.output_tokens || 0,
+  };
+  if (webSearchRequests && webSearchRequests > 0) {
+    usageField.server_tool_use = { web_search_requests: webSearchRequests };
+  }
 
   return {
     id: `msg_${randomUUID().replace(/-/g, '').slice(0, 24)}`,
@@ -51,10 +62,7 @@ function buildClaudeResponse({
     content: contentBlocks,
     stop_reason: stopReason,
     stop_sequence: null,
-    usage: {
-      input_tokens: usage?.input_tokens || 0,
-      output_tokens: usage?.output_tokens || 0,
-    },
+    usage: usageField,
   };
 }
 
@@ -267,10 +275,25 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
       const contentBlocks: any[] = [];
       let currentText = '';
       let turnEndUsage: { input_tokens: number; output_tokens: number } | undefined;
+      // 問題1: web_search 実行回数のカウンター
+      let webSearchRequests = 0;
+      // 問題2(A案): 得到済みソース情報を保持し、後続のテキストブロックに citations を付与する
+      let pendingCitations: any[] = [];
 
       const flushText = () => {
         if (currentText) {
-          contentBlocks.push({ type: 'text', text: currentText });
+          const block: any = { type: 'text', text: currentText };
+          // ⚠️ 案A: 全ソースを各テキストブロックに一括付与
+          if (pendingCitations.length > 0) {
+            block.citations = pendingCitations.map(src => ({
+              type: 'web_search_result_location',
+              url: src.url,
+              title: src.title,
+              encrypted_index: src.encrypted_content,
+              cited_text: currentText.slice(0, 150),
+            }));
+          }
+          contentBlocks.push(block);
           currentText = '';
         }
       };
@@ -293,6 +316,8 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
           }
         } else if (msg.type === 'server_tool_call') {
             flushText();
+            // 問題1: web_search 実行毎にカウントをインクリメント
+            webSearchRequests++;
             contentBlocks.push({
               type: 'server_tool_use',
               id: msg.callId,
@@ -306,6 +331,10 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
               tool_use_id: msg.callId,
               content: msg.result
             });
+            // 問題2(A案): 後続テキストブロック用にソース情報を保持
+            if (Array.isArray(msg.result)) {
+              pendingCitations = msg.result;
+            }
         } else if (msg.type === 'error' || msg.type === 'fatal_error') {
           throw new GeminiApiError(msg.message, 'status' in msg ? msg.status : undefined);
         } else if (msg.type === 'turn_end') {
@@ -319,6 +348,7 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
         contentBlocks,
         model: body.model,
         usage: turnEndUsage,
+        webSearchRequests,
       });
 
       res.json(claudeResponse);

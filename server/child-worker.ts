@@ -3,6 +3,7 @@ import path from 'node:path';
 import net from 'node:net';
 import readline from 'node:readline';
 import { EventEmitter } from 'node:events';
+import { randomUUID } from 'node:crypto';
 
 // SDKがリクエストごとにAgentを生成してイベントリスナーを登録するため、
 // Warningを抑制するために最大リスナー数を引き上げる
@@ -256,7 +257,7 @@ async function handleParentMessage(msg: ParentMessage, sendEvent: (msg: ChildMes
                 const sdkTools = tools?.filter(t => !t.type?.startsWith('web_search_')).map((t) => tool(
                     {
                         name: t.name,
-                        description: t.description,
+                        description: t.description ?? '',
                         inputSchema: convertClaudeToolToZodSchema(t),
                     },
                     async (params) => {
@@ -482,14 +483,17 @@ async function consumeStream(
 
                 const wsName = (sessionData as any).claudeWebSearchName;
                 if (name === 'google_web_search' && wsName) {
-                    console.log(`[Child Worker] Intercepted google_web_search -> ${wsName}`);
-                    (sessionData as any).lastServerToolCallId = callId;
+                    // Claude API 仕様に準拠した srvtoolu_ プレフィックス付きIDを生成
+                    const serverCallId = `srvtoolu_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
+                    console.log(`[Child Worker] Intercepted google_web_search -> ${wsName} (id: ${serverCallId})`);
+                    // モンキーパッチ側が結果を返す際に同じIDを使用するよう保存
+                    (sessionData as any).lastServerToolCallId = serverCallId;
                     hasProducedAnyBlock = true;
                     // server-side tool, does not wait for client
                     sendEvent({
                         type: 'server_tool_call',
                         sessionId,
-                        callId,
+                        callId: serverCallId,
                         name: wsName,
                         args: parsedArgs
                     });
