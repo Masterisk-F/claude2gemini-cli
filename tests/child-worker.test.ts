@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { spawn } from 'node:child_process';
 import net from 'node:net';
 import readline from 'node:readline';
@@ -11,13 +11,12 @@ describe('Child Worker', () => {
 
         // Child Worker 起動
         // tsx を明示的に使用して ESM の .js インポートを解決させる
+        const testEnv = { ...process.env, GOOGLE_API_KEY: 'test-key' };
+        delete testEnv.NODE_OPTIONS;
+
         const child = spawn('node', ['--import', 'tsx', 'server/child-worker.ts', `--account-id=${accountId}`, `--socket=${socketPath}`], {
             stdio: 'ignore',
-            env: {
-                ...process.env,
-                NODE_OPTIONS: undefined,
-                GOOGLE_API_KEY: 'test-key'
-            }
+            env: testEnv
         });
 
         try {
@@ -74,10 +73,10 @@ describe('Child Worker', () => {
             });
 
             // ready と response を待つ
-            for (let i = 0; i < 50; i++) {
-                await new Promise(r => setTimeout(r, 100));
-                if (receivedReady && receivedResponse) break;
-            }
+            await vi.waitUntil(() => receivedReady && receivedResponse, {
+                timeout: 15000,
+                interval: 100
+            });
 
             expect(receivedReady).toBe(true);
             // 注: 環境によって認証エラーが返るまで時間がかかる場合があるため、

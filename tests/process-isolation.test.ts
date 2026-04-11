@@ -6,18 +6,32 @@ describe('Process Isolation', () => {
         expect(childManager).toBeDefined();
     });
 
-    // 注: Vitest 環境下での子プロセスの起動（tsx loaderの継承）に課題があるため、
-    // 実際の起動テストは環境が整い次第復旧させる。
-    // 現時点では、Issue #3 の目的であるエラーハンドリングのユニットテストを優先する。
-    it.skip('ChildManager can spawn multiple isolated workers concurrently', async () => {
+    it('ChildManager can spawn multiple isolated workers concurrently', async () => {
         const accounts = ['test-isolation-A', 'test-isolation-B'];
+
+        // Vitest環境での子プロセス起動を成功させるための一時的な環境設定
+        const originalExecArgv = process.execArgv;
+        const originalNodeOptions = process.env.NODE_OPTIONS;
+        process.execArgv = ['--import', 'tsx'];
+        delete process.env.NODE_OPTIONS;
+
         try {
             await childManager.spawnAll(accounts);
             const childrenMap = (childManager as any).children as Map<string, any>;
             expect(childrenMap.has('test-isolation-A')).toBe(true);
             expect(childrenMap.has('test-isolation-B')).toBe(true);
+
+            const connectionA = childrenMap.get('test-isolation-A');
+            const connectionB = childrenMap.get('test-isolation-B');
+            expect(connectionA.process.pid).toBeDefined();
+            expect(connectionB.process.pid).toBeDefined();
+            expect(connectionA.process.pid).not.toBe(connectionB.process.pid);
         } finally {
             childManager.killAll();
+            process.execArgv = originalExecArgv;
+            if (originalNodeOptions !== undefined) {
+                process.env.NODE_OPTIONS = originalNodeOptions;
+            }
         }
     });
 });
