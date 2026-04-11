@@ -179,6 +179,56 @@ export async function streamGeminiToClaudeSSE(
         sendContentBlockStop(res, blockIndex);
         blockIndex++;
         hasProducedAnyBlock = true;
+      } else if (msg.type === 'server_tool_call') {
+        if (textBlockStarted) {
+          sendContentBlockStop(res, blockIndex);
+          blockIndex++;
+          textBlockStarted = false;
+        }
+
+        sendSSE(res, 'content_block_start', {
+          type: 'content_block_start',
+          index: blockIndex,
+          content_block: {
+            type: 'server_tool_use',
+            id: msg.callId,
+            name: msg.name,
+            input: {},
+          },
+        });
+
+        sendSSE(res, 'content_block_delta', {
+          type: 'content_block_delta',
+          index: blockIndex,
+          delta: {
+            type: 'input_json_delta',
+            partial_json: JSON.stringify(msg.args),
+          },
+        });
+
+        sendContentBlockStop(res, blockIndex);
+        blockIndex++;
+        hasProducedAnyBlock = true;
+      } else if (msg.type === 'server_tool_result') {
+        if (textBlockStarted) {
+          sendContentBlockStop(res, blockIndex);
+          blockIndex++;
+          textBlockStarted = false;
+        }
+
+        sendSSE(res, 'content_block_start', {
+          type: 'content_block_start',
+          index: blockIndex,
+          content_block: {
+            type: 'web_search_tool_result',
+            tool_use_id: msg.callId,
+            content: msg.result,
+          },
+        });
+
+        sendContentBlockStop(res, blockIndex);
+        blockIndex++;
+        hasProducedAnyBlock = true;
       } else if (msg.type === 'turn_end') {
         if (textBlockStarted) {
           sendContentBlockStop(res, blockIndex);

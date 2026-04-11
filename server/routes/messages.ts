@@ -28,37 +28,27 @@ function normalizeToolResultContent(content: unknown): string {
 }
 
 function buildClaudeResponse({
-  text,
+  contentBlocks,
   model,
-  toolCalls,
   usage,
 }: {
-  text: string;
+  contentBlocks: any[];
   model: string;
-  toolCalls: ClaudeToolUseBlock[];
   usage?: { input_tokens: number; output_tokens: number };
 }) {
-  if (!text && toolCalls.length === 0) {
+  if (contentBlocks.length === 0) {
     throw new Error('Gemini API returned an empty response');
   }
 
-  const content: any[] = [];
-  if (text) {
-    content.push({ type: 'text', text });
-  }
-
-  for (const call of toolCalls) {
-    content.push(call);
-  }
-
-  const stopReason = toolCalls.length > 0 ? 'tool_use' : 'end_turn';
+  const hasToolUse = contentBlocks.some(b => b.type === 'tool_use' || b.type === 'server_tool_use');
+  const stopReason = hasToolUse ? 'tool_use' : 'end_turn';
 
   return {
     id: `msg_${randomUUID().replace(/-/g, '').slice(0, 24)}`,
     type: 'message',
     role: 'assistant',
     model: model,
-    content: content,
+    content: contentBlocks,
     stop_reason: stopReason,
     stop_sequence: null,
     usage: {
@@ -274,37 +264,60 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
       await streamGeminiToClaudeSSE(stream, res, body.model, sessionId, sessionStore, allowedToolNames);
 
     } else {
-      let fullText = '';
-      const toolCalls: ClaudeToolUseBlock[] = [];
+      const contentBlocks: any[] = [];
+      let currentText = '';
       let turnEndUsage: { input_tokens: number; output_tokens: number } | undefined;
+
+      const flushText = () => {
+        if (currentText) {
+          contentBlocks.push({ type: 'text', text: currentText });
+          currentText = '';
+        }
+      };
 
       for await (const msg of stream) {
         if (msg.type === 'stream_event') {
           if (msg.event.type === 'content' && msg.event.value) {
-            fullText += msg.event.value;
+            currentText += msg.event.value;
           }
         } else if (msg.type === 'tool_call') {
           if (allowedToolNames.includes(msg.name)) {
+            flushText();
             sessionStore.addPendingToolCall(sessionId, msg.callId);
-            toolCalls.push({
+            contentBlocks.push({
               type: 'tool_use',
               id: msg.callId,
               name: msg.name,
               input: msg.args
             });
           }
+        } else if (msg.type === 'server_tool_call') {
+            flushText();
+            contentBlocks.push({
+              type: 'server_tool_use',
+              id: msg.callId,
+              name: msg.name,
+              input: msg.args
+            });
+        } else if (msg.type === 'server_tool_result') {
+            flushText();
+            contentBlocks.push({
+              type: 'web_search_tool_result',
+              tool_use_id: msg.callId,
+              content: msg.result
+            });
         } else if (msg.type === 'error' || msg.type === 'fatal_error') {
           throw new GeminiApiError(msg.message, 'status' in msg ? msg.status : undefined);
         } else if (msg.type === 'turn_end') {
+          flushText();
           turnEndUsage = msg.usage;
           break;
         }
       }
 
       const claudeResponse = buildClaudeResponse({
-        text: fullText,
+        contentBlocks,
         model: body.model,
-        toolCalls,
         usage: turnEndUsage,
       });
 

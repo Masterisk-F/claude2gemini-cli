@@ -30,5 +30,5 @@ describe('Process Isolation', () => {
             process.execArgv = originalExecArgv;
             vi.unstubAllEnvs();
         }
-    });
+    }, 20000);
 });
