@@ -309,15 +309,42 @@ async function handleParentMessage(msg: ParentMessage, sendEvent: (msg: ChildMes
                         if (ws && typeof ws.execute === 'function' && !ws.__executePatched) {
                             const originalExecute = ws.execute.bind(ws);
                             ws.execute = async (params: any, signal?: AbortSignal) => {
-                                const result = await originalExecute(params, signal);
-                                const callId = (sessionData as any).lastServerToolCallId || `unknown_${Date.now()}`;
-                                sendEvent({
-                                    type: 'server_tool_result',
-                                    sessionId,
-                                    callId,
-                                    result
-                                });
-                                return result;
+                                try {
+                                    const result = await originalExecute(params, signal);
+                                    const callId = (sessionData as any).lastServerToolCallId || `unknown_${Date.now()}`;
+
+                                    // Map gemini-cli result to Claude web_search_tool_result format
+                                    // result.sources is GroundingChunkItem[]
+                                    const claudeResult = (result.sources || []).map((s: any) => ({
+                                        type: 'web_search_result',
+                                        url: s.web?.uri || '',
+                                        title: s.web?.title || '',
+                                        // Claude expects encrypted_content for citations in subsequent turns
+                                        // We use base64 of URI as a placeholder
+                                        encrypted_content: Buffer.from(s.web?.uri || '').toString('base64'),
+                                        page_age: new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })
+                                    }));
+
+                                    sendEvent({
+                                        type: 'server_tool_result',
+                                        sessionId,
+                                        callId,
+                                        result: claudeResult
+                                    });
+                                    return result;
+                                } catch (err) {
+                                    const callId = (sessionData as any).lastServerToolCallId || `unknown_${Date.now()}`;
+                                    sendEvent({
+                                        type: 'server_tool_result',
+                                        sessionId,
+                                        callId,
+                                        result: {
+                                            type: 'web_search_tool_result_error',
+                                            error_code: 'internal_error'
+                                        }
+                                    });
+                                    throw err;
+                                }
                             };
                             ws.__executePatched = true;
                         }
