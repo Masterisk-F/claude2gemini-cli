@@ -253,7 +253,7 @@ async function handleParentMessage(msg: ParentMessage, sendEvent: (msg: ChildMes
                 };
                 sessionData.toolState = toolState;
 
-                const sdkTools = tools?.map((t) => tool(
+                const sdkTools = tools?.filter(t => !t.type?.startsWith('web_search_')).map((t) => tool(
                     {
                         name: t.name,
                         description: t.description,
@@ -438,7 +438,7 @@ async function consumeStream(
 
             const chunk = iter.value;
 
-            if (chunk.type === 'content' && chunk.value) {
+            if ((chunk.type === 'content' || chunk.type === 'citation') && chunk.value) {
                 hasProducedAnyBlock = true;
                 sendEvent({ type: 'stream_event', sessionId, event: { type: 'content', value: chunk.value } });
             } else if (chunk.type === 'error') {
