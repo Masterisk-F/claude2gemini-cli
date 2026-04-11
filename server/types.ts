@@ -13,7 +13,7 @@ export interface ClaudeTextBlock {
 }
 
 export interface ClaudeToolUseBlock {
-  type: 'tool_use';
+  type: 'tool_use' | 'server_tool_use';
   id: string;
   name: string;
   input: Record<string, unknown>;
@@ -25,7 +25,13 @@ export interface ClaudeToolResultBlock {
   content: string | ClaudeContentBlock[];
 }
 
-export type ClaudeContentBlock = ClaudeTextBlock | ClaudeToolUseBlock | ClaudeToolResultBlock;
+export interface ClaudeWebSearchToolResultBlock {
+  type: 'web_search_tool_result';
+  tool_use_id: string;
+  content: any;
+}
+
+export type ClaudeContentBlock = ClaudeTextBlock | ClaudeToolUseBlock | ClaudeToolResultBlock | ClaudeWebSearchToolResultBlock;
 
 export interface ClaudeMessage {
   role: 'user' | 'assistant';
@@ -33,9 +39,10 @@ export interface ClaudeMessage {
 }
 
 export interface ClaudeToolDefinition {
+  type?: string;
   name: string;
-  description: string;
-  input_schema: Record<string, unknown>;
+  description?: string;
+  input_schema?: Record<string, unknown>;
 }
 
 export interface ClaudeRequest {
