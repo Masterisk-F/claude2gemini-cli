@@ -3,7 +3,6 @@ import { defineConfig } from 'vitest/config';
 export default defineConfig({
   test: {
     include: ['tests/**/*.test.ts'],
-    exclude: ['gemini-cli/**', 'node_modules/**'],
-    testTimeout: 20000
+    exclude: ['gemini-cli/**', 'node_modules/**']
   }
 });

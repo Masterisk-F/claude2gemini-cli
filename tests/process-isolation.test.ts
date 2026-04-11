@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { childManager } from '../server/child-manager.js';
 
 describe('Process Isolation', () => {
@@ -11,9 +11,8 @@ describe('Process Isolation', () => {
 
         // Vitest環境での子プロセス起動を成功させるための一時的な環境設定
         const originalExecArgv = process.execArgv;
-        const originalNodeOptions = process.env.NODE_OPTIONS;
         process.execArgv = ['--import', 'tsx'];
-        delete process.env.NODE_OPTIONS;
+        vi.stubEnv('NODE_OPTIONS', '');
 
         try {
             await childManager.spawnAll(accounts);
@@ -29,9 +28,7 @@ describe('Process Isolation', () => {
         } finally {
             childManager.killAll();
             process.execArgv = originalExecArgv;
-            if (originalNodeOptions !== undefined) {
-                process.env.NODE_OPTIONS = originalNodeOptions;
-            }
+            vi.unstubAllEnvs();
         }
     });
 });

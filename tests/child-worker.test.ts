@@ -21,26 +21,25 @@ describe('Child Worker', () => {
 
         try {
             // ソケットが作成されるまで待機
-            await new Promise((resolve, reject) => {
-                let retries = 0;
-                const interval = setInterval(() => {
-                    try {
+            let isConnected = false;
+            for (let i = 0; i < 100; i++) {
+                try {
+                    await new Promise((resolve, reject) => {
                         const client = net.connect(socketPath, () => {
-                            clearInterval(interval);
-                            resolve(client);
+                            client.end();
+                            resolve(true);
                         });
-                        client.on('error', () => {
-                            retries++;
-                            if (retries > 100) {
-                                clearInterval(interval);
-                                reject(new Error('Socket connection timeout'));
-                            }
-                        });
-                    } catch (e) {
-                        // Ignore
-                    }
-                }, 100);
-            });
+                        client.on('error', reject);
+                    });
+                    isConnected = true;
+                    break;
+                } catch (e) {
+                    await new Promise(r => setTimeout(r, 100));
+                }
+            }
+            if (!isConnected) {
+                throw new Error('Socket connection timeout');
+            }
 
             const client = net.createConnection(socketPath);
 
@@ -92,5 +91,5 @@ describe('Child Worker', () => {
                 });
             } catch (e) { }
         }
-    });
+    }, 20000);
 });
