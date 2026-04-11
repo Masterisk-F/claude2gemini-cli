@@ -306,47 +306,50 @@ async function handleParentMessage(msg: ParentMessage, sendEvent: (msg: ChildMes
                     const registry = (geminiSession as any).config?.toolRegistry;
                     if (registry) {
                         const ws = registry.getTool('google_web_search');
-                        if (ws && typeof ws.execute === 'function' && !ws.__executePatched) {
-                            const originalExecute = ws.execute.bind(ws);
-                            ws.execute = async (params: any, signal?: AbortSignal) => {
-                                try {
-                                    const result = await originalExecute(params, signal);
-                                    const callId = (sessionData as any).lastServerToolCallId || `unknown_${Date.now()}`;
+                        if (ws && typeof ws.createInvocation === 'function' && !ws.__createInvocationPatched) {
+                            const originalCreateInvocation = ws.createInvocation.bind(ws);
+                            ws.createInvocation = (params: any, messageBus: any, name: any, displayName: any) => {
+                                const invocation = originalCreateInvocation(params, messageBus, name, displayName);
+                                const originalExecute = invocation.execute.bind(invocation);
+                                invocation.execute = async (signal: AbortSignal) => {
+                                    try {
+                                        const result = await originalExecute(signal);
+                                        const callId = (sessionData as any).lastServerToolCallId || `unknown_${Date.now()}`;
 
-                                    // Map gemini-cli result to Claude web_search_tool_result format
-                                    // result.sources is GroundingChunkItem[]
-                                    const claudeResult = (result.sources || []).map((s: any) => ({
-                                        type: 'web_search_result',
-                                        url: s.web?.uri || '',
-                                        title: s.web?.title || '',
-                                        // Claude expects encrypted_content for citations in subsequent turns
-                                        // We use base64 of URI as a placeholder
-                                        encrypted_content: Buffer.from(s.web?.uri || '').toString('base64'),
-                                        page_age: new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })
-                                    }));
+                                        // Map gemini-cli result to Claude web_search_tool_result format
+                                        const claudeResult = (result.sources || []).map((s: any) => ({
+                                            type: 'web_search_result',
+                                            url: s.web?.uri || '',
+                                            title: s.web?.title || '',
+                                            encrypted_content: Buffer.from(s.web?.uri || '').toString('base64'),
+                                            page_age: new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })
+                                        }));
 
-                                    sendEvent({
-                                        type: 'server_tool_result',
-                                        sessionId,
-                                        callId,
-                                        result: claudeResult
-                                    });
-                                    return result;
-                                } catch (err) {
-                                    const callId = (sessionData as any).lastServerToolCallId || `unknown_${Date.now()}`;
-                                    sendEvent({
-                                        type: 'server_tool_result',
-                                        sessionId,
-                                        callId,
-                                        result: {
-                                            type: 'web_search_tool_result_error',
-                                            error_code: 'internal_error'
-                                        }
-                                    });
-                                    throw err;
-                                }
+                                        console.log(`[Child Worker] Web search result mapped. Sources count: ${claudeResult.length}`);
+                                        sendEvent({
+                                            type: 'server_tool_result',
+                                            sessionId,
+                                            callId,
+                                            result: claudeResult
+                                        });
+                                        return result;
+                                    } catch (err) {
+                                        const callId = (sessionData as any).lastServerToolCallId || `unknown_${Date.now()}`;
+                                        sendEvent({
+                                            type: 'server_tool_result',
+                                            sessionId,
+                                            callId,
+                                            result: {
+                                                type: 'web_search_tool_result_error',
+                                                error_code: 'internal_error'
+                                            }
+                                        });
+                                        throw err;
+                                    }
+                                };
+                                return invocation;
                             };
-                            ws.__executePatched = true;
+                            ws.__createInvocationPatched = true;
                         }
                     }
                 }
@@ -452,6 +455,7 @@ async function consumeStream(
                 return; // エラー時は関数終了
             } else if (chunk.type === 'finished') {
                 const usage = chunk.value?.usageMetadata;
+                console.log(`[Child Worker] Finished event received. expectedClientTools: ${toolState.expectedClientTools}`);
                 if (usage) {
                     sessionData.lastUsage = {
                         input_tokens: usage.promptTokenCount || 0,
@@ -459,7 +463,9 @@ async function consumeStream(
                     };
                 }
                 toolState.hasYieldedFinished = true;
-                if (toolState.registeredClientTools >= toolState.expectedClientTools && toolState.resolveToolTurn) {
+                if (toolState.expectedClientTools > 0 &&
+                    toolState.registeredClientTools >= toolState.expectedClientTools &&
+                    toolState.resolveToolTurn) {
                     toolState.resolveToolTurn();
                 }
             } else if (chunk.type === 'tool_call_request') {
@@ -476,6 +482,7 @@ async function consumeStream(
 
                 const wsName = (sessionData as any).claudeWebSearchName;
                 if (name === 'google_web_search' && wsName) {
+                    console.log(`[Child Worker] Intercepted google_web_search -> ${wsName}`);
                     (sessionData as any).lastServerToolCallId = callId;
                     hasProducedAnyBlock = true;
                     // server-side tool, does not wait for client
@@ -487,6 +494,7 @@ async function consumeStream(
                         args: parsedArgs
                     });
                 } else {
+                    console.log(`[Child Worker] Tool call (not intercepted): ${name}`);
                     toolState.expectedClientTools++;
                     hasProducedAnyBlock = true;
                     stopReason = 'tool_use';

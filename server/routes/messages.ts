@@ -40,8 +40,8 @@ function buildClaudeResponse({
     throw new Error('Gemini API returned an empty response');
   }
 
-  const hasToolUse = contentBlocks.some(b => b.type === 'tool_use' || b.type === 'server_tool_use');
-  const stopReason = hasToolUse ? 'tool_use' : 'end_turn';
+  const hasClientToolUse = contentBlocks.some(b => b.type === 'tool_use');
+  const stopReason = hasClientToolUse ? 'tool_use' : 'end_turn';
 
   return {
     id: `msg_${randomUUID().replace(/-/g, '').slice(0, 24)}`,
