@@ -292,7 +292,39 @@ async function handleParentMessage(msg: ParentMessage, sendEvent: (msg: ChildMes
 
                 const geminiSession = agent.session();
                 const allowedToolNames = tools?.map(t => t.name) || [];
+
+                const wsTool = tools?.find(t => t.type?.startsWith('web_search_'));
+                let claudeWebSearchName: string | undefined = undefined;
+                if (wsTool) {
+                    claudeWebSearchName = wsTool.name || 'web_search';
+                    allowedToolNames.push('google_web_search');
+                }
+
                 await initializeSessionLocally(geminiSession, allowedToolNames);
+
+                if (claudeWebSearchName) {
+                    const registry = (geminiSession as any).config?.toolRegistry;
+                    if (registry) {
+                        const ws = registry.getTool('google_web_search');
+                        if (ws && typeof ws.execute === 'function' && !ws.__executePatched) {
+                            const originalExecute = ws.execute.bind(ws);
+                            ws.execute = async (params: any, signal?: AbortSignal) => {
+                                const result = await originalExecute(params, signal);
+                                const callId = (sessionData as any).lastServerToolCallId || `unknown_${Date.now()}`;
+                                sendEvent({
+                                    type: 'server_tool_result',
+                                    sessionId,
+                                    callId,
+                                    result
+                                });
+                                return result;
+                            };
+                            ws.__executePatched = true;
+                        }
+                    }
+                }
+
+                (sessionData as any).claudeWebSearchName = claudeWebSearchName;
 
                 stream = geminiSession.sendStream(prompt);
                 sessionData.stream = stream;
@@ -408,17 +440,6 @@ async function consumeStream(
                 const callId = callInfo.callId;
                 const name = callInfo.name;
 
-                toolState.expectedClientTools++;
-                hasProducedAnyBlock = true;
-                stopReason = 'tool_use';
-
-                let q = toolState.callIds.get(name);
-                if (!q) {
-                    q = [];
-                    toolState.callIds.set(name, q);
-                }
-                q.push(callId);
-
                 let parsedArgs: Record<string, unknown> = {};
                 if (typeof callInfo.args === 'string') {
                     try { parsedArgs = JSON.parse(callInfo.args); } catch (e) { }
@@ -426,14 +447,39 @@ async function consumeStream(
                     parsedArgs = callInfo.args;
                 }
 
-                // 親プロセスへツール呼び出しを通知
-                sendEvent({
-                    type: 'tool_call',
-                    sessionId,
-                    callId,
-                    name,
-                    args: parsedArgs
-                });
+                const wsName = (sessionData as any).claudeWebSearchName;
+                if (name === 'google_web_search' && wsName) {
+                    (sessionData as any).lastServerToolCallId = callId;
+                    hasProducedAnyBlock = true;
+                    // server-side tool, does not wait for client
+                    sendEvent({
+                        type: 'server_tool_call',
+                        sessionId,
+                        callId,
+                        name: wsName,
+                        args: parsedArgs
+                    });
+                } else {
+                    toolState.expectedClientTools++;
+                    hasProducedAnyBlock = true;
+                    stopReason = 'tool_use';
+
+                    let q = toolState.callIds.get(name);
+                    if (!q) {
+                        q = [];
+                        toolState.callIds.set(name, q);
+                    }
+                    q.push(callId);
+
+                    // 親プロセスへツール呼び出しを通知
+                    sendEvent({
+                        type: 'tool_call',
+                        sessionId,
+                        callId,
+                        name,
+                        args: parsedArgs
+                    });
+                }
             }
 
             nextPromise = stream.next();
