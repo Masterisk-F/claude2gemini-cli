@@ -318,12 +318,29 @@ async function handleParentMessage(msg: ParentMessage, sendEvent: (msg: ChildMes
                                         const callId = (sessionData as any).lastServerToolCallId || `unknown_${Date.now()}`;
 
                                         // Map gemini-cli result to Claude web_search_tool_result format
-                                        const claudeResult = (result.sources || []).map((s: any) => ({
-                                            type: 'web_search_result',
-                                            url: s.web?.uri || '',
-                                            title: s.web?.title || '',
-                                            encrypted_content: Buffer.from(s.web?.uri || '').toString('base64'),
-                                            page_age: new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })
+                                        const claudeResult = await Promise.all((result.sources || []).map(async (s: any) => {
+                                            let finalUrl = s.web?.uri || '';
+                                            if (finalUrl.includes('vertexaisearch.cloud.google.com/grounding-api-redirect/')) {
+                                                try {
+                                                    const res = await fetch(finalUrl, { method: 'GET', redirect: 'manual' });
+                                                    const location = res.headers.get('location');
+                                                    if (location) {
+                                                        finalUrl = location;
+                                                    } else {
+                                                        const headRes = await fetch(finalUrl, { method: 'HEAD', redirect: 'follow' });
+                                                        finalUrl = headRes.url;
+                                                    }
+                                                } catch (e) {
+                                                    console.warn(`[Child Worker] Failed to resolve redirect URL: ${finalUrl}`, e);
+                                                }
+                                            }
+                                            return {
+                                                type: 'web_search_result',
+                                                url: finalUrl,
+                                                title: s.web?.title || '',
+                                                encrypted_content: Buffer.from(finalUrl).toString('base64'),
+                                                page_age: new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })
+                                            };
                                         }));
 
                                         console.log(`[Child Worker] Web search result mapped. Sources count: ${claudeResult.length}`);
