@@ -241,10 +241,29 @@ export async function streamGeminiToClaudeSSE(
         blockIndex++;
         hasProducedAnyBlock = true;
       } else if (msg.type === 'server_tool_result') {
-        // ※ server_tool_result ブロック自体（配列のcontentを持つ）をストリームで流すと Claude SDK パーサーがエラーを起こして終了してしまう問題があるためストリームへの出力は省く。
-        // 代わりに、ここで受け取った結果を pendingCitations として保持し、次に生成される text ブロックの content_block_start 時に citations として追加するだけで要件は満たせる。
-        
-        // 問題2(A案): 次のテキストブロック用にソース情報を保持
+        // 先行するテキストブロックがあれば終了させる
+        if (textBlockStarted) {
+          sendContentBlockStop(res, blockIndex);
+          blockIndex++;
+          textBlockStarted = false;
+        }
+
+        // web_search_tool_result をストリームに出力する
+        sendSSE(res, 'content_block_start', {
+          type: 'content_block_start',
+          index: blockIndex,
+          content_block: {
+            type: 'web_search_tool_result',
+            tool_use_id: msg.callId,
+            content: msg.result
+          }
+        });
+
+        sendContentBlockStop(res, blockIndex);
+        blockIndex++;
+        hasProducedAnyBlock = true;
+
+        // 次のテキストブロック用にソース情報を保持（citations用）
         if (Array.isArray(msg.result)) {
           pendingCitations = pendingCitations.concat(msg.result);
         }
