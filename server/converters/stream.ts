@@ -1,7 +1,7 @@
 /**
  * Gemini ストリームイベント → Claude SSE イベント変換
  *
- * Gemini SDK の sendStream() が生成する ServerGeminiStreamEvent を、
+ * gemini-cli-sdk の sendStream() が生成する ServerGeminiStreamEvent を、
  * Claude Messages API の SSE (Server-Sent Events) 形式に変換する。
  */
 
@@ -126,15 +126,12 @@ export async function streamGeminiToClaudeSSE(
 
   let textBlockStarted = false;
   let hasProducedAnyBlock = false;
-  // 問題1: web_search 実行回数のカウンター
   let webSearchRequests = 0;
-  // 問題2(A案): 得到済みソース情報を保持し、次のテキストブロックに citations を付与する
   let pendingCitations: any[] = [];
 
   // 次のテキストブロック開始時に citations があれば付けて送信する
   const sendTextBlockStart = (index: number) => {
     if (pendingCitations.length > 0) {
-      // ⚠️ 案A: 全ソースをテキストブロックに一括付与
       sendSSE(res, 'content_block_start', {
         type: 'content_block_start',
         index,
@@ -214,7 +211,6 @@ export async function streamGeminiToClaudeSSE(
           textBlockStarted = false;
         }
 
-        // 問題1: web_search 実行毎にカウントをインクリメント
         webSearchRequests++;
 
         sendSSE(res, 'content_block_start', {
@@ -280,7 +276,6 @@ export async function streamGeminiToClaudeSSE(
             stop_reason: msg.stopReason,
             stop_sequence: null,
           },
-          // 問題1: web_search 実行数を含める
           usage: {
             output_tokens: msg.usage?.output_tokens || 0,
             ...(webSearchRequests > 0 ? { server_tool_use: { web_search_requests: webSearchRequests } } : {}),

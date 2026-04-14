@@ -275,15 +275,12 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
       const contentBlocks: any[] = [];
       let currentText = '';
       let turnEndUsage: { input_tokens: number; output_tokens: number } | undefined;
-      // 問題1: web_search 実行回数のカウンター
       let webSearchRequests = 0;
-      // 問題2(A案): 得到済みソース情報を保持し、後続のテキストブロックに citations を付与する
       let pendingCitations: any[] = [];
 
       const flushText = () => {
         if (currentText) {
           const block: any = { type: 'text', text: currentText };
-          // ⚠️ 案A: 全ソースを各テキストブロックに一括付与
           if (pendingCitations.length > 0) {
             block.citations = pendingCitations.map(src => ({
               type: 'web_search_result_location',
@@ -316,7 +313,6 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
           }
         } else if (msg.type === 'server_tool_call') {
             flushText();
-            // 問題1: web_search 実行毎にカウントをインクリメント
             webSearchRequests++;
             contentBlocks.push({
               type: 'server_tool_use',
