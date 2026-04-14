@@ -331,9 +331,9 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
               tool_use_id: msg.callId,
               content: msg.result
             });
-            // 問題2(A案): 後続テキストブロック用にソース情報を保持
+            // 複数回検索時に過去のソースが消えないよう concat で累積する（stream.ts と同一の挙動）
             if (Array.isArray(msg.result)) {
-              pendingCitations = msg.result;
+              pendingCitations = pendingCitations.concat(msg.result);
             }
         } else if (msg.type === 'error' || msg.type === 'fatal_error') {
           throw new GeminiApiError(msg.message, 'status' in msg ? msg.status : undefined);
