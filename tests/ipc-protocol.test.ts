@@ -41,4 +41,35 @@ describe('IPC Protocol', () => {
         const parsed = parseIPCMessage<ChildMessage>(serialized);
         expect(parsed).toEqual(msg);
     });
+
+    it('serialize and parse server_tool_call', () => {
+        const msg: ChildMessage = {
+            type: 'server_tool_call',
+            sessionId: 'sess-1',
+            callId: 'call-1',
+            name: 'web_search',
+            args: { query: 'test query' }
+        };
+
+        const serialized = serializeIPCMessage(msg);
+        const parsed = parseIPCMessage<ChildMessage>(serialized);
+        expect(parsed).toEqual(msg);
+    });
+
+    it('serialize and parse server_tool_result', () => {
+        const msg: ChildMessage = {
+            type: 'server_tool_result',
+            sessionId: 'sess-1',
+            callId: 'call-1',
+            result: {
+                llmContent: 'results',
+                returnDisplay: 'display',
+                sources: []
+            }
+        };
+
+        const serialized = serializeIPCMessage(msg);
+        const parsed = parseIPCMessage<ChildMessage>(serialized);
+        expect(parsed).toEqual(msg);
+    });
 });

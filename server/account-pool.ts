@@ -44,7 +44,7 @@ class AccountPool {
 
   nextAccount(): string | undefined {
     if (this.accounts.length === 0) {
-      return undefined; // フォールバック用
+      return 'default'; // 仮想的なデフォルトアカウントを返す
     }
 
     const account = this.accounts[this.currentIndex];

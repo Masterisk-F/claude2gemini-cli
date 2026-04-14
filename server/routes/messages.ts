@@ -28,43 +28,41 @@ function normalizeToolResultContent(content: unknown): string {
 }
 
 function buildClaudeResponse({
-  text,
+  contentBlocks,
   model,
-  toolCalls,
   usage,
+  webSearchRequests,
 }: {
-  text: string;
+  contentBlocks: any[];
   model: string;
-  toolCalls: ClaudeToolUseBlock[];
   usage?: { input_tokens: number; output_tokens: number };
+  webSearchRequests?: number;
 }) {
-  if (!text && toolCalls.length === 0) {
+  if (contentBlocks.length === 0) {
     throw new Error('Gemini API returned an empty response');
   }
 
-  const content: any[] = [];
-  if (text) {
-    content.push({ type: 'text', text });
-  }
+  const hasClientToolUse = contentBlocks.some(b => b.type === 'tool_use');
+  const stopReason = hasClientToolUse ? 'tool_use' : 'end_turn';
 
-  for (const call of toolCalls) {
-    content.push(call);
+  // web_search が使用された場合にのみ server_tool_use フィールドを付与する
+  const usageField: any = {
+    input_tokens: usage?.input_tokens || 0,
+    output_tokens: usage?.output_tokens || 0,
+  };
+  if (webSearchRequests && webSearchRequests > 0) {
+    usageField.server_tool_use = { web_search_requests: webSearchRequests };
   }
-
-  const stopReason = toolCalls.length > 0 ? 'tool_use' : 'end_turn';
 
   return {
     id: `msg_${randomUUID().replace(/-/g, '').slice(0, 24)}`,
     type: 'message',
     role: 'assistant',
     model: model,
-    content: content,
+    content: contentBlocks,
     stop_reason: stopReason,
     stop_sequence: null,
-    usage: {
-      input_tokens: usage?.input_tokens || 0,
-      output_tokens: usage?.output_tokens || 0,
-    },
+    usage: usageField,
   };
 }
 
@@ -274,38 +272,79 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
       await streamGeminiToClaudeSSE(stream, res, body.model, sessionId, sessionStore, allowedToolNames);
 
     } else {
-      let fullText = '';
-      const toolCalls: ClaudeToolUseBlock[] = [];
+      const contentBlocks: any[] = [];
+      let currentText = '';
       let turnEndUsage: { input_tokens: number; output_tokens: number } | undefined;
+      let webSearchRequests = 0;
+      let pendingCitations: any[] = [];
+
+      const flushText = () => {
+        if (currentText) {
+          const block: any = { type: 'text', text: currentText };
+          if (pendingCitations.length > 0) {
+            block.citations = pendingCitations.map(src => ({
+              type: 'web_search_result_location',
+              url: src.url,
+              title: src.title,
+              encrypted_index: src.encrypted_content,
+              cited_text: currentText.slice(0, 150),
+            }));
+          }
+          contentBlocks.push(block);
+          currentText = '';
+        }
+      };
 
       for await (const msg of stream) {
         if (msg.type === 'stream_event') {
           if (msg.event.type === 'content' && msg.event.value) {
-            fullText += msg.event.value;
+            currentText += msg.event.value;
           }
         } else if (msg.type === 'tool_call') {
           if (allowedToolNames.includes(msg.name)) {
+            flushText();
             sessionStore.addPendingToolCall(sessionId, msg.callId);
-            toolCalls.push({
+            contentBlocks.push({
               type: 'tool_use',
               id: msg.callId,
               name: msg.name,
               input: msg.args
             });
           }
+        } else if (msg.type === 'server_tool_call') {
+            flushText();
+            webSearchRequests++;
+            contentBlocks.push({
+              type: 'server_tool_use',
+              id: msg.callId,
+              name: msg.name,
+              input: msg.args
+            });
+        } else if (msg.type === 'server_tool_result') {
+            flushText();
+            contentBlocks.push({
+              type: 'web_search_tool_result',
+              tool_use_id: msg.callId,
+              content: msg.result
+            });
+            // 複数回検索時に過去のソースが消えないよう concat で累積する（stream.ts と同一の挙動）
+            if (Array.isArray(msg.result)) {
+              pendingCitations = pendingCitations.concat(msg.result);
+            }
         } else if (msg.type === 'error' || msg.type === 'fatal_error') {
           throw new GeminiApiError(msg.message, 'status' in msg ? msg.status : undefined);
         } else if (msg.type === 'turn_end') {
+          flushText();
           turnEndUsage = msg.usage;
           break;
         }
       }
 
       const claudeResponse = buildClaudeResponse({
-        text: fullText,
+        contentBlocks,
         model: body.model,
-        toolCalls,
         usage: turnEndUsage,
+        webSearchRequests,
       });
 
       res.json(claudeResponse);

@@ -13,7 +13,7 @@ export interface ClaudeTextBlock {
 }
 
 export interface ClaudeToolUseBlock {
-  type: 'tool_use';
+  type: 'tool_use' | 'server_tool_use';
   id: string;
   name: string;
   input: Record<string, unknown>;
@@ -25,7 +25,13 @@ export interface ClaudeToolResultBlock {
   content: string | ClaudeContentBlock[];
 }
 
-export type ClaudeContentBlock = ClaudeTextBlock | ClaudeToolUseBlock | ClaudeToolResultBlock;
+export interface ClaudeWebSearchToolResultBlock {
+  type: 'web_search_tool_result';
+  tool_use_id: string;
+  content: any;
+}
+
+export type ClaudeContentBlock = ClaudeTextBlock | ClaudeToolUseBlock | ClaudeToolResultBlock | ClaudeWebSearchToolResultBlock;
 
 export interface ClaudeMessage {
   role: 'user' | 'assistant';
@@ -33,9 +39,10 @@ export interface ClaudeMessage {
 }
 
 export interface ClaudeToolDefinition {
+  type?: string;
   name: string;
-  description: string;
-  input_schema: Record<string, unknown>;
+  description?: string;
+  input_schema?: Record<string, unknown>;
 }
 
 export interface ClaudeRequest {
@@ -56,6 +63,10 @@ export interface ClaudeRequest {
 export interface ClaudeUsage {
   input_tokens: number;
   output_tokens: number;
+  /** web_search ツール使用時にのみ付与されるサーバーツール使用量 */
+  server_tool_use?: {
+    web_search_requests: number;
+  };
 }
 
 export type ClaudeStopReason = 'end_turn' | 'max_tokens' | 'stop_sequence' | 'tool_use';
@@ -81,10 +92,26 @@ export interface ClaudeMessageStartEvent {
   };
 }
 
+/** Citations: テキストブロックに付与される web_search 引用情報 */
+export interface ClaudeWebSearchCitation {
+  type: 'web_search_result_location';
+  url: string;
+  title: string;
+  /** encrypted_content (IPC 内部) を変換したもの。実装上は URL の Base64 エンコード値 */
+  encrypted_index: string;
+  cited_text: string;
+}
+
 export interface ClaudeContentBlockStartEvent {
   type: 'content_block_start';
   index: number;
-  content_block: { type: 'text'; text: '' } | { type: 'tool_use'; id: string; name: string; input: Record<string, never> };
+  content_block:
+    | { type: 'text'; text: ''; citations?: ClaudeWebSearchCitation[] }
+    | { type: 'tool_use'; id: string; name: string; input: Record<string, never> }
+    /** PR #24 追加: server-side tool (web_search など) の開始ブロック */
+    | { type: 'server_tool_use'; id: string; name: string; input: Record<string, never> }
+    /** PR #24 追加: web_search の結果ブロック */
+    | { type: 'web_search_tool_result'; tool_use_id: string; content: any };
 }
 
 export interface ClaudeContentBlockDeltaEvent {

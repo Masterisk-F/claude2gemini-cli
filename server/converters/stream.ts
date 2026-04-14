@@ -1,7 +1,7 @@
 /**
  * Gemini ストリームイベント → Claude SSE イベント変換
  *
- * Gemini SDK の sendStream() が生成する ServerGeminiStreamEvent を、
+ * gemini-cli-sdk の sendStream() が生成する ServerGeminiStreamEvent を、
  * Claude Messages API の SSE (Server-Sent Events) 形式に変換する。
  */
 
@@ -126,6 +126,31 @@ export async function streamGeminiToClaudeSSE(
 
   let textBlockStarted = false;
   let hasProducedAnyBlock = false;
+  let webSearchRequests = 0;
+  let pendingCitations: any[] = [];
+
+  // 次のテキストブロック開始時に citations があれば付けて送信する
+  const sendTextBlockStart = (index: number) => {
+    if (pendingCitations.length > 0) {
+      sendSSE(res, 'content_block_start', {
+        type: 'content_block_start',
+        index,
+        content_block: {
+          type: 'text',
+          text: '',
+          citations: pendingCitations.map(src => ({
+            type: 'web_search_result_location',
+            url: src.url,
+            title: src.title,
+            encrypted_index: src.encrypted_content,
+            cited_text: '',
+          })),
+        },
+      });
+    } else {
+      sendContentBlockStart(res, index);
+    }
+  };
 
   try {
     for await (const msg of childStream) {
@@ -133,7 +158,7 @@ export async function streamGeminiToClaudeSSE(
         const chunk = msg.event;
         if (chunk.type === 'content' && chunk.value) {
           if (!textBlockStarted) {
-            sendContentBlockStart(res, blockIndex);
+            sendTextBlockStart(blockIndex);
             textBlockStarted = true;
             hasProducedAnyBlock = true;
           }
@@ -179,6 +204,65 @@ export async function streamGeminiToClaudeSSE(
         sendContentBlockStop(res, blockIndex);
         blockIndex++;
         hasProducedAnyBlock = true;
+      } else if (msg.type === 'server_tool_call') {
+        if (textBlockStarted) {
+          sendContentBlockStop(res, blockIndex);
+          blockIndex++;
+          textBlockStarted = false;
+        }
+
+        webSearchRequests++;
+
+        sendSSE(res, 'content_block_start', {
+          type: 'content_block_start',
+          index: blockIndex,
+          content_block: {
+            type: 'server_tool_use',
+            id: msg.callId,
+            name: msg.name,
+            input: {},
+          },
+        });
+
+        sendSSE(res, 'content_block_delta', {
+          type: 'content_block_delta',
+          index: blockIndex,
+          delta: {
+            type: 'input_json_delta',
+            partial_json: JSON.stringify(msg.args),
+          },
+        });
+
+        sendContentBlockStop(res, blockIndex);
+        blockIndex++;
+        hasProducedAnyBlock = true;
+      } else if (msg.type === 'server_tool_result') {
+        // 先行するテキストブロックがあれば終了させる
+        if (textBlockStarted) {
+          sendContentBlockStop(res, blockIndex);
+          blockIndex++;
+          textBlockStarted = false;
+        }
+
+        // web_search_tool_result をストリームに出力する
+        sendSSE(res, 'content_block_start', {
+          type: 'content_block_start',
+          index: blockIndex,
+          content_block: {
+            type: 'web_search_tool_result',
+            tool_use_id: msg.callId,
+            content: msg.result
+          }
+        });
+
+        sendContentBlockStop(res, blockIndex);
+        blockIndex++;
+        hasProducedAnyBlock = true;
+
+        // 次のテキストブロック用にソース情報を保持（citations用）
+        if (Array.isArray(msg.result)) {
+          pendingCitations = pendingCitations.concat(msg.result);
+        }
       } else if (msg.type === 'turn_end') {
         if (textBlockStarted) {
           sendContentBlockStop(res, blockIndex);
@@ -194,6 +278,7 @@ export async function streamGeminiToClaudeSSE(
           },
           usage: {
             output_tokens: msg.usage?.output_tokens || 0,
+            ...(webSearchRequests > 0 ? { server_tool_use: { web_search_requests: webSearchRequests } } : {}),
           },
         });
 

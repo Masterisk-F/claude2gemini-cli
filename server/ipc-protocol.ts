@@ -54,6 +54,19 @@ export type ChildMessage =
         args: Record<string, unknown>;
     }
     | {
+        type: 'server_tool_call';
+        sessionId: string;
+        callId: string;
+        name: string;
+        args: Record<string, unknown>;
+    }
+    | {
+        type: 'server_tool_result';
+        sessionId: string;
+        callId: string;
+        result: any;
+    }
+    | {
         type: 'turn_end';
         sessionId: string;
         stopReason: string; // ClaudeStopReason ('end_turn' | 'max_tokens' | 'tool_use' | 'stop_sequence')

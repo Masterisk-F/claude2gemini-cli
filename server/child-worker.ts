@@ -3,6 +3,7 @@ import path from 'node:path';
 import net from 'node:net';
 import readline from 'node:readline';
 import { EventEmitter } from 'node:events';
+import { randomUUID } from 'node:crypto';
 
 // SDKがリクエストごとにAgentを生成してイベントリスナーを登録するため、
 // Warningを抑制するために最大リスナー数を引き上げる
@@ -253,10 +254,10 @@ async function handleParentMessage(msg: ParentMessage, sendEvent: (msg: ChildMes
                 };
                 sessionData.toolState = toolState;
 
-                const sdkTools = tools?.map((t) => tool(
+                const sdkTools = tools?.filter(t => !t.type?.startsWith('web_search_')).map((t) => tool(
                     {
                         name: t.name,
-                        description: t.description,
+                        description: t.description ?? '',
                         inputSchema: convertClaudeToolToZodSchema(t),
                     },
                     async (params) => {
@@ -292,7 +293,86 @@ async function handleParentMessage(msg: ParentMessage, sendEvent: (msg: ChildMes
 
                 const geminiSession = agent.session();
                 const allowedToolNames = tools?.map(t => t.name) || [];
+
+                const wsTool = tools?.find(t => t.type?.startsWith('web_search_'));
+                let claudeWebSearchName: string | undefined = undefined;
+                if (wsTool) {
+                    claudeWebSearchName = wsTool.name || 'web_search';
+                    allowedToolNames.push('google_web_search');
+                }
+
                 await initializeSessionLocally(geminiSession, allowedToolNames);
+
+                if (claudeWebSearchName) {
+                    const registry = (geminiSession as any).config?.toolRegistry;
+                    if (registry) {
+                        const ws = registry.getTool('google_web_search');
+                        if (ws && typeof ws.createInvocation === 'function' && !ws.__createInvocationPatched) {
+                            const originalCreateInvocation = ws.createInvocation.bind(ws);
+                            ws.createInvocation = (params: any, messageBus: any, name: any, displayName: any) => {
+                                const invocation = originalCreateInvocation(params, messageBus, name, displayName);
+                                const originalExecute = invocation.execute.bind(invocation);
+                                invocation.execute = async (signal: AbortSignal) => {
+                                    try {
+                                        const result = await originalExecute(signal);
+                                        const callId = (sessionData as any).lastServerToolCallId || `unknown_${Date.now()}`;
+
+                                        // Map gemini-cli result to Claude web_search_tool_result format
+                                        const claudeResult = await Promise.all((result.sources || []).map(async (s: any) => {
+                                            let finalUrl = s.web?.uri || '';
+                                            if (finalUrl.includes('vertexaisearch.cloud.google.com/grounding-api-redirect/')) {
+                                                try {
+                                                    const res = await fetch(finalUrl, { method: 'GET', redirect: 'manual' });
+                                                    const location = res.headers.get('location');
+                                                    if (location) {
+                                                        finalUrl = location;
+                                                    } else {
+                                                        const headRes = await fetch(finalUrl, { method: 'HEAD', redirect: 'follow' });
+                                                        finalUrl = headRes.url;
+                                                    }
+                                                } catch (e) {
+                                                    console.warn(`[Child Worker] Failed to resolve redirect URL: ${finalUrl}`, e);
+                                                }
+                                            }
+                                            return {
+                                                type: 'web_search_result',
+                                                url: finalUrl,
+                                                title: s.web?.title || '',
+                                                encrypted_content: Buffer.from(finalUrl).toString('base64'),
+                                                page_age: new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })
+                                            };
+                                        }));
+
+                                        console.log(`[Child Worker] Web search result mapped. Sources count: ${claudeResult.length}`);
+                                        sendEvent({
+                                            type: 'server_tool_result',
+                                            sessionId,
+                                            callId,
+                                            result: claudeResult
+                                        });
+                                        return result;
+                                    } catch (err) {
+                                        const callId = (sessionData as any).lastServerToolCallId || `unknown_${Date.now()}`;
+                                        sendEvent({
+                                            type: 'server_tool_result',
+                                            sessionId,
+                                            callId,
+                                            result: {
+                                                type: 'web_search_tool_result_error',
+                                                error_code: 'internal_error'
+                                            }
+                                        });
+                                        throw err;
+                                    }
+                                };
+                                return invocation;
+                            };
+                            ws.__createInvocationPatched = true;
+                        }
+                    }
+                }
+
+                (sessionData as any).claudeWebSearchName = claudeWebSearchName;
 
                 stream = geminiSession.sendStream(prompt);
                 sessionData.stream = stream;
@@ -379,7 +459,7 @@ async function consumeStream(
 
             const chunk = iter.value;
 
-            if (chunk.type === 'content' && chunk.value) {
+            if ((chunk.type === 'content' || chunk.type === 'citation') && chunk.value) {
                 hasProducedAnyBlock = true;
                 sendEvent({ type: 'stream_event', sessionId, event: { type: 'content', value: chunk.value } });
             } else if (chunk.type === 'error') {
@@ -393,6 +473,7 @@ async function consumeStream(
                 return; // エラー時は関数終了
             } else if (chunk.type === 'finished') {
                 const usage = chunk.value?.usageMetadata;
+                console.log(`[Child Worker] Finished event received. expectedClientTools: ${toolState.expectedClientTools}`);
                 if (usage) {
                     sessionData.lastUsage = {
                         input_tokens: usage.promptTokenCount || 0,
@@ -400,24 +481,15 @@ async function consumeStream(
                     };
                 }
                 toolState.hasYieldedFinished = true;
-                if (toolState.registeredClientTools >= toolState.expectedClientTools && toolState.resolveToolTurn) {
+                if (toolState.expectedClientTools > 0 &&
+                    toolState.registeredClientTools >= toolState.expectedClientTools &&
+                    toolState.resolveToolTurn) {
                     toolState.resolveToolTurn();
                 }
             } else if (chunk.type === 'tool_call_request') {
                 const callInfo = chunk.value;
                 const callId = callInfo.callId;
                 const name = callInfo.name;
-
-                toolState.expectedClientTools++;
-                hasProducedAnyBlock = true;
-                stopReason = 'tool_use';
-
-                let q = toolState.callIds.get(name);
-                if (!q) {
-                    q = [];
-                    toolState.callIds.set(name, q);
-                }
-                q.push(callId);
 
                 let parsedArgs: Record<string, unknown> = {};
                 if (typeof callInfo.args === 'string') {
@@ -426,14 +498,44 @@ async function consumeStream(
                     parsedArgs = callInfo.args;
                 }
 
-                // 親プロセスへツール呼び出しを通知
-                sendEvent({
-                    type: 'tool_call',
-                    sessionId,
-                    callId,
-                    name,
-                    args: parsedArgs
-                });
+                const wsName = (sessionData as any).claudeWebSearchName;
+                if (name === 'google_web_search' && wsName) {
+                    // Claude API 仕様に準拠した srvtoolu_ プレフィックス付きIDを生成
+                    const serverCallId = `srvtoolu_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
+                    console.log(`[Child Worker] Intercepted google_web_search -> ${wsName} (id: ${serverCallId})`);
+                    // モンキーパッチ側が結果を返す際に同じIDを使用するよう保存
+                    (sessionData as any).lastServerToolCallId = serverCallId;
+                    hasProducedAnyBlock = true;
+                    // server-side tool, does not wait for client
+                    sendEvent({
+                        type: 'server_tool_call',
+                        sessionId,
+                        callId: serverCallId,
+                        name: wsName,
+                        args: parsedArgs
+                    });
+                } else {
+                    console.log(`[Child Worker] Tool call (not intercepted): ${name}`);
+                    toolState.expectedClientTools++;
+                    hasProducedAnyBlock = true;
+                    stopReason = 'tool_use';
+
+                    let q = toolState.callIds.get(name);
+                    if (!q) {
+                        q = [];
+                        toolState.callIds.set(name, q);
+                    }
+                    q.push(callId);
+
+                    // 親プロセスへツール呼び出しを通知
+                    sendEvent({
+                        type: 'tool_call',
+                        sessionId,
+                        callId,
+                        name,
+                        args: parsedArgs
+                    });
+                }
             }
 
             nextPromise = stream.next();

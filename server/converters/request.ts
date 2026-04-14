@@ -54,15 +54,15 @@ function formatContentForPrompt(content: string | ClaudeContentBlock[]): string 
   for (const block of content) {
     if (block.type === 'text') {
       parts.push(block.text);
-    } else if (block.type === 'tool_use') {
+    } else if (block.type === 'tool_use' || block.type === 'server_tool_use') {
       parts.push(`[Tool Call: ${block.name}(${JSON.stringify(block.input)})]`);
-    } else if (block.type === 'tool_result') {
-      const resultText = typeof block.content === 'string'
-        ? block.content
-        : Array.isArray(block.content)
-          ? block.content.map((b: any) => b.type === 'text' ? b.text : JSON.stringify(b)).join('\n')
+    } else if (block.type === 'tool_result' || block.type === 'web_search_tool_result') {
+      const resultText = typeof (block as any).content === 'string'
+        ? (block as any).content
+        : Array.isArray((block as any).content)
+          ? (block as any).content.map((b: any) => b.type === 'text' ? b.text : JSON.stringify(b)).join('\n')
           : '';
-      parts.push(`[Tool Result (${block.tool_use_id}): ${resultText}]`);
+      parts.push(`[Tool Result ((block as any).tool_use_id): ${resultText}]`);
     }
   }
   return parts.join('\n');
