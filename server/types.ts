@@ -92,10 +92,26 @@ export interface ClaudeMessageStartEvent {
   };
 }
 
+/** Citations: テキストブロックに付与される web_search 引用情報 */
+export interface ClaudeWebSearchCitation {
+  type: 'web_search_result_location';
+  url: string;
+  title: string;
+  /** encrypted_content (IPC 内部) を変換したもの。実装上は URL の Base64 エンコード値 */
+  encrypted_index: string;
+  cited_text: string;
+}
+
 export interface ClaudeContentBlockStartEvent {
   type: 'content_block_start';
   index: number;
-  content_block: { type: 'text'; text: '' } | { type: 'tool_use'; id: string; name: string; input: Record<string, never> };
+  content_block:
+    | { type: 'text'; text: ''; citations?: ClaudeWebSearchCitation[] }
+    | { type: 'tool_use'; id: string; name: string; input: Record<string, never> }
+    /** PR #24 追加: server-side tool (web_search など) の開始ブロック */
+    | { type: 'server_tool_use'; id: string; name: string; input: Record<string, never> }
+    /** PR #24 追加: web_search の結果ブロック */
+    | { type: 'web_search_tool_result'; tool_use_id: string; content: any };
 }
 
 export interface ClaudeContentBlockDeltaEvent {
