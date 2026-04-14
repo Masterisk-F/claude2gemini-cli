@@ -195,4 +195,78 @@ describe('Web Search E2E', () => {
         expect(content[1].type).toBe('web_search_tool_result');
         expect(content[1].tool_use_id).toBe(srvtoolId);
     });
+
+    it('accumulates citations from multiple web_search results in non-streaming mode', async () => {
+        vi.spyOn(accountPool, 'nextAccount').mockReturnValue('test-account');
+        const mockEvents = new EventEmitter();
+        
+        const result1 = [
+            { type: 'web_search_result', url: 'http://source1.com', title: 'Source 1', encrypted_content: 'source1-b64', page_age: 'Today' }
+        ];
+        const result2 = [
+            { type: 'web_search_result', url: 'http://source2.com', title: 'Source 2', encrypted_content: 'source2-b64', page_age: 'Today' }
+        ];
+
+        vi.spyOn(childManager, 'sendRequest').mockImplementation(async (accountId, msg) => {
+            const pMsg = msg as ParentMessage;
+            if (pMsg.type === 'request') {
+                setTimeout(() => {
+                    // First search
+                    mockEvents.emit('message', { type: 'server_tool_call', sessionId: pMsg.sessionId, callId: 'srvtoolu_1', name: 'web_search', args: { query: 'q1' } } as ChildMessage);
+                    setTimeout(() => {
+                        mockEvents.emit('message', { type: 'server_tool_result', sessionId: pMsg.sessionId, callId: 'srvtoolu_1', result: result1 } as ChildMessage);
+                        
+                        setTimeout(() => {
+                            // Second search
+                            mockEvents.emit('message', { type: 'server_tool_call', sessionId: pMsg.sessionId, callId: 'srvtoolu_2', name: 'web_search', args: { query: 'q2' } } as ChildMessage);
+                            setTimeout(() => {
+                                mockEvents.emit('message', { type: 'server_tool_result', sessionId: pMsg.sessionId, callId: 'srvtoolu_2', result: result2 } as ChildMessage);
+                                
+                                setTimeout(() => {
+                                    mockEvents.emit('message', { type: 'stream_event', sessionId: pMsg.sessionId, event: { type: 'content', value: 'Search completed.' } } as ChildMessage);
+                                    mockEvents.emit('message', { type: 'turn_end', sessionId: pMsg.sessionId, stopReason: 'end_turn', usage: { input_tokens: 10, output_tokens: 20 } } as ChildMessage);
+                                }, 10);
+                            }, 10);
+                        }, 10);
+                    }, 10);
+                }, 10);
+            }
+        });
+
+        vi.spyOn(childManager, 'onMessage').mockImplementation((accountId, cb) => {
+            mockEvents.on('message', cb);
+            return () => mockEvents.off('message', cb);
+        });
+
+        const res = await request(app)
+            .post('/v1/messages')
+            .send({
+                model: 'claude-3-opus-20240229',
+                messages: [{ role: 'user', content: 'search twice' }],
+                tools: [{ name: 'web_search', description: 'desc', type: 'web_search_20260209' }]
+            });
+
+        expect(res.status).toBe(200);
+        const content = res.body.content;
+
+        // Verify content blocks
+        expect(content[0].type).toBe('server_tool_use');
+        expect(content[1].type).toBe('web_search_tool_result');
+        expect(content[2].type).toBe('server_tool_use');
+        expect(content[3].type).toBe('web_search_tool_result');
+        expect(content[4].type).toBe('text');
+
+        // Verify citations are accumulated
+        expect(content[4].citations).toBeDefined();
+        expect(content[4].citations.length).toBe(2);
+        expect(content[4].citations[0].url).toBe('http://source1.com');
+        expect(content[4].citations[1].url).toBe('http://source2.com');
+        
+        // Verify field name mapping
+        expect(content[4].citations[0].encrypted_index).toBe('source1-b64');
+        expect(content[4].citations[1].encrypted_index).toBe('source2-b64');
+
+        // Verify usage counter
+        expect(res.body.usage.server_tool_use.web_search_requests).toBe(2);
+    });
 });
