@@ -275,11 +275,6 @@ async function handleParentMessage(msg: ParentMessage, sendEvent: (msg: ChildMes
                             });
 
                             toolState!.registeredClientTools++;
-                            if (toolState!.hasYieldedFinished &&
-                                toolState!.registeredClientTools >= toolState!.expectedClientTools &&
-                                toolState!.resolveToolTurn) {
-                                toolState!.resolveToolTurn();
-                            }
                         });
                     }
                 ));
@@ -409,6 +404,12 @@ async function handleParentMessage(msg: ParentMessage, sendEvent: (msg: ChildMes
             return;
         }
 
+        // 新しいターン用にツール状態をリセット
+        sessionData.toolState.callIds.clear();
+        sessionData.toolState.expectedClientTools = 0;
+        sessionData.toolState.registeredClientTools = 0;
+        sessionData.toolState.hasYieldedFinished = false;
+
         // ストリーム消費ループを再開
         consumeStream(sessionData.stream, sessionData.toolState, sessionId, sessionData, sendEvent);
     }
@@ -481,9 +482,10 @@ async function consumeStream(
                     };
                 }
                 toolState.hasYieldedFinished = true;
-                if (toolState.expectedClientTools > 0 &&
-                    toolState.registeredClientTools >= toolState.expectedClientTools &&
-                    toolState.resolveToolTurn) {
+                // finished時点で全tool_call_requestは処理済み。
+                // SDK Schedulerはツールを順次実行するため、registeredClientToolsの
+                // 完了を待つとデッドロックする。expectedClientTools > 0 なら即座にターン終了。
+                if (toolState.expectedClientTools > 0 && toolState.resolveToolTurn) {
                     toolState.resolveToolTurn();
                 }
             } else if (chunk.type === 'tool_call_request') {
