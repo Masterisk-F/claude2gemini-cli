@@ -52,8 +52,6 @@ interface ToolState {
     callIds: Map<string, string[]>;
     resolveToolTurn?: () => void;
     expectedClientTools: number;
-    registeredClientTools: number;
-    hasYieldedFinished: boolean;
 }
 
 interface PendingToolCall {
@@ -245,9 +243,7 @@ async function handleParentMessage(msg: ParentMessage, sendEvent: (msg: ChildMes
                 // 新規作成
                 toolState = {
                     callIds: new Map(),
-                    expectedClientTools: 0,
-                    registeredClientTools: 0,
-                    hasYieldedFinished: false
+                    expectedClientTools: 0
                 };
                 sessionData.toolState = toolState;
 
@@ -266,7 +262,6 @@ async function handleParentMessage(msg: ParentMessage, sendEvent: (msg: ChildMes
                         const earlyResult = sessionData.earlyToolResults.get(callId);
                         if (earlyResult !== undefined) {
                             sessionData.earlyToolResults.delete(callId);
-                            toolState!.registeredClientTools++;
                             return earlyResult;
                         }
 
@@ -278,8 +273,6 @@ async function handleParentMessage(msg: ParentMessage, sendEvent: (msg: ChildMes
                                 resolve,
                                 reject,
                             });
-
-                            toolState!.registeredClientTools++;
                         });
                     }
                 ));
@@ -427,8 +420,6 @@ async function consumeStream(
     // 前ターンのツール状態をリセット
     // callIdsはSDKのコールバック内でshift()により消費されるためclear()不要
     toolState.expectedClientTools = 0;
-    toolState.registeredClientTools = 0;
-    toolState.hasYieldedFinished = false;
 
     let isToolTurnReached = false;
     let turnPromiseResolve: () => void;
@@ -488,7 +479,6 @@ async function consumeStream(
                         output_tokens: usage.candidatesTokenCount || 0,
                     };
                 }
-                toolState.hasYieldedFinished = true;
                 // finished時点で全tool_call_requestは処理済み。
                 // SDK Schedulerはツールを順次実行するため、registeredClientToolsの
                 // 完了を待つとデッドロックする。expectedClientTools > 0 なら即座にターン終了。
