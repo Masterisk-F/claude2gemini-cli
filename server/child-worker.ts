@@ -52,8 +52,6 @@ interface ToolState {
     callIds: Map<string, string[]>;
     resolveToolTurn?: () => void;
     expectedClientTools: number;
-    registeredClientTools: number;
-    hasYieldedFinished: boolean;
 }
 
 interface PendingToolCall {
@@ -68,6 +66,7 @@ interface SessionData {
     stream?: AsyncGenerator<ServerGeminiStreamEvent, any, any>;
     pendingNext?: Promise<IteratorResult<ServerGeminiStreamEvent, any>>;
     pendingToolCalls: Map<string, PendingToolCall>;
+    earlyToolResults: Map<string, unknown>;
     toolState?: ToolState;
     lastUsage?: {
         input_tokens: number;
@@ -80,7 +79,7 @@ const sessionStore = new Map<string, SessionData>();
 function getOrCreateSession(sessionId: string): SessionData {
     let session = sessionStore.get(sessionId);
     if (!session) {
-        session = { pendingToolCalls: new Map() };
+        session = { pendingToolCalls: new Map(), earlyToolResults: new Map() };
         sessionStore.set(sessionId, session);
     }
     return session;
@@ -239,18 +238,12 @@ async function handleParentMessage(msg: ParentMessage, sendEvent: (msg: ChildMes
             let toolState = sessionData.toolState;
 
             if (stream && toolState) {
-                // 再利用
-                toolState.callIds.clear();
-                toolState.expectedClientTools = 0;
-                toolState.registeredClientTools = 0;
-                toolState.hasYieldedFinished = false;
+                // 再利用 - リセットは consumeStream 冒頭で行う
             } else {
                 // 新規作成
                 toolState = {
                     callIds: new Map(),
-                    expectedClientTools: 0,
-                    registeredClientTools: 0,
-                    hasYieldedFinished: false
+                    expectedClientTools: 0
                 };
                 sessionData.toolState = toolState;
 
@@ -265,6 +258,13 @@ async function handleParentMessage(msg: ParentMessage, sendEvent: (msg: ChildMes
                         const callId = callIds?.shift();
                         if (!callId) throw new Error(`callId not found for tool ${t.name}`);
 
+                        // 先行して到着済みの結果があればキャッシュから即座に返す
+                        const earlyResult = sessionData.earlyToolResults.get(callId);
+                        if (earlyResult !== undefined) {
+                            sessionData.earlyToolResults.delete(callId);
+                            return earlyResult;
+                        }
+
                         return new Promise((resolve, reject) => {
                             sessionData.pendingToolCalls.set(callId, {
                                 toolCallId: callId,
@@ -273,13 +273,6 @@ async function handleParentMessage(msg: ParentMessage, sendEvent: (msg: ChildMes
                                 resolve,
                                 reject,
                             });
-
-                            toolState!.registeredClientTools++;
-                            if (toolState!.hasYieldedFinished &&
-                                toolState!.registeredClientTools >= toolState!.expectedClientTools &&
-                                toolState!.resolveToolTurn) {
-                                toolState!.resolveToolTurn();
-                            }
                         });
                     }
                 ));
@@ -399,7 +392,8 @@ async function handleParentMessage(msg: ParentMessage, sendEvent: (msg: ChildMes
             pendingCall.resolve(result);
             sessionData.pendingToolCalls.delete(toolCallId);
         } else {
-            console.warn(`[Child Worker ${accountId}] Pending tool call not found: ${toolCallId}`);
+            // SDKがまだツールを登録していない場合、結果をキャッシュしておく
+            sessionData.earlyToolResults.set(toolCallId, result);
         }
     } else if (msg.type === 'resume_stream') {
         const { sessionId } = msg;
@@ -408,6 +402,7 @@ async function handleParentMessage(msg: ParentMessage, sendEvent: (msg: ChildMes
             console.warn(`[Child Worker ${accountId}] Cannot resume stream, session invalid: ${sessionId}`);
             return;
         }
+
 
         // ストリーム消費ループを再開
         consumeStream(sessionData.stream, sessionData.toolState, sessionId, sessionData, sendEvent);
@@ -422,6 +417,10 @@ async function consumeStream(
     sessionData: SessionData,
     sendEvent: (msg: ChildMessage) => void
 ) {
+    // 前ターンのツール状態をリセット
+    // callIdsはSDKのコールバック内でshift()により消費されるためclear()不要
+    toolState.expectedClientTools = 0;
+
     let isToolTurnReached = false;
     let turnPromiseResolve: () => void;
     const turnPromise = new Promise<void>((resolve) => { turnPromiseResolve = resolve; });
@@ -480,10 +479,10 @@ async function consumeStream(
                         output_tokens: usage.candidatesTokenCount || 0,
                     };
                 }
-                toolState.hasYieldedFinished = true;
-                if (toolState.expectedClientTools > 0 &&
-                    toolState.registeredClientTools >= toolState.expectedClientTools &&
-                    toolState.resolveToolTurn) {
+                // finished時点で全tool_call_requestは処理済み。
+                // SDK Schedulerはツールを順次実行するため、registeredClientToolsの
+                // 完了を待つとデッドロックする。expectedClientTools > 0 なら即座にターン終了。
+                if (toolState.expectedClientTools > 0 && toolState.resolveToolTurn) {
                     toolState.resolveToolTurn();
                 }
             } else if (chunk.type === 'tool_call_request') {
