@@ -68,6 +68,7 @@ interface SessionData {
     stream?: AsyncGenerator<ServerGeminiStreamEvent, any, any>;
     pendingNext?: Promise<IteratorResult<ServerGeminiStreamEvent, any>>;
     pendingToolCalls: Map<string, PendingToolCall>;
+    earlyToolResults: Map<string, unknown>;
     toolState?: ToolState;
     lastUsage?: {
         input_tokens: number;
@@ -80,7 +81,7 @@ const sessionStore = new Map<string, SessionData>();
 function getOrCreateSession(sessionId: string): SessionData {
     let session = sessionStore.get(sessionId);
     if (!session) {
-        session = { pendingToolCalls: new Map() };
+        session = { pendingToolCalls: new Map(), earlyToolResults: new Map() };
         sessionStore.set(sessionId, session);
     }
     return session;
@@ -261,6 +262,14 @@ async function handleParentMessage(msg: ParentMessage, sendEvent: (msg: ChildMes
                         const callId = callIds?.shift();
                         if (!callId) throw new Error(`callId not found for tool ${t.name}`);
 
+                        // 先行して到着済みの結果があればキャッシュから即座に返す
+                        const earlyResult = sessionData.earlyToolResults.get(callId);
+                        if (earlyResult !== undefined) {
+                            sessionData.earlyToolResults.delete(callId);
+                            toolState!.registeredClientTools++;
+                            return earlyResult;
+                        }
+
                         return new Promise((resolve, reject) => {
                             sessionData.pendingToolCalls.set(callId, {
                                 toolCallId: callId,
@@ -390,7 +399,8 @@ async function handleParentMessage(msg: ParentMessage, sendEvent: (msg: ChildMes
             pendingCall.resolve(result);
             sessionData.pendingToolCalls.delete(toolCallId);
         } else {
-            console.warn(`[Child Worker ${accountId}] Pending tool call not found: ${toolCallId}`);
+            // SDKがまだツールを登録していない場合、結果をキャッシュしておく
+            sessionData.earlyToolResults.set(toolCallId, result);
         }
     } else if (msg.type === 'resume_stream') {
         const { sessionId } = msg;
