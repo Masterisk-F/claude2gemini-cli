@@ -63,8 +63,8 @@ export interface ClaudeRequest {
 export interface ClaudeUsage {
   input_tokens: number;
   output_tokens: number;
-  cache_read_tokens?: number;
-  cache_write_tokens?: number;
+  cache_read_input_tokens?: number;
+  cache_creation_input_tokens?: number;
   /** web_search ツール使用時にのみ付与されるサーバーツール使用量 */
   server_tool_use?: {
     web_search_requests: number;
