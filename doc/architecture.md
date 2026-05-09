@@ -58,13 +58,13 @@ The isolated execution boundary for the Gemini CLI SDK.
 - Restricts `process.env.GEMINI_CLI_HOME` to a specific temporary account directory.
 - Runs a UNIX socket server to receive instructions (NDJSON) from the Parent process.
 - Instantiates `GeminiCliAgent`, executes SDK flows, and intercepts `ServerGeminiStreamEvent`.
-- Forwards output chunks, tool requests, and errors back to the Parent process.
+- Forwards output chunks, tool requests, and errors back to the Parent process. It also tracks token usage (including Prompt Caching) with a fallback mechanism that queries internal SDK services (`ChatRecordingService` and `GeminiChat`) to ensure metrics are captured even if stream chunks lack metadata.
 
 ### `server/ipc-protocol.ts`
 
 Defines TypeScript interfaces for NDJSON communication between Parent and Child processes.
 - **ParentMessage**: `request`, `tool_result`, `resume_stream`
-- **ChildMessage**: `stream_event`, `tool_call`, `turn_end`, `error`, `fatal_error`, `ready`
+- **ChildMessage**: `stream_event`, `tool_call`, `turn_end`, `error`, `fatal_error`, `ready`, `model_info`
 
 ### `server/routes/messages.ts`
 
