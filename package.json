@@ -1,6 +1,6 @@
 {
   "name": "claude2gemini-cli",
-  "version": "0.1.0",
+  "version": "0.6.0",
   "description": "Claude API compatible proxy backed by Gemini CLI SDK",
   "type": "module",
   "scripts": {
