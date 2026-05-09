@@ -68,6 +68,7 @@ interface SessionData {
     pendingToolCalls: Map<string, PendingToolCall>;
     earlyToolResults: Map<string, unknown>;
     toolState?: ToolState;
+    agentSession?: any;
     lastUsage?: {
         input_tokens: number;
         output_tokens: number;
@@ -369,6 +370,7 @@ async function handleParentMessage(msg: ParentMessage, sendEvent: (msg: ChildMes
 
                 stream = geminiSession.sendStream(prompt);
                 sessionData.stream = stream;
+                sessionData.agentSession = geminiSession;
             }
 
             // ストリーム消費ループ開始
@@ -544,6 +546,26 @@ async function consumeStream(
         if (!hasProducedAnyBlock && !isToolTurnReached) {
             sendEvent({ type: 'error', sessionId, message: 'Gemini API returned an empty response', status: 500 });
             return;
+        }
+
+        // --- Usage fallback to ChatRecordingService ---
+        try {
+            const client = sessionData.agentSession?.client;
+            if (client && typeof client.getChatRecordingService === 'function') {
+                const recordingService = client.getChatRecordingService();
+                const conversation = recordingService?.getConversation?.();
+                if (conversation && Array.isArray(conversation.messages)) {
+                    const lastGeminiMsg = conversation.messages.filter((m: any) => m.type === 'gemini').at(-1);
+                    if (lastGeminiMsg && lastGeminiMsg.tokens) {
+                        sessionData.lastUsage = {
+                            input_tokens: lastGeminiMsg.tokens.input || 0,
+                            output_tokens: lastGeminiMsg.tokens.output || 0,
+                        };
+                    }
+                }
+            }
+        } catch (e) {
+            console.warn(`[Child Worker] Failed to extract tokens from recording service:`, e);
         }
 
         sendEvent({
