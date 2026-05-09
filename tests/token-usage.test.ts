@@ -33,7 +33,7 @@ describe('Token Usage Reporting', () => {
                         type: 'turn_end',
                         sessionId: pMsg.sessionId,
                         stopReason: 'end_turn',
-                        usage: { input_tokens: 123, output_tokens: 45 }
+                        usage: { input_tokens: 123, output_tokens: 45, cache_read_tokens: 67 }
                     } as ChildMessage);
                 }, 10);
             }
@@ -55,6 +55,7 @@ describe('Token Usage Reporting', () => {
         expect(res.status).toBe(200);
         expect(res.body.usage.input_tokens).toBe(123);
         expect(res.body.usage.output_tokens).toBe(45);
+        expect(res.body.usage.cache_read_tokens).toBe(67);
     });
 
     it('reports input and output tokens in streaming response (message_delta)', async () => {
@@ -78,7 +79,7 @@ describe('Token Usage Reporting', () => {
                             type: 'turn_end',
                             sessionId: pMsg.sessionId,
                             stopReason: 'end_turn',
-                            usage: { input_tokens: 123, output_tokens: 45 }
+                            usage: { input_tokens: 123, output_tokens: 45, cache_read_tokens: 67 }
                         } as ChildMessage);
                     }, 10);
                 }, 10);
@@ -113,5 +114,6 @@ describe('Token Usage Reporting', () => {
         expect(messageDelta).toBeDefined();
         expect(messageDelta.usage.input_tokens).toBe(123);
         expect(messageDelta.usage.output_tokens).toBe(45);
+        expect(messageDelta.usage.cache_read_tokens).toBe(67);
     });
 });

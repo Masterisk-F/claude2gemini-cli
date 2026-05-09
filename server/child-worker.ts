@@ -72,6 +72,8 @@ interface SessionData {
     lastUsage?: {
         input_tokens: number;
         output_tokens: number;
+        cache_read_tokens?: number;
+        cache_write_tokens?: number;
     };
 }
 
@@ -495,6 +497,7 @@ async function consumeStream(
                     sessionData.lastUsage = {
                         input_tokens: usage.promptTokenCount || 0,
                         output_tokens: usage.candidatesTokenCount || 0,
+                        cache_read_tokens: usage.cachedContentTokenCount || 0,
                     };
                 }
                 // finished時点で全tool_call_requestは処理済み。
@@ -578,16 +581,18 @@ async function consumeStream(
                 if (conversation && Array.isArray(conversation.messages)) {
                     const lastGeminiMsg = conversation.messages.filter((m: any) => m.type === 'gemini').at(-1);
                     if (lastGeminiMsg && lastGeminiMsg.tokens) {
-                        console.log(`[Child Worker] Usage fallback (msg): input=${lastGeminiMsg.tokens.input}, output=${lastGeminiMsg.tokens.output}`);
+                        console.log(`[Child Worker] Usage fallback (msg): input=${lastGeminiMsg.tokens.input}, output=${lastGeminiMsg.tokens.output}, cached=${lastGeminiMsg.tokens.cached}`);
                         sessionData.lastUsage = {
                             input_tokens: lastGeminiMsg.tokens.input || promptTokens || 0,
                             output_tokens: lastGeminiMsg.tokens.output || 0,
+                            cache_read_tokens: lastGeminiMsg.tokens.cached || 0,
                         };
                     } else if (promptTokens) {
                         console.log(`[Child Worker] Usage fallback (chat): input=${promptTokens}`);
                         sessionData.lastUsage = {
                             input_tokens: promptTokens,
                             output_tokens: sessionData.lastUsage?.output_tokens || 0,
+                            cache_read_tokens: sessionData.lastUsage?.cache_read_tokens || 0,
                         };
                     }
                 }

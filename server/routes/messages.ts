@@ -35,7 +35,7 @@ function buildClaudeResponse({
 }: {
   contentBlocks: any[];
   model: string;
-  usage?: { input_tokens: number; output_tokens: number };
+  usage?: { input_tokens: number; output_tokens: number; cache_read_tokens?: number; cache_write_tokens?: number };
   webSearchRequests?: number;
 }) {
   if (contentBlocks.length === 0) {
@@ -50,6 +50,12 @@ function buildClaudeResponse({
     input_tokens: usage?.input_tokens || 0,
     output_tokens: usage?.output_tokens || 0,
   };
+  if (usage?.cache_read_tokens !== undefined) {
+    usageField.cache_read_tokens = usage.cache_read_tokens;
+  }
+  if (usage?.cache_write_tokens !== undefined) {
+    usageField.cache_write_tokens = usage.cache_write_tokens;
+  }
   if (webSearchRequests && webSearchRequests > 0) {
     usageField.server_tool_use = { web_search_requests: webSearchRequests };
   }

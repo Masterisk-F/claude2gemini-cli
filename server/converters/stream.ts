@@ -44,6 +44,8 @@ function sendMessageStart(res: Response, messageId: string, model: string, input
       usage: {
         input_tokens: inputTokens,
         output_tokens: 0,
+        cache_read_tokens: 0,
+        cache_write_tokens: 0,
       },
     },
   });
@@ -310,6 +312,7 @@ export async function streamGeminiToClaudeSSE(
           usage: {
             input_tokens: msg.usage?.input_tokens || 0,
             output_tokens: msg.usage?.output_tokens || 0,
+            cache_read_tokens: msg.usage?.cache_read_tokens || 0,
             ...(webSearchRequests > 0 ? { server_tool_use: { web_search_requests: webSearchRequests } } : {}),
           },
         });
