@@ -371,6 +371,22 @@ async function handleParentMessage(msg: ParentMessage, sendEvent: (msg: ChildMes
                 stream = geminiSession.sendStream(prompt);
                 sessionData.stream = stream;
                 sessionData.agentSession = geminiSession;
+
+                // Send estimated input tokens early
+                try {
+                    const chat = (geminiSession as any).client?.getChat?.();
+                    const estimatedTokens = chat?.lastPromptTokenCount;
+                    if (estimatedTokens) {
+                        sendEvent({
+                            type: 'stream_event',
+                            sessionId,
+                            event: {
+                                type: 'model_info',
+                                value: JSON.stringify({ estimated_input_tokens: estimatedTokens })
+                            }
+                        });
+                    }
+                } catch (e) {}
             }
 
             // ストリーム消費ループ開始
@@ -548,18 +564,30 @@ async function consumeStream(
             return;
         }
 
-        // --- Usage fallback to ChatRecordingService ---
+        // --- Usage fallback to ChatRecordingService and GeminiChat ---
         try {
             const client = sessionData.agentSession?.client;
-            if (client && typeof client.getChatRecordingService === 'function') {
-                const recordingService = client.getChatRecordingService();
+            if (client) {
+                const chat = (client as any).getChat?.();
+                const recordingService = (client as any).getChatRecordingService?.();
+
+                // Try to get from chat first (it's updated in processStreamResponse in real-time)
+                const promptTokens = chat?.lastPromptTokenCount;
+
                 const conversation = recordingService?.getConversation?.();
                 if (conversation && Array.isArray(conversation.messages)) {
                     const lastGeminiMsg = conversation.messages.filter((m: any) => m.type === 'gemini').at(-1);
                     if (lastGeminiMsg && lastGeminiMsg.tokens) {
+                        console.log(`[Child Worker] Usage fallback (msg): input=${lastGeminiMsg.tokens.input}, output=${lastGeminiMsg.tokens.output}`);
                         sessionData.lastUsage = {
-                            input_tokens: lastGeminiMsg.tokens.input || 0,
+                            input_tokens: lastGeminiMsg.tokens.input || promptTokens || 0,
                             output_tokens: lastGeminiMsg.tokens.output || 0,
+                        };
+                    } else if (promptTokens) {
+                        console.log(`[Child Worker] Usage fallback (chat): input=${promptTokens}`);
+                        sessionData.lastUsage = {
+                            input_tokens: promptTokens,
+                            output_tokens: sessionData.lastUsage?.output_tokens || 0,
                         };
                     }
                 }

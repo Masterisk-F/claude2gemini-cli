@@ -30,7 +30,7 @@ function sendSSE(res: Response, eventType: string, data: unknown): void {
 /**
  * message_start イベントを送信する
  */
-function sendMessageStart(res: Response, messageId: string, model: string): void {
+function sendMessageStart(res: Response, messageId: string, model: string, inputTokens: number = 0): void {
   sendSSE(res, 'message_start', {
     type: 'message_start',
     message: {
@@ -42,7 +42,7 @@ function sendMessageStart(res: Response, messageId: string, model: string): void
       stop_reason: null,
       stop_sequence: null,
       usage: {
-        input_tokens: 0,
+        input_tokens: inputTokens,
         output_tokens: 0,
       },
     },
@@ -121,7 +121,9 @@ export async function streamGeminiToClaudeSSE(
   const messageId = `msg_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
   let blockIndex = 0;
 
-  sendMessageStart(res, messageId, model);
+  let messageStartSent = false;
+  let estimatedInputTokens = 0;
+  // sendMessageStart は最初のコンテンツまたは model_info が来たタイミングで送信する
   sendSSE(res, 'ping', { type: 'ping' });
 
   let textBlockStarted = false;
@@ -156,6 +158,19 @@ export async function streamGeminiToClaudeSSE(
     for await (const msg of childStream) {
       if (msg.type === 'stream_event') {
         const chunk = msg.event;
+        if (chunk.type === 'model_info') {
+          try {
+            const info = JSON.parse(chunk.value);
+            estimatedInputTokens = info.estimated_input_tokens || 0;
+          } catch (e) {}
+          continue;
+        }
+
+        if (!messageStartSent) {
+          sendMessageStart(res, messageId, model, estimatedInputTokens);
+          messageStartSent = true;
+        }
+
         if (chunk.type === 'content' && chunk.value) {
           if (!textBlockStarted) {
             sendTextBlockStart(blockIndex);
@@ -165,6 +180,10 @@ export async function streamGeminiToClaudeSSE(
           sendTextDelta(res, blockIndex, chunk.value);
         }
       } else if (msg.type === 'tool_call') {
+        if (!messageStartSent) {
+          sendMessageStart(res, messageId, model, estimatedInputTokens);
+          messageStartSent = true;
+        }
         const callId = msg.callId;
         const name = msg.name;
 
@@ -205,6 +224,10 @@ export async function streamGeminiToClaudeSSE(
         blockIndex++;
         hasProducedAnyBlock = true;
       } else if (msg.type === 'server_tool_call') {
+        if (!messageStartSent) {
+          sendMessageStart(res, messageId, model, estimatedInputTokens);
+          messageStartSent = true;
+        }
         if (textBlockStarted) {
           sendContentBlockStop(res, blockIndex);
           blockIndex++;
@@ -237,6 +260,10 @@ export async function streamGeminiToClaudeSSE(
         blockIndex++;
         hasProducedAnyBlock = true;
       } else if (msg.type === 'server_tool_result') {
+        if (!messageStartSent) {
+          sendMessageStart(res, messageId, model, estimatedInputTokens);
+          messageStartSent = true;
+        }
         // 先行するテキストブロックがあれば終了させる
         if (textBlockStarted) {
           sendContentBlockStop(res, blockIndex);
@@ -264,6 +291,10 @@ export async function streamGeminiToClaudeSSE(
           pendingCitations = pendingCitations.concat(msg.result);
         }
       } else if (msg.type === 'turn_end') {
+        if (!messageStartSent) {
+          sendMessageStart(res, messageId, model, estimatedInputTokens);
+          messageStartSent = true;
+        }
         if (textBlockStarted) {
           sendContentBlockStop(res, blockIndex);
           blockIndex++;
@@ -277,6 +308,7 @@ export async function streamGeminiToClaudeSSE(
             stop_sequence: null,
           },
           usage: {
+            input_tokens: msg.usage?.input_tokens || 0,
             output_tokens: msg.usage?.output_tokens || 0,
             ...(webSearchRequests > 0 ? { server_tool_use: { web_search_requests: webSearchRequests } } : {}),
           },
@@ -284,6 +316,10 @@ export async function streamGeminiToClaudeSSE(
 
         break; // 完全終了
       } else if (msg.type === 'error' || msg.type === 'fatal_error') {
+        if (!messageStartSent) {
+          sendMessageStart(res, messageId, model, estimatedInputTokens);
+          messageStartSent = true;
+        }
         if (textBlockStarted) {
           sendContentBlockStop(res, blockIndex);
           textBlockStarted = false;
