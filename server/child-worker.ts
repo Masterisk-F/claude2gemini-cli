@@ -68,9 +68,12 @@ interface SessionData {
     pendingToolCalls: Map<string, PendingToolCall>;
     earlyToolResults: Map<string, unknown>;
     toolState?: ToolState;
+    agentSession?: any;
     lastUsage?: {
         input_tokens: number;
         output_tokens: number;
+        cache_read_input_tokens?: number;
+        cache_creation_input_tokens?: number;
     };
 }
 
@@ -369,6 +372,23 @@ async function handleParentMessage(msg: ParentMessage, sendEvent: (msg: ChildMes
 
                 stream = geminiSession.sendStream(prompt);
                 sessionData.stream = stream;
+                sessionData.agentSession = geminiSession;
+
+                // Send estimated input tokens early
+                try {
+                    const chat = (geminiSession as any).client?.getChat?.();
+                    const estimatedTokens = chat?.lastPromptTokenCount;
+                    if (estimatedTokens) {
+                        sendEvent({
+                            type: 'stream_event',
+                            sessionId,
+                            event: {
+                                type: 'model_info',
+                                value: JSON.stringify({ estimated_input_tokens: estimatedTokens })
+                            }
+                        });
+                    }
+                } catch (e) {}
             }
 
             // ストリーム消費ループ開始
@@ -477,6 +497,8 @@ async function consumeStream(
                     sessionData.lastUsage = {
                         input_tokens: usage.promptTokenCount || 0,
                         output_tokens: usage.candidatesTokenCount || 0,
+                        cache_read_input_tokens: usage.cachedContentTokenCount || 0,
+                        cache_creation_input_tokens: 0,
                     };
                 }
                 // finished時点で全tool_call_requestは処理済み。
@@ -544,6 +566,42 @@ async function consumeStream(
         if (!hasProducedAnyBlock && !isToolTurnReached) {
             sendEvent({ type: 'error', sessionId, message: 'Gemini API returned an empty response', status: 500 });
             return;
+        }
+
+        // --- Usage fallback to ChatRecordingService and GeminiChat ---
+        try {
+            const client = sessionData.agentSession?.client;
+            if (client) {
+                const chat = (client as any).getChat?.();
+                const recordingService = (client as any).getChatRecordingService?.();
+
+                // Try to get from chat first (it's updated in processStreamResponse in real-time)
+                const promptTokens = chat?.lastPromptTokenCount;
+
+                const conversation = recordingService?.getConversation?.();
+                if (conversation && Array.isArray(conversation.messages)) {
+                    const lastGeminiMsg = conversation.messages.filter((m: any) => m.type === 'gemini').at(-1);
+                    if (lastGeminiMsg && lastGeminiMsg.tokens) {
+                        console.log(`[Child Worker] Usage fallback (msg): input=${lastGeminiMsg.tokens.input}, output=${lastGeminiMsg.tokens.output}, cached=${lastGeminiMsg.tokens.cached}`);
+                        sessionData.lastUsage = {
+                            input_tokens: lastGeminiMsg.tokens.input || promptTokens || 0,
+                            output_tokens: lastGeminiMsg.tokens.output || 0,
+                            cache_read_input_tokens: lastGeminiMsg.tokens.cached || 0,
+                            cache_creation_input_tokens: 0,
+                        };
+                    } else if (promptTokens) {
+                        console.log(`[Child Worker] Usage fallback (chat): input=${promptTokens}`);
+                        sessionData.lastUsage = {
+                            input_tokens: promptTokens,
+                            output_tokens: sessionData.lastUsage?.output_tokens || 0,
+                            cache_read_input_tokens: sessionData.lastUsage?.cache_read_input_tokens || 0,
+                            cache_creation_input_tokens: 0,
+                        };
+                    }
+                }
+            }
+        } catch (e) {
+            console.warn(`[Child Worker] Failed to extract tokens from recording service:`, e);
         }
 
         sendEvent({
