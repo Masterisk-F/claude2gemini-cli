@@ -196,12 +196,18 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
     const lastMessage = body.messages[body.messages.length - 1];
     if (lastMessage.role === 'user' && Array.isArray(lastMessage.content)) {
       const toolResults = lastMessage.content.filter((b: any) => b.type === 'tool_result') as any[];
+      const textBlocks = lastMessage.content.filter((b: any) => b.type === 'text') as any[];
+      let extraText = '';
+      if (textBlocks.length > 0) {
+        extraText = textBlocks.map((b: any) => b.text).join('\n');
+      }
 
       if (toolResults.length > 0) {
         console.log(`[ToolResult] ${toolResults.length} tool_result(s) received`);
         const sessionsToResume = new Map<string, string>(); // sessionId -> accountId
 
-        for (const tr of toolResults) {
+        for (let i = 0; i < toolResults.length; i++) {
+          const tr = toolResults[i];
           const resolvedSessionId = sessionStore.resolveToolCall(tr.tool_use_id);
 
           if (resolvedSessionId) {
@@ -210,9 +216,14 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
             if (sessionData && sessionData.accountId) {
               accountId = sessionData.accountId;
             }
+            let resultStr = normalizeToolResultContent(tr.content);
+            // Append extra text to the last tool result
+            if (i === toolResults.length - 1 && extraText) {
+              resultStr += `\n\nUser additional input:\n${extraText}`;
+            }
             pendingToolResults.push({
               toolCallId: tr.tool_use_id,
-              result: normalizeToolResultContent(tr.content),
+              result: resultStr,
             });
             isResuming = true;
           } else {
