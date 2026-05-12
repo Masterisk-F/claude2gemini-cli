@@ -216,14 +216,17 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
             if (sessionData && sessionData.accountId) {
               accountId = sessionData.accountId;
             }
-            let resultStr = normalizeToolResultContent(tr.content);
-            // Append extra text to the last tool result
+            let resultData: any = normalizeToolResultContent(tr.content);
+            // Append extra text to the last tool result as a JSON object field
             if (i === toolResults.length - 1 && extraText) {
-              resultStr += `\n\nUser additional input:\n${extraText}`;
+              resultData = JSON.stringify({
+                result: resultData,
+                user_additional_input: extraText
+              });
             }
             pendingToolResults.push({
               toolCallId: tr.tool_use_id,
-              result: resultStr,
+              result: resultData,
             });
             isResuming = true;
           } else {
