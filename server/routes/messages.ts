@@ -203,34 +203,46 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
       }
 
       if (toolResults.length > 0) {
-        console.log(`[ToolResult] ${toolResults.length} tool_result(s) received`);
-        const sessionsToResume = new Map<string, string>(); // sessionId -> accountId
-
-        for (let i = 0; i < toolResults.length; i++) {
-          const tr = toolResults[i];
-          const resolvedSessionId = sessionStore.resolveToolCall(tr.tool_use_id);
-
-          if (resolvedSessionId) {
-            sessionId = resolvedSessionId;
-            const sessionData = sessionStore.getSession(sessionId);
-            if (sessionData && sessionData.accountId) {
-              accountId = sessionData.accountId;
+        if (extraText) {
+          // Mixed tool_result and text -> Cancel existing session and fallback to stateless
+          console.log(`[ToolResult] Mixed tool_result and text received - cancelling session and falling back to stateless`);
+          for (const tr of toolResults) {
+            const resolvedSessionId = sessionStore.resolveToolCall(tr.tool_use_id);
+            if (resolvedSessionId) {
+              const sessionData = sessionStore.getSession(resolvedSessionId);
+              if (sessionData && sessionData.accountId) {
+                // Send cancel message (don't await to avoid blocking)
+                childManager.sendRequest(sessionData.accountId, {
+                  type: 'cancel_session',
+                  sessionId: resolvedSessionId
+                }).catch(err => console.error(`Failed to send cancel_session`, err));
+              }
+              sessionStore.deleteSession(resolvedSessionId);
             }
-            let resultData: any = normalizeToolResultContent(tr.content);
-            // Append extra text to the last tool result as a JSON object field
-            if (i === toolResults.length - 1 && extraText) {
-              resultData = JSON.stringify({
-                result: resultData,
-                user_additional_input: extraText
+          }
+          // Remains isResuming = false, sessionId = undefined, accountId = undefined
+        } else {
+          // Regular tool_result only -> Resume stream
+          console.log(`[ToolResult] ${toolResults.length} tool_result(s) received`);
+
+          for (let i = 0; i < toolResults.length; i++) {
+            const tr = toolResults[i];
+            const resolvedSessionId = sessionStore.resolveToolCall(tr.tool_use_id);
+
+            if (resolvedSessionId) {
+              sessionId = resolvedSessionId;
+              const sessionData = sessionStore.getSession(sessionId);
+              if (sessionData && sessionData.accountId) {
+                accountId = sessionData.accountId;
+              }
+              pendingToolResults.push({
+                toolCallId: tr.tool_use_id,
+                result: normalizeToolResultContent(tr.content),
               });
+              isResuming = true;
+            } else {
+              console.warn(`[ToolResult] FAILED to resolve ${tr.tool_use_id} - falling back to stateless`);
             }
-            pendingToolResults.push({
-              toolCallId: tr.tool_use_id,
-              result: resultData,
-            });
-            isResuming = true;
-          } else {
-            console.warn(`[ToolResult] FAILED to resolve ${tr.tool_use_id} - falling back to stateless`);
           }
         }
       }

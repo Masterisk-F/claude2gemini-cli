@@ -5,7 +5,7 @@ import { sessionStore } from '../server/session-store.js';
 
 vi.mock('../server/child-manager.js', () => ({
   childManager: {
-    sendRequest: vi.fn(),
+    sendRequest: vi.fn(() => Promise.resolve()),
     onMessage: vi.fn(() => () => {}),
     onChildExit: vi.fn(() => () => {}),
   }
@@ -65,6 +65,7 @@ vi.mock('../server/session-store.js', () => ({
     getSession: vi.fn(),
     getOrCreateSession: vi.fn(() => ({ accountId: 'test-account-1' })),
     addPendingToolCall: vi.fn(),
+    deleteSession: vi.fn(),
   }
 }));
 
@@ -77,7 +78,7 @@ describe('POST /', () => {
     vi.clearAllMocks();
   });
 
-  it('appends text blocks as a separate property in the tool_result object', async () => {
+  it('cancels pending session and falls back to stateless when text and tool_result are mixed', async () => {
     // Mock resolveToolCall to return a mock session ID
     (sessionStore.resolveToolCall as any).mockReturnValue('mock-session-id');
     (sessionStore.getSession as any).mockReturnValue({ accountId: 'test-account-1' });
@@ -114,25 +115,45 @@ describe('POST /', () => {
       .expect(200);
 
     // Provide content so buildClaudeResponse doesn't throw
+    // We need to wait for the request to be sent to get the new sessionId
     setTimeout(() => {
       if (onMessageCallback) {
-        onMessageCallback({ type: 'stream_event', sessionId: 'mock-session-id', event: { type: 'content', value: 'Hello' } });
-        onMessageCallback({ type: 'turn_end', sessionId: 'mock-session-id' });
+        // Find the new sessionId from the last sendRequest call
+        const calls = (childManager.sendRequest as any).mock.calls;
+        const lastCall = calls[calls.length - 1];
+        if (lastCall && lastCall[1].type === 'request') {
+          const newSessionId = lastCall[1].sessionId;
+          onMessageCallback({ type: 'stream_event', sessionId: newSessionId, event: { type: 'content', value: 'Hello' } });
+          onMessageCallback({ type: 'turn_end', sessionId: newSessionId });
+        }
       }
     }, 50);
 
     await promise;
 
+    // 1. Verify session was deleted from store
+    expect(sessionStore.deleteSession).toHaveBeenCalledWith('mock-session-id');
+
+    // 2. Verify cancel_session was sent to child worker
     expect(childManager.sendRequest).toHaveBeenCalledWith(
       'test-account-1',
       expect.objectContaining({
-        type: 'tool_result',
-        toolCallId: 'tool_123',
-        result: JSON.stringify({
-          result: 'Original tool result',
-          user_additional_input: 'User additional instruction'
-        })
+        type: 'cancel_session',
+        sessionId: 'mock-session-id'
       })
     );
+
+    // 3. Verify a new request was sent (stateless mode)
+    expect(childManager.sendRequest).toHaveBeenCalledWith(
+      'test-account-1',
+      expect.objectContaining({
+        type: 'request',
+        messages: payload.messages
+      })
+    );
+
+    // Verify it used a DIFFERENT session ID than the cancelled one
+    const requestCall = (childManager.sendRequest as any).mock.calls.find((c: any) => c[1].type === 'request');
+    expect(requestCall[1].sessionId).not.toBe('mock-session-id');
   });
 });
