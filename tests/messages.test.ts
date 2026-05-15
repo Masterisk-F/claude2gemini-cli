@@ -5,7 +5,7 @@ import { sessionStore } from '../server/session-store.js';
 
 vi.mock('../server/child-manager.js', () => ({
   childManager: {
-    sendRequest: vi.fn(() => Promise.resolve()),
+    sendRequest: vi.fn(() => Promise.resolve({ type: 'success' })),
     onMessage: vi.fn(() => () => {}),
     onChildExit: vi.fn(() => () => {}),
   }
@@ -83,12 +83,6 @@ describe('POST /', () => {
     (sessionStore.resolveToolCall as any).mockReturnValue('mock-session-id');
     (sessionStore.getSession as any).mockReturnValue({ accountId: 'test-account-1' });
 
-    let onMessageCallback: any = null;
-    (childManager.onMessage as any).mockImplementation((accId: string, cb: any) => {
-      onMessageCallback = cb;
-      return () => {}; // cleanup fn
-    });
-
     const payload = {
       model: 'claude-3-opus-20240229',
       messages: [
@@ -116,20 +110,21 @@ describe('POST /', () => {
 
     // Provide content so buildClaudeResponse doesn't throw
     // We need to wait for the request to be sent to get the new sessionId
-    setTimeout(() => {
-      if (onMessageCallback) {
-        // Find the new sessionId from the last sendRequest call
-        const calls = (childManager.sendRequest as any).mock.calls;
-        const lastCall = calls[calls.length - 1];
-        if (lastCall && lastCall[1].type === 'request') {
-          const newSessionId = lastCall[1].sessionId;
-          onMessageCallback({ type: 'stream_event', sessionId: newSessionId, event: { type: 'content', value: 'Hello' } });
-          onMessageCallback({ type: 'turn_end', sessionId: newSessionId });
-        }
-      }
-    }, 50);
+    const waitPromise = vi.waitFor(() => {
+      const onMessageCalls = (childManager.onMessage as any).mock.calls;
+      if (onMessageCalls.length === 0) throw new Error('onMessage not called');
+      const callback = onMessageCalls[0][1];
 
-    await promise;
+      const sendRequestCalls = (childManager.sendRequest as any).mock.calls;
+      const requestCall = sendRequestCalls.find((c: any) => c[1].type === 'request');
+      if (!requestCall) throw new Error('request call not found');
+
+      const newSessionId = requestCall[1].sessionId;
+      callback({ type: 'stream_event', sessionId: newSessionId, event: { type: 'content', value: 'Hello' } });
+      callback({ type: 'turn_end', sessionId: newSessionId });
+    });
+
+    await Promise.all([promise, waitPromise]);
 
     // 1. Verify session was deleted from store
     expect(sessionStore.deleteSession).toHaveBeenCalledWith('mock-session-id');
