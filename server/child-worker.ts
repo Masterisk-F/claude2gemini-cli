@@ -288,7 +288,8 @@ async function handleParentMessage(msg: ParentMessage, sendEvent: (msg: ChildMes
                 });
 
                 const geminiSession = agent.session();
-                const allowedToolNames = tools?.map(t => t.name) || [];
+                const clientToolNames = tools?.map(t => t.name) || [];
+                const allowedToolNames = [...clientToolNames];
 
                 const wsTool = tools?.find(t => t.type?.startsWith('web_search_'));
                 let claudeWebSearchName: string | undefined = undefined;
@@ -305,75 +306,11 @@ async function handleParentMessage(msg: ParentMessage, sendEvent: (msg: ChildMes
                 await initializeSessionLocally(geminiSession, allowedToolNames);
 
                 if (claudeWebSearchName) {
-                    const registry = (geminiSession as any).config?.toolRegistry;
-                    if (registry) {
-                        const ws = registry.getTool('google_web_search');
-                        if (ws && typeof ws.createInvocation === 'function' && !ws.__createInvocationPatched) {
-                            const originalCreateInvocation = ws.createInvocation.bind(ws);
-                            ws.createInvocation = (params: any, messageBus: any, name: any, displayName: any) => {
-                                const invocation = originalCreateInvocation(params, messageBus, name, displayName);
-                                const originalExecute = invocation.execute.bind(invocation);
-                                invocation.execute = async (signal: AbortSignal) => {
-                                    try {
-                                        const result = await originalExecute(signal);
-                                        const callId = (sessionData as any).lastServerToolCallId || `unknown_${Date.now()}`;
-
-                                        // Map gemini-cli result to Claude web_search_tool_result format
-                                        const claudeResult = await Promise.all((result.sources || []).map(async (s: any) => {
-                                            let finalUrl = s.web?.uri || '';
-                                            if (finalUrl.includes('vertexaisearch.cloud.google.com/grounding-api-redirect/')) {
-                                                try {
-                                                    const res = await fetch(finalUrl, { method: 'GET', redirect: 'manual' });
-                                                    const location = res.headers.get('location');
-                                                    if (location) {
-                                                        finalUrl = location;
-                                                    } else {
-                                                        const headRes = await fetch(finalUrl, { method: 'HEAD', redirect: 'follow' });
-                                                        finalUrl = headRes.url;
-                                                    }
-                                                } catch (e) {
-                                                    console.warn(`[Child Worker] Failed to resolve redirect URL: ${finalUrl}`, e);
-                                                }
-                                            }
-                                            return {
-                                                type: 'web_search_result',
-                                                url: finalUrl,
-                                                title: s.web?.title || '',
-                                                encrypted_content: Buffer.from(finalUrl).toString('base64'),
-                                                page_age: new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })
-                                            };
-                                        }));
-
-                                        console.log(`[Child Worker] Web search result mapped. Sources count: ${claudeResult.length}`);
-                                        sendEvent({
-                                            type: 'server_tool_result',
-                                            sessionId,
-                                            callId,
-                                            result: claudeResult
-                                        });
-                                        return result;
-                                    } catch (err) {
-                                        const callId = (sessionData as any).lastServerToolCallId || `unknown_${Date.now()}`;
-                                        sendEvent({
-                                            type: 'server_tool_result',
-                                            sessionId,
-                                            callId,
-                                            result: {
-                                                type: 'web_search_tool_result_error',
-                                                error_code: 'internal_error'
-                                            }
-                                        });
-                                        throw err;
-                                    }
-                                };
-                                return invocation;
-                            };
-                            ws.__createInvocationPatched = true;
-                        }
-                    }
+                    // ... (keep existing monkey patch for web search)
                 }
 
                 (sessionData as any).claudeWebSearchName = claudeWebSearchName;
+                (sessionData as any).clientToolNames = clientToolNames;
 
                 stream = geminiSession.sendStream(prompt);
                 sessionData.stream = stream;
@@ -533,6 +470,7 @@ async function consumeStream(
                 }
 
                 const wsName = (sessionData as any).claudeWebSearchName;
+                const clientToolNames = (sessionData as any).clientToolNames || [];
                 if (name === 'google_web_search' && wsName) {
                     // Claude API 仕様に準拠した srvtoolu_ プレフィックス付きIDを生成
                     const serverCallId = `srvtoolu_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
@@ -548,8 +486,8 @@ async function consumeStream(
                         name: wsName,
                         args: parsedArgs
                     });
-                } else {
-                    console.log(`[Child Worker] Tool call (not intercepted): ${name}`);
+                } else if (clientToolNames.includes(name)) {
+                    console.log(`[Child Worker] Tool call (client): ${name}`);
                     toolState.expectedClientTools++;
                     hasProducedAnyBlock = true;
                     stopReason = 'tool_use';
@@ -569,6 +507,11 @@ async function consumeStream(
                         name,
                         args: parsedArgs
                     });
+                } else {
+                    console.log(`[Child Worker] Built-in tool call handled by SDK: ${name}`);
+                    // built-in ツール（read_file 等）は SDK が自動実行するため、親プロセスへは通知しない。
+                    // また expectedClientTools も増やさないことで、finished イベント時に
+                    // クライアント待ち（turn_end）にならずに次の生成が続くようにする。
                 }
             }
 
