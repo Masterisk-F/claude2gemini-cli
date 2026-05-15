@@ -31,7 +31,25 @@ export interface ClaudeWebSearchToolResultBlock {
   content: any;
 }
 
-export type ClaudeContentBlock = ClaudeTextBlock | ClaudeToolUseBlock | ClaudeToolResultBlock | ClaudeWebSearchToolResultBlock;
+export interface ClaudeImageBlock {
+  type: 'image';
+  source: {
+    type: 'base64';
+    media_type: string;
+    data: string;
+  };
+}
+
+export interface ClaudeDocumentBlock {
+  type: 'document';
+  source: {
+    type: 'base64';
+    media_type: string;
+    data: string;
+  };
+}
+
+export type ClaudeContentBlock = ClaudeTextBlock | ClaudeToolUseBlock | ClaudeToolResultBlock | ClaudeWebSearchToolResultBlock | ClaudeImageBlock | ClaudeDocumentBlock;
 
 export interface ClaudeMessage {
   role: 'user' | 'assistant';
