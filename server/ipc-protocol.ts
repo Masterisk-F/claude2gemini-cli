@@ -29,6 +29,10 @@ export type ParentMessage =
     | {
         type: 'resume_stream';
         sessionId: string;
+    }
+    | {
+        type: 'cancel_session';
+        sessionId: string;
     };
 
 /**

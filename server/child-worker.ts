@@ -426,6 +426,14 @@ async function handleParentMessage(msg: ParentMessage, sendEvent: (msg: ChildMes
 
         // ストリーム消費ループを再開
         consumeStream(sessionData.stream, sessionData.toolState, sessionId, sessionData, sendEvent);
+    } else if (msg.type === 'cancel_session') {
+        const { sessionId } = msg;
+        const sessionData = sessionStore.get(sessionId);
+        if (sessionData) {
+            sessionData.toolState?.resolveToolTurn?.();
+            sessionStore.delete(sessionId);
+            console.log(`[Child Worker ${accountId}] Session cancelled: ${sessionId}`);
+        }
     }
 }
 
@@ -458,7 +466,7 @@ async function consumeStream(
 
     try {
         while (true) {
-            if (isToolTurnReached) {
+            if (isToolTurnReached || !sessionStore.has(sessionId)) {
                 sessionData.pendingNext = nextPromise;
                 break;
             }
