@@ -14,6 +14,7 @@ Claude2Gemini-CLI is a proxy server that makes [Google Gemini CLI SDK](https://g
 ## Features
 
 - **Full Claude Messages API compatibility** — `POST /v1/messages` with both streaming (SSE) and non-streaming responses
+- **Multimodal support** — Images and documents (PDF, etc.) are supported by automatically saving base64 data to temporary files and instructing Gemini to read them natively via its built-in `read_file` tool
 - **Tool use support** — Claude `tool_use` / `tool_result` round-trips are transparently bridged to Gemini's agent tool execution loop, including MCP (Model Context Protocol) tools
 - **Multi-turn conversations** — Conversation history is preserved across turns
 - **System prompts** — Claude `system` parameter maps to Gemini `instructions`
