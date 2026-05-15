@@ -232,7 +232,7 @@ async function handleParentMessage(msg: ParentMessage, sendEvent: (msg: ChildMes
         let prompt = '';
         // 如果有历史记录且 sessionData.stream は存在しない場合は結合
         if (!sessionData.stream) {
-            prompt = convertMessagesToPrompt(messages);
+            prompt = convertMessagesToPrompt(messages, proxyHome, sessionId);
         }
         const systemPrompt = extractSystemPrompt(system);
 
@@ -295,6 +295,11 @@ async function handleParentMessage(msg: ParentMessage, sendEvent: (msg: ChildMes
                 if (wsTool) {
                     claudeWebSearchName = wsTool.name || 'web_search';
                     allowedToolNames.push('google_web_search');
+                }
+
+                // マルチモーダル対応のための read_file ツール許可
+                if (!allowedToolNames.includes('read_file')) {
+                    allowedToolNames.push('read_file');
                 }
 
                 await initializeSessionLocally(geminiSession, allowedToolNames);
