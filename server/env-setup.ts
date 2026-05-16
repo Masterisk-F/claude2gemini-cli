@@ -17,6 +17,16 @@ export function buildProxyHome(proxyHomeId: string, credentials?: any): string {
   const proxyHome = path.join(os.tmpdir(), `claude2gemini-env-${username}-${proxyHomeId}`);
   const proxyGemini = path.join(proxyHome, '.gemini');
 
+  // Clean up orphaned temp files from previous crashed sessions
+  const tmpDir = path.join(proxyHome, 'tmp');
+  if (fs.existsSync(tmpDir)) {
+    try {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    } catch (error) {
+      console.warn('[Proxy Env] Failed to clean up orphaned temp files:', error instanceof Error ? error.message : String(error));
+    }
+  }
+
   if (!fs.existsSync(proxyGemini)) {
     fs.mkdirSync(proxyGemini, { recursive: true });
   }
