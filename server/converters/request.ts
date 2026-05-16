@@ -21,7 +21,7 @@ export function mapModelName(model: string): string {
     return 'gemini-3-flash-preview';
   }
   if (lower.includes('haiku')) {
-    return 'gemini-2.5-flash-lite';
+    return 'gemini-3.1-flash-lite-preview';
   }
   if (!lower.includes('gemini')) {
     return 'gemini-3-flash-preview';
