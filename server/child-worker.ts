@@ -96,7 +96,7 @@ async function cleanupTempFiles(files?: string[]) {
             await fs.promises.unlink(file);
             console.log(`[Child Worker] Cleaned up temp file: ${file}`);
         } catch (e) {
-            // ignore
+            console.warn(`[Child Worker] Failed to clean up temp file: ${file}`, e);
         }
     }
 }
@@ -318,10 +318,6 @@ async function handleParentMessage(msg: ParentMessage, sendEvent: (msg: ChildMes
                 }
 
                 await initializeSessionLocally(geminiSession, allowedToolNames);
-
-                if (claudeWebSearchName) {
-                    // ... (keep existing monkey patch for web search)
-                }
 
                 (sessionData as any).claudeWebSearchName = claudeWebSearchName;
                 (sessionData as any).clientToolNames = clientToolNames;

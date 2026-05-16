@@ -78,6 +78,7 @@ async function formatContentForPrompt(content: string | ClaudeContentBlock[], pr
         parts.push(`[Attached File: The user attached a file. Please read it using the read_file tool from the absolute path: ${filePath}]`);
       } catch (err) {
         console.error('[Converter] Error processing image/document block:', err);
+        parts.push('[Error: Failed to process attached file]');
       }
     }
   }
