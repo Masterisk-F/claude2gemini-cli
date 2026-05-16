@@ -75,6 +75,7 @@ interface SessionData {
         cache_read_input_tokens?: number;
         cache_creation_input_tokens?: number;
     };
+    sessionTempFiles?: string[];
 }
 
 const sessionStore = new Map<string, SessionData>();
@@ -82,10 +83,22 @@ const sessionStore = new Map<string, SessionData>();
 function getOrCreateSession(sessionId: string): SessionData {
     let session = sessionStore.get(sessionId);
     if (!session) {
-        session = { pendingToolCalls: new Map(), earlyToolResults: new Map() };
+        session = { pendingToolCalls: new Map(), earlyToolResults: new Map(), sessionTempFiles: [] };
         sessionStore.set(sessionId, session);
     }
     return session;
+}
+
+async function cleanupTempFiles(files?: string[]) {
+    if (!files || files.length === 0) return;
+    for (const file of files) {
+        try {
+            await fs.promises.unlink(file);
+            console.log(`[Child Worker] Cleaned up temp file: ${file}`);
+        } catch (e) {
+            // ignore
+        }
+    }
 }
 
 // --- SDK操作ヘルパー ---
@@ -232,7 +245,8 @@ async function handleParentMessage(msg: ParentMessage, sendEvent: (msg: ChildMes
         let prompt = '';
         // 如果有历史记录且 sessionData.stream は存在しない場合は結合
         if (!sessionData.stream) {
-            prompt = convertMessagesToPrompt(messages, proxyHome, sessionId);
+            sessionData.sessionTempFiles = sessionData.sessionTempFiles || [];
+            prompt = await convertMessagesToPrompt(messages, proxyHome, sessionId, sessionData.sessionTempFiles);
         }
         const systemPrompt = extractSystemPrompt(system);
 
@@ -365,7 +379,6 @@ async function handleParentMessage(msg: ParentMessage, sendEvent: (msg: ChildMes
             return;
         }
 
-
         // ストリーム消費ループを再開
         consumeStream(sessionData.stream, sessionData.toolState, sessionId, sessionData, sendEvent);
     } else if (msg.type === 'cancel_session') {
@@ -422,6 +435,7 @@ async function consumeStream(
 
             const iter = result as IteratorResult<any>;
             if (iter.done) {
+                cleanupTempFiles(sessionData.sessionTempFiles);
                 sessionStore.delete(sessionId);
                 break; // 完全終了
             }
@@ -569,6 +583,7 @@ async function consumeStream(
 
     } catch (error) {
         console.error(`[Child Worker ${accountId}] Stream loop error:`, error);
+        cleanupTempFiles(sessionData.sessionTempFiles);
         sessionStore.delete(sessionId);
         sendEvent({
             type: 'error',
