@@ -7,6 +7,7 @@
 
 import type { ClaudeMessage, ClaudeContentBlock } from '../types.js';
 import fs from 'node:fs';
+import { promises as fsPromises } from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 
@@ -36,7 +37,7 @@ export function mapModelName(model: string): string {
  * ClaudeMessage の content を構造化テキストに変換する。
  * tool_use と tool_result ブロックも含めることで、会話履歴の文脈を保持する。
  */
-function formatContentForPrompt(content: string | ClaudeContentBlock[], proxyHome: string, sessionId: string): string {
+async function formatContentForPrompt(content: string | ClaudeContentBlock[], proxyHome: string, sessionId: string, tempFiles: string[]): Promise<string> {
   if (typeof content === 'string') {
     return content;
   }
@@ -52,28 +53,27 @@ function formatContentForPrompt(content: string | ClaudeContentBlock[], proxyHom
         : Array.isArray((block as any).content)
           ? (block as any).content.map((b: any) => b.type === 'text' ? b.text : JSON.stringify(b)).join('\n')
           : '';
-      parts.push(`[Tool Result ((block as any).tool_use_id): ${resultText}]`);
+      parts.push(`[Tool Result ${(block as any).tool_use_id}: ${resultText}]`);
     } else if (block.type === 'image' || block.type === 'document') {
       try {
         const tempDir = path.join(proxyHome, 'tmp');
-        if (!fs.existsSync(tempDir)) {
-          fs.mkdirSync(tempDir, { recursive: true });
-        }
+        await fsPromises.mkdir(tempDir, { recursive: true });
 
         const mediaType = (block as any).source.media_type || '';
         let ext = '';
-        if (mediaType.includes('jpeg') || mediaType.includes('jpg')) ext = '.jpg';
-        else if (mediaType.includes('png')) ext = '.png';
-        else if (mediaType.includes('webp')) ext = '.webp';
-        else if (mediaType.includes('gif')) ext = '.gif';
-        else if (mediaType.includes('pdf')) ext = '.pdf';
+        if (mediaType === 'image/jpeg') ext = '.jpg';
+        else if (mediaType === 'image/png') ext = '.png';
+        else if (mediaType === 'image/webp') ext = '.webp';
+        else if (mediaType === 'image/gif') ext = '.gif';
+        else if (mediaType === 'application/pdf') ext = '.pdf';
         else ext = '.bin'; // default fallback
 
         const fileName = `${sessionId}-${randomUUID()}${ext}`;
         const filePath = path.join(tempDir, fileName);
 
         const base64Data = (block as any).source.data;
-        fs.writeFileSync(filePath, Buffer.from(base64Data, 'base64'));
+        await fsPromises.writeFile(filePath, Buffer.from(base64Data, 'base64'));
+        tempFiles.push(filePath);
 
         parts.push(`[Attached File: The user attached a file. Please read it using the read_file tool from the absolute path: ${filePath}]`);
       } catch (err) {
@@ -89,21 +89,21 @@ function formatContentForPrompt(content: string | ClaudeContentBlock[], proxyHom
  * 単一の user メッセージの場合はテキストをそのまま返す。
  * 複数メッセージ（マルチターン）の場合はロール付きの会話テキストにまとめる。
  */
-export function convertMessagesToPrompt(messages: ClaudeMessage[], proxyHome: string, sessionId: string): string {
+export async function convertMessagesToPrompt(messages: ClaudeMessage[], proxyHome: string, sessionId: string, tempFiles: string[]): Promise<string> {
   if (messages.length === 0) {
     throw new Error('messages に user ロールのメッセージが含まれていません');
   }
 
   // 単一メッセージの場合はシンプルにテキストのみ返す
   if (messages.length === 1 && messages[0].role === 'user') {
-    return formatContentForPrompt(messages[0].content, proxyHome, sessionId);
+    return await formatContentForPrompt(messages[0].content, proxyHome, sessionId, tempFiles);
   }
 
   // マルチターン: ロール付きの会話テキストに変換
   const parts: string[] = [];
   for (const msg of messages) {
     const roleLabel = msg.role === 'user' ? 'User' : 'Assistant';
-    const text = formatContentForPrompt(msg.content, proxyHome, sessionId);
+    const text = await formatContentForPrompt(msg.content, proxyHome, sessionId, tempFiles);
     if (text) {
       parts.push(`${roleLabel}: ${text}`);
     }
