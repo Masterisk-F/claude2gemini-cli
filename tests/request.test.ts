@@ -12,8 +12,7 @@ describe('convertMessagesToPrompt', () => {
         ]
       }
     ];
-    // Cast to any to bypass current type signature before we fix the implementation
-    const { prompt, inlineDataParts } = await (convertMessagesToPrompt(messages, '', '', []) as Promise<any>);
+    const { prompt, inlineDataParts } = await convertMessagesToPrompt(messages);
 
     expect(prompt).toContain('[Tool Result tool-123: result text]');
     expect(inlineDataParts).toEqual([]);
@@ -35,7 +34,7 @@ describe('convertMessagesToPrompt', () => {
         ]
       }
     ];
-    const { prompt, inlineDataParts } = await (convertMessagesToPrompt(messages, '', '', []) as Promise<any>);
+    const { prompt, inlineDataParts } = await convertMessagesToPrompt(messages);
 
     expect(inlineDataParts).toHaveLength(1);
     expect(inlineDataParts[0]).toEqual({
@@ -64,7 +63,7 @@ describe('convertMessagesToPrompt', () => {
         ]
       }
     ];
-    const { prompt, inlineDataParts } = await (convertMessagesToPrompt(messages, '', '', []) as Promise<any>);
+    const { prompt, inlineDataParts } = await convertMessagesToPrompt(messages);
 
     expect(inlineDataParts).toHaveLength(1);
     expect(inlineDataParts[0]).toEqual({

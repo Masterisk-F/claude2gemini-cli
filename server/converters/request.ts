@@ -55,23 +55,41 @@ async function formatContentForPrompt(content: string | ClaudeContentBlock[], in
       parts.push(block.text);
     } else if (block.type === 'tool_use' || block.type === 'server_tool_use') {
       parts.push(`[Tool Call: ${block.name}(${JSON.stringify(block.input)})]`);
-    } else if (block.type === 'tool_result' || block.type === 'web_search_tool_result') {
-      const resultText = typeof (block as any).content === 'string'
-        ? (block as any).content
-        : Array.isArray((block as any).content)
-          ? (block as any).content.map((b: any) => b.type === 'text' ? b.text : JSON.stringify(b)).join('\n')
+    } else if (block.type === 'tool_result') {
+      const resultText = typeof block.content === 'string'
+        ? block.content
+        : block.content.map((b: ClaudeContentBlock) => b.type === 'text' ? b.text : JSON.stringify(b)).join('\n');
+      parts.push(`[Tool Result ${block.tool_use_id}: ${resultText}]`);
+    } else if (block.type === 'web_search_tool_result') {
+      const wb = block;
+      const resultText = typeof wb.content === 'string'
+        ? wb.content
+        : Array.isArray(wb.content)
+          ? wb.content.map((b: any) => b.type === 'text' ? b.text : JSON.stringify(b)).join('\n')
           : '';
-      parts.push(`[Tool Result ${(block as any).tool_use_id}: ${resultText}]`);
-    } else if (block.type === 'image' || block.type === 'document') {
+      parts.push(`[Tool Result ${wb.tool_use_id}: ${resultText}]`);
+    } else if (block.type === 'image') {
       try {
-        const mediaType = (block as any).source?.media_type || '';
-        const base64Data = (block as any).source?.data;
+        const mediaType = block.source.media_type;
+        const base64Data = block.source.data;
         if (mediaType && base64Data) {
           inlineDataParts.push({ inlineData: { mimeType: mediaType, data: base64Data } });
           parts.push(`[Attached: ${mediaType}]`);
         }
       } catch (err) {
-        console.error(`[Converter] Error processing image/document block:`, err);
+        console.error(`[Converter] Error processing image block:`, err);
+        parts.push('[Error: Failed to process attached file]');
+      }
+    } else if (block.type === 'document') {
+      try {
+        const mediaType = block.source.media_type;
+        const base64Data = block.source.data;
+        if (mediaType && base64Data) {
+          inlineDataParts.push({ inlineData: { mimeType: mediaType, data: base64Data } });
+          parts.push(`[Attached: ${mediaType}]`);
+        }
+      } catch (err) {
+        console.error(`[Converter] Error processing document block:`, err);
         parts.push('[Error: Failed to process attached file]');
       }
     }
