@@ -76,6 +76,9 @@ interface SessionData {
         cache_creation_input_tokens?: number;
     };
     sessionTempFiles?: string[];
+    claudeWebSearchName?: string;
+    clientToolNames?: string[];
+    lastServerToolCallId?: string;
 }
 
 const sessionStore = new Map<string, SessionData>();
@@ -319,8 +322,76 @@ async function handleParentMessage(msg: ParentMessage, sendEvent: (msg: ChildMes
 
                 await initializeSessionLocally(geminiSession, allowedToolNames);
 
-                (sessionData as any).claudeWebSearchName = claudeWebSearchName;
-                (sessionData as any).clientToolNames = clientToolNames;
+                if (claudeWebSearchName) {
+                    const registry = (geminiSession as any).config?.toolRegistry;
+                    if (registry) {
+                        const ws = registry.getTool('google_web_search');
+                        if (ws && typeof ws.createInvocation === 'function' && !ws.__createInvocationPatched) {
+                            const originalCreateInvocation = ws.createInvocation.bind(ws);
+                            ws.createInvocation = (params: any, messageBus: any, name: any, displayName: any) => {
+                                const invocation = originalCreateInvocation(params, messageBus, name, displayName);
+                                const originalExecute = invocation.execute.bind(invocation);
+                                invocation.execute = async (signal: AbortSignal) => {
+                                    try {
+                                        const result = await originalExecute(signal);
+                                        const callId = sessionData.lastServerToolCallId || `unknown_${Date.now()}`;
+
+                                        const claudeResult = await Promise.all((result.sources || []).map(async (s: any) => {
+                                            let finalUrl = s.web?.uri || '';
+                                            if (finalUrl.includes('vertexaisearch.cloud.google.com/grounding-api-redirect/')) {
+                                                try {
+                                                    const res = await fetch(finalUrl, { method: 'GET', redirect: 'manual' });
+                                                    const location = res.headers.get('location');
+                                                    if (location) {
+                                                        finalUrl = location;
+                                                    } else {
+                                                        const headRes = await fetch(finalUrl, { method: 'HEAD', redirect: 'follow' });
+                                                        finalUrl = headRes.url;
+                                                    }
+                                                } catch (e) {
+                                                    console.warn(`[Child Worker] Failed to resolve redirect URL: ${finalUrl}`, e);
+                                                }
+                                            }
+                                            return {
+                                                type: 'web_search_result',
+                                                url: finalUrl,
+                                                title: s.web?.title || '',
+                                                encrypted_content: Buffer.from(finalUrl).toString('base64'),
+                                                page_age: new Date().toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' })
+                                            };
+                                        }));
+
+                                        console.log(`[Child Worker] Web search result mapped. Sources count: ${claudeResult.length}`);
+                                        sendEvent({
+                                            type: 'server_tool_result',
+                                            sessionId,
+                                            callId,
+                                            result: claudeResult
+                                        });
+                                        return result;
+                                    } catch (err) {
+                                        const callId = sessionData.lastServerToolCallId || `unknown_${Date.now()}`;
+                                        sendEvent({
+                                            type: 'server_tool_result',
+                                            sessionId,
+                                            callId,
+                                            result: {
+                                                type: 'web_search_tool_result_error',
+                                                error_code: 'internal_error'
+                                            }
+                                        });
+                                        throw err;
+                                    }
+                                };
+                                return invocation;
+                            };
+                            ws.__createInvocationPatched = true;
+                        }
+                    }
+                }
+
+                sessionData.claudeWebSearchName = claudeWebSearchName;
+                sessionData.clientToolNames = clientToolNames;
 
                 stream = geminiSession.sendStream(prompt);
                 sessionData.stream = stream;
@@ -479,14 +550,14 @@ async function consumeStream(
                     parsedArgs = callInfo.args;
                 }
 
-                const wsName = (sessionData as any).claudeWebSearchName;
-                const clientToolNames = (sessionData as any).clientToolNames || [];
+                const wsName = sessionData.claudeWebSearchName;
+                const clientToolNames = sessionData.clientToolNames || [];
                 if (name === 'google_web_search' && wsName) {
                     // Claude API 仕様に準拠した srvtoolu_ プレフィックス付きIDを生成
                     const serverCallId = `srvtoolu_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
                     console.log(`[Child Worker] Intercepted google_web_search -> ${wsName} (id: ${serverCallId})`);
                     // モンキーパッチ側が結果を返す際に同じIDを使用するよう保存
-                    (sessionData as any).lastServerToolCallId = serverCallId;
+                    sessionData.lastServerToolCallId = serverCallId;
                     hasProducedAnyBlock = true;
                     // server-side tool, does not wait for client
                     sendEvent({
