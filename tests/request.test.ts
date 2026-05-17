@@ -1,25 +1,8 @@
-import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import { convertMessagesToPrompt } from '../server/converters/request.js';
 import type { ClaudeMessage } from '../server/types.js';
-import { promises as fsPromises } from 'node:fs';
 
 describe('convertMessagesToPrompt', () => {
-  const proxyHome = '/tmp/proxyHomeTest';
-  const sessionId = 'sess-123';
-
-  beforeEach(async () => {
-    await fsPromises.mkdir(proxyHome, { recursive: true });
-  });
-
-  afterEach(async () => {
-    vi.restoreAllMocks();
-    try {
-      await fsPromises.rm(proxyHome, { recursive: true, force: true });
-    } catch (e) {
-      // ignore
-    }
-  });
-
   it('correctly interpolates tool result', async () => {
     const messages: ClaudeMessage[] = [
       {
@@ -29,13 +12,14 @@ describe('convertMessagesToPrompt', () => {
         ]
       }
     ];
-    const tempFiles: string[] = [];
-    const prompt = await convertMessagesToPrompt(messages, proxyHome, sessionId, tempFiles);
+    // Cast to any to bypass current type signature before we fix the implementation
+    const { prompt, inlineDataParts } = await (convertMessagesToPrompt(messages, '', '', []) as Promise<any>);
 
     expect(prompt).toContain('[Tool Result tool-123: result text]');
+    expect(inlineDataParts).toEqual([]);
   });
 
-  it('processes image block correctly, creating a file and injecting read_file instruction', async () => {
+  it('processes image block correctly, collecting it into inlineDataParts', async () => {
     const messages: ClaudeMessage[] = [
       {
         role: 'user',
@@ -51,22 +35,20 @@ describe('convertMessagesToPrompt', () => {
         ]
       }
     ];
-    const tempFiles: string[] = [];
-    const prompt = await convertMessagesToPrompt(messages, proxyHome, sessionId, tempFiles);
+    const { prompt, inlineDataParts } = await (convertMessagesToPrompt(messages, '', '', []) as Promise<any>);
 
-    expect(tempFiles).toHaveLength(1);
-    const filePath = tempFiles[0];
-    expect(filePath).toMatch(/\.jpg$/);
-    expect(filePath).toContain(sessionId);
+    expect(inlineDataParts).toHaveLength(1);
+    expect(inlineDataParts[0]).toEqual({
+      inlineData: {
+        mimeType: 'image/jpeg',
+        data: 'dGVzdA=='
+      }
+    });
 
-    // File should exist and contain the decoded data
-    const fileContent = await fsPromises.readFile(filePath, 'utf-8');
-    expect(fileContent).toBe('test');
-
-    expect(prompt).toContain(`[Attached File: The user attached a file. Please read it using the read_file tool from the absolute path: ${filePath}]`);
+    expect(prompt).toContain('[Attached: image/jpeg]');
   });
 
-  it('processes document block correctly with correct extension', async () => {
+  it('processes document block correctly', async () => {
     const messages: ClaudeMessage[] = [
       {
         role: 'user',
@@ -82,38 +64,15 @@ describe('convertMessagesToPrompt', () => {
         ]
       }
     ];
-    const tempFiles: string[] = [];
-    const prompt = await convertMessagesToPrompt(messages, proxyHome, sessionId, tempFiles);
+    const { prompt, inlineDataParts } = await (convertMessagesToPrompt(messages, '', '', []) as Promise<any>);
 
-    expect(tempFiles).toHaveLength(1);
-    expect(tempFiles[0]).toMatch(/\.pdf$/);
-  });
-
-  it('pushes an error message to the prompt if file writing fails', async () => {
-    // Mock fsPromises.writeFile to throw an error
-    vi.spyOn(fsPromises, 'writeFile').mockRejectedValue(new Error('Simulated write error'));
-    const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
-
-    const messages: ClaudeMessage[] = [
-      {
-        role: 'user',
-        content: [
-          {
-            type: 'image',
-            source: {
-              type: 'base64',
-              media_type: 'image/png',
-              data: 'bW9jaw=='
-            }
-          }
-        ]
+    expect(inlineDataParts).toHaveLength(1);
+    expect(inlineDataParts[0]).toEqual({
+      inlineData: {
+        mimeType: 'application/pdf',
+        data: 'UERG'
       }
-    ];
-    const tempFiles: string[] = [];
-    const prompt = await convertMessagesToPrompt(messages, proxyHome, sessionId, tempFiles);
-
-    expect(tempFiles).toHaveLength(0); // Should not have added any file
-    expect(consoleErrorSpy).toHaveBeenCalled();
-    expect(prompt).toContain('[Error: Failed to process attached file]');
+    });
+    expect(prompt).toContain('[Attached: application/pdf]');
   });
 });

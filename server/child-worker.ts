@@ -75,7 +75,6 @@ interface SessionData {
         cache_read_input_tokens?: number;
         cache_creation_input_tokens?: number;
     };
-    sessionTempFiles?: string[];
     claudeWebSearchName?: string;
     clientToolNames?: string[];
     lastServerToolCallId?: string;
@@ -86,22 +85,10 @@ const sessionStore = new Map<string, SessionData>();
 function getOrCreateSession(sessionId: string): SessionData {
     let session = sessionStore.get(sessionId);
     if (!session) {
-        session = { pendingToolCalls: new Map(), earlyToolResults: new Map(), sessionTempFiles: [] };
+        session = { pendingToolCalls: new Map(), earlyToolResults: new Map() };
         sessionStore.set(sessionId, session);
     }
     return session;
-}
-
-async function cleanupTempFiles(files?: string[]) {
-    if (!files || files.length === 0) return;
-    for (const file of files) {
-        try {
-            await fs.promises.unlink(file);
-            console.log(`[Child Worker] Cleaned up temp file: ${file}`);
-        } catch (e) {
-            console.warn(`[Child Worker] Failed to clean up temp file: ${file}`, e);
-        }
-    }
 }
 
 // --- SDK操作ヘルパー ---
@@ -246,10 +233,12 @@ async function handleParentMessage(msg: ParentMessage, sendEvent: (msg: ChildMes
 
         // Prompt の構築
         let prompt = '';
+        let currentInlineDataParts: any[] = [];
         // 如果有历史记录且 sessionData.stream は存在しない場合は結合
         if (!sessionData.stream) {
-            sessionData.sessionTempFiles = sessionData.sessionTempFiles || [];
-            prompt = await convertMessagesToPrompt(messages, proxyHome, sessionId, sessionData.sessionTempFiles);
+            const result = await convertMessagesToPrompt(messages);
+            prompt = result.prompt;
+            currentInlineDataParts = result.inlineDataParts;
         }
         const systemPrompt = extractSystemPrompt(system);
 
@@ -313,11 +302,6 @@ async function handleParentMessage(msg: ParentMessage, sendEvent: (msg: ChildMes
                 if (wsTool) {
                     claudeWebSearchName = wsTool.name || 'web_search';
                     allowedToolNames.push('google_web_search');
-                }
-
-                // マルチモーダル対応のための read_file ツール許可
-                if (!allowedToolNames.includes('read_file')) {
-                    allowedToolNames.push('read_file');
                 }
 
                 await initializeSessionLocally(geminiSession, allowedToolNames);
@@ -392,6 +376,35 @@ async function handleParentMessage(msg: ParentMessage, sendEvent: (msg: ChildMes
 
                 sessionData.claudeWebSearchName = claudeWebSearchName;
                 sessionData.clientToolNames = clientToolNames;
+
+                
+                if (currentInlineDataParts.length > 0) {
+                    const client = (geminiSession as any).client;
+                    if (client && typeof client.sendMessageStream === 'function' && !client.__sendMessagePatched) {
+                        const originalSendMessageStream = client.sendMessageStream.bind(client);
+                        let isFirstRequest = true;
+                        client.sendMessageStream = async function*(request: any, ...args: any[]) {
+                            let req = request;
+                            if (isFirstRequest) {
+                                isFirstRequest = false;
+                                if (typeof req === 'string') {
+                                    req = [req, ...currentInlineDataParts];
+                                } else if (Array.isArray(req)) {
+                                    req = [...req, ...currentInlineDataParts];
+                                } else if (req && typeof req === 'object' && req.parts) {
+                                    req.parts = [...req.parts, ...currentInlineDataParts];
+                                } else {
+                                    req = [req, ...currentInlineDataParts];
+                                }
+                            }
+                            const stream = await originalSendMessageStream(req, ...args);
+                            for await (const chunk of stream) {
+                                yield chunk;
+                            }
+                        };
+                        client.__sendMessagePatched = true;
+                    }
+                }
 
                 stream = geminiSession.sendStream(prompt);
                 sessionData.stream = stream;
@@ -502,7 +515,6 @@ async function consumeStream(
 
             const iter = result as IteratorResult<any>;
             if (iter.done) {
-                cleanupTempFiles(sessionData.sessionTempFiles);
                 sessionStore.delete(sessionId);
                 break; // 完全終了
             }
@@ -650,7 +662,6 @@ async function consumeStream(
 
     } catch (error) {
         console.error(`[Child Worker ${accountId}] Stream loop error:`, error);
-        cleanupTempFiles(sessionData.sessionTempFiles);
         sessionStore.delete(sessionId);
         sendEvent({
             type: 'error',

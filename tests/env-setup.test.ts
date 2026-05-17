@@ -32,38 +32,18 @@ describe('buildProxyHome', () => {
     expect(fs.existsSync(path.join(proxyHome, '.gemini'))).toBe(true);
   });
 
-  it('should clean up orphaned temp files in tmp/ directory on startup', () => {
-    // 1. Create a dummy tmp directory and files as if it were a previous crashed session
+  it('should not delete tmp directory if it exists (removed tmp cleanup)', () => {
+    // 1. Create a dummy tmp directory
     const tmpDir = path.join(proxyHome, 'tmp');
     fs.mkdirSync(tmpDir, { recursive: true });
-    fs.writeFileSync(path.join(tmpDir, 'orphan.txt'), 'leaked content');
-
-    const subDir = path.join(tmpDir, 'subdir');
-    fs.mkdirSync(subDir);
-    fs.writeFileSync(path.join(subDir, 'leaked.jpg'), 'image data');
+    fs.writeFileSync(path.join(tmpDir, 'orphan.txt'), 'content');
 
     expect(fs.existsSync(path.join(tmpDir, 'orphan.txt'))).toBe(true);
-    expect(fs.existsSync(path.join(subDir, 'leaked.jpg'))).toBe(true);
 
     // 2. Call buildProxyHome
     buildProxyHome(accountId);
 
-    // 3. Verify tmp directory is gone (or at least empty)
-    // According to our implementation: fs.rmSync(tmpDir, { recursive: true, force: true });
-    expect(fs.existsSync(tmpDir)).toBe(false);
-  });
-
-  it('should handle non-existent tmp directory gracefully', () => {
-    // 1. Ensure tmp directory does not exist
-    const tmpDir = path.join(proxyHome, 'tmp');
-    if (fs.existsSync(tmpDir)) {
-      fs.rmSync(tmpDir, { recursive: true, force: true });
-    }
-
-    // 2. Call buildProxyHome
-    expect(() => buildProxyHome(accountId)).not.toThrow();
-
-    // 3. Verify it still created the basic structure
-    expect(fs.existsSync(path.join(proxyHome, '.gemini'))).toBe(true);
+    // 3. Verify tmp directory is NOT gone
+    expect(fs.existsSync(tmpDir)).toBe(true);
   });
 });

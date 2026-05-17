@@ -6,10 +6,18 @@
  */
 
 import type { ClaudeMessage, ClaudeContentBlock } from '../types.js';
-import fs from 'node:fs';
-import { promises as fsPromises } from 'node:fs';
-import path from 'node:path';
-import { randomUUID } from 'node:crypto';
+
+export interface InlineDataPart {
+  inlineData: {
+    mimeType: string;
+    data: string; // base64
+  };
+}
+
+export interface ConvertedPrompt {
+  prompt: string;
+  inlineDataParts: InlineDataPart[];
+}
 
 /**
  * Claude モデル名を Gemini モデル名に変換する。
@@ -37,7 +45,7 @@ export function mapModelName(model: string): string {
  * ClaudeMessage の content を構造化テキストに変換する。
  * tool_use と tool_result ブロックも含めることで、会話履歴の文脈を保持する。
  */
-async function formatContentForPrompt(content: string | ClaudeContentBlock[], proxyHome: string, sessionId: string, tempFiles: string[]): Promise<string> {
+async function formatContentForPrompt(content: string | ClaudeContentBlock[], inlineDataParts: InlineDataPart[]): Promise<string> {
   if (typeof content === 'string') {
     return content;
   }
@@ -56,28 +64,14 @@ async function formatContentForPrompt(content: string | ClaudeContentBlock[], pr
       parts.push(`[Tool Result ${(block as any).tool_use_id}: ${resultText}]`);
     } else if (block.type === 'image' || block.type === 'document') {
       try {
-        const tempDir = path.join(proxyHome, 'tmp');
-        await fsPromises.mkdir(tempDir, { recursive: true });
-
-        const mediaType = (block as any).source.media_type || '';
-        let ext = '';
-        if (mediaType === 'image/jpeg') ext = '.jpg';
-        else if (mediaType === 'image/png') ext = '.png';
-        else if (mediaType === 'image/webp') ext = '.webp';
-        else if (mediaType === 'image/gif') ext = '.gif';
-        else if (mediaType === 'application/pdf') ext = '.pdf';
-        else ext = '.bin'; // default fallback
-
-        const fileName = `${sessionId}-${randomUUID()}${ext}`;
-        const filePath = path.join(tempDir, fileName);
-
-        const base64Data = (block as any).source.data;
-        await fsPromises.writeFile(filePath, Buffer.from(base64Data, 'base64'));
-        tempFiles.push(filePath);
-
-        parts.push(`[Attached File: The user attached a file. Please read it using the read_file tool from the absolute path: ${filePath}]`);
+        const mediaType = (block as any).source?.media_type || '';
+        const base64Data = (block as any).source?.data;
+        if (mediaType && base64Data) {
+          inlineDataParts.push({ inlineData: { mimeType: mediaType, data: base64Data } });
+          parts.push(`[Attached: ${mediaType}]`);
+        }
       } catch (err) {
-        console.error(`[Converter ${sessionId}] Error processing image/document block:`, err);
+        console.error(`[Converter] Error processing image/document block:`, err);
         parts.push('[Error: Failed to process attached file]');
       }
     }
@@ -90,26 +84,29 @@ async function formatContentForPrompt(content: string | ClaudeContentBlock[], pr
  * 単一の user メッセージの場合はテキストをそのまま返す。
  * 複数メッセージ（マルチターン）の場合はロール付きの会話テキストにまとめる。
  */
-export async function convertMessagesToPrompt(messages: ClaudeMessage[], proxyHome: string, sessionId: string, tempFiles: string[]): Promise<string> {
+export async function convertMessagesToPrompt(messages: ClaudeMessage[]): Promise<ConvertedPrompt> {
   if (messages.length === 0) {
     throw new Error('messages に user ロールのメッセージが含まれていません');
   }
 
+  const inlineDataParts: InlineDataPart[] = [];
+
   // 単一メッセージの場合はシンプルにテキストのみ返す
   if (messages.length === 1 && messages[0].role === 'user') {
-    return await formatContentForPrompt(messages[0].content, proxyHome, sessionId, tempFiles);
+    const prompt = await formatContentForPrompt(messages[0].content, inlineDataParts);
+    return { prompt, inlineDataParts };
   }
 
   // マルチターン: ロール付きの会話テキストに変換
   const parts: string[] = [];
   for (const msg of messages) {
     const roleLabel = msg.role === 'user' ? 'User' : 'Assistant';
-    const text = await formatContentForPrompt(msg.content, proxyHome, sessionId, tempFiles);
+    const text = await formatContentForPrompt(msg.content, inlineDataParts);
     if (text) {
       parts.push(`${roleLabel}: ${text}`);
     }
   }
-  return parts.join('\n\n');
+  return { prompt: parts.join('\n\n'), inlineDataParts };
 }
 
 /**
