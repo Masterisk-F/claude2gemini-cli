@@ -75,6 +75,9 @@ interface SessionData {
         cache_read_input_tokens?: number;
         cache_creation_input_tokens?: number;
     };
+    claudeWebSearchName?: string;
+    clientToolNames?: string[];
+    lastServerToolCallId?: string;
 }
 
 const sessionStore = new Map<string, SessionData>();
@@ -230,9 +233,12 @@ async function handleParentMessage(msg: ParentMessage, sendEvent: (msg: ChildMes
 
         // Prompt の構築
         let prompt = '';
+        let currentInlineDataParts: any[] = [];
         // 如果有历史记录且 sessionData.stream は存在しない場合は結合
         if (!sessionData.stream) {
-            prompt = convertMessagesToPrompt(messages);
+            const result = await convertMessagesToPrompt(messages);
+            prompt = result.prompt;
+            currentInlineDataParts = result.inlineDataParts;
         }
         const systemPrompt = extractSystemPrompt(system);
 
@@ -288,7 +294,8 @@ async function handleParentMessage(msg: ParentMessage, sendEvent: (msg: ChildMes
                 });
 
                 const geminiSession = agent.session();
-                const allowedToolNames = tools?.map(t => t.name) || [];
+                const clientToolNames = tools?.map(t => t.name) || [];
+                const allowedToolNames = [...clientToolNames];
 
                 const wsTool = tools?.find(t => t.type?.startsWith('web_search_'));
                 let claudeWebSearchName: string | undefined = undefined;
@@ -311,9 +318,8 @@ async function handleParentMessage(msg: ParentMessage, sendEvent: (msg: ChildMes
                                 invocation.execute = async (signal: AbortSignal) => {
                                     try {
                                         const result = await originalExecute(signal);
-                                        const callId = (sessionData as any).lastServerToolCallId || `unknown_${Date.now()}`;
+                                        const callId = sessionData.lastServerToolCallId || `unknown_${Date.now()}`;
 
-                                        // Map gemini-cli result to Claude web_search_tool_result format
                                         const claudeResult = await Promise.all((result.sources || []).map(async (s: any) => {
                                             let finalUrl = s.web?.uri || '';
                                             if (finalUrl.includes('vertexaisearch.cloud.google.com/grounding-api-redirect/')) {
@@ -348,7 +354,7 @@ async function handleParentMessage(msg: ParentMessage, sendEvent: (msg: ChildMes
                                         });
                                         return result;
                                     } catch (err) {
-                                        const callId = (sessionData as any).lastServerToolCallId || `unknown_${Date.now()}`;
+                                        const callId = sessionData.lastServerToolCallId || `unknown_${Date.now()}`;
                                         sendEvent({
                                             type: 'server_tool_result',
                                             sessionId,
@@ -368,7 +374,37 @@ async function handleParentMessage(msg: ParentMessage, sendEvent: (msg: ChildMes
                     }
                 }
 
-                (sessionData as any).claudeWebSearchName = claudeWebSearchName;
+                sessionData.claudeWebSearchName = claudeWebSearchName;
+                sessionData.clientToolNames = clientToolNames;
+
+                
+                if (currentInlineDataParts.length > 0) {
+                    const client = (geminiSession as any).client;
+                    if (client && typeof client.sendMessageStream === 'function' && !client.__sendMessagePatched) {
+                        const originalSendMessageStream = client.sendMessageStream.bind(client);
+                        let isFirstRequest = true;
+                        client.sendMessageStream = async function*(request: any, ...args: any[]) {
+                            let req = request;
+                            if (isFirstRequest) {
+                                isFirstRequest = false;
+                                if (typeof req === 'string') {
+                                    req = [req, ...currentInlineDataParts];
+                                } else if (Array.isArray(req)) {
+                                    req = [...req, ...currentInlineDataParts];
+                                } else if (req && typeof req === 'object' && req.parts) {
+                                    req.parts = [...req.parts, ...currentInlineDataParts];
+                                } else {
+                                    req = [req, ...currentInlineDataParts];
+                                }
+                            }
+                            const stream = await originalSendMessageStream(req, ...args);
+                            for await (const chunk of stream) {
+                                yield chunk;
+                            }
+                        };
+                        client.__sendMessagePatched = true;
+                    }
+                }
 
                 stream = geminiSession.sendStream(prompt);
                 sessionData.stream = stream;
@@ -422,7 +458,6 @@ async function handleParentMessage(msg: ParentMessage, sendEvent: (msg: ChildMes
             console.warn(`[Child Worker ${accountId}] Cannot resume stream, session invalid: ${sessionId}`);
             return;
         }
-
 
         // ストリーム消費ループを再開
         consumeStream(sessionData.stream, sessionData.toolState, sessionId, sessionData, sendEvent);
@@ -527,13 +562,14 @@ async function consumeStream(
                     parsedArgs = callInfo.args;
                 }
 
-                const wsName = (sessionData as any).claudeWebSearchName;
+                const wsName = sessionData.claudeWebSearchName;
+                const clientToolNames = sessionData.clientToolNames || [];
                 if (name === 'google_web_search' && wsName) {
                     // Claude API 仕様に準拠した srvtoolu_ プレフィックス付きIDを生成
                     const serverCallId = `srvtoolu_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
                     console.log(`[Child Worker] Intercepted google_web_search -> ${wsName} (id: ${serverCallId})`);
                     // モンキーパッチ側が結果を返す際に同じIDを使用するよう保存
-                    (sessionData as any).lastServerToolCallId = serverCallId;
+                    sessionData.lastServerToolCallId = serverCallId;
                     hasProducedAnyBlock = true;
                     // server-side tool, does not wait for client
                     sendEvent({
@@ -543,8 +579,8 @@ async function consumeStream(
                         name: wsName,
                         args: parsedArgs
                     });
-                } else {
-                    console.log(`[Child Worker] Tool call (not intercepted): ${name}`);
+                } else if (clientToolNames.includes(name)) {
+                    console.log(`[Child Worker] Tool call (client): ${name}`);
                     toolState.expectedClientTools++;
                     hasProducedAnyBlock = true;
                     stopReason = 'tool_use';
@@ -564,6 +600,11 @@ async function consumeStream(
                         name,
                         args: parsedArgs
                     });
+                } else {
+                    console.log(`[Child Worker] Built-in tool call handled by SDK: ${name}`);
+                    // built-in ツール（read_file 等）は SDK が自動実行するため、親プロセスへは通知しない。
+                    // また expectedClientTools も増やさないことで、finished イベント時に
+                    // クライアント待ち（turn_end）にならずに次の生成が続くようにする。
                 }
             }
 

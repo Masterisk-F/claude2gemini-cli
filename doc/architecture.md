@@ -86,6 +86,7 @@ Lightweight state management for the Parent process:
 Converts Claude message arrays into Gemini prompt strings:
 - **Role-labeled conversation text** (`User: ...`, `Assistant: ...`)
 - **Tool blocks** → Text representations (`[Tool Call: ...]`)
+- **Multimodal blocks** → For `image` and `document` blocks, the proxy converts them into Gemini's native `inlineData` format within `ConvertedPrompt.inlineDataParts`. The `child-worker.ts` patches the SDK's `sendMessageStream` method to inject these `inlineData` parts into the first request of the stream, allowing the model to process them without any temporary file I/O or tool-based file reads.
 - **Model name mapping** — Converts Claude model names to Gemini equivalents (e.g. sonnet → `gemini-3-flash-preview`)
 
 ### `server/converters/stream.ts`
@@ -172,7 +173,6 @@ sequenceDiagram
 
 ## Limitations
 
-- **No image/file content** — Only text content blocks are supported
 - **No conversation caching** — Gemini SDK manages its own conversation state; multi-turn history is flattened into prompt text
 - **In-memory sessions** — Parent sessions and Child streams are lost on proxy restart
 - **Single-node** — Designed for single-server execution; multiple proxies would require external session orchestration (e.g. Redis).

@@ -7,6 +7,18 @@
 
 import type { ClaudeMessage, ClaudeContentBlock } from '../types.js';
 
+export interface InlineDataPart {
+  inlineData: {
+    mimeType: string;
+    data: string; // base64
+  };
+}
+
+export interface ConvertedPrompt {
+  prompt: string;
+  inlineDataParts: InlineDataPart[];
+}
+
 /**
  * Claude モデル名を Gemini モデル名に変換する。
  * Claude Code は処理の途中で軽量モデル（haiku 等）を裏で呼び出すため、
@@ -30,23 +42,10 @@ export function mapModelName(model: string): string {
 }
 
 /**
- * ClaudeMessage の content からテキスト部分を抽出する
- */
-function extractTextFromContent(content: string | ClaudeContentBlock[]): string {
-  if (typeof content === 'string') {
-    return content;
-  }
-  return content
-    .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
-    .map(block => block.text)
-    .join('\n');
-}
-
-/**
  * ClaudeMessage の content を構造化テキストに変換する。
  * tool_use と tool_result ブロックも含めることで、会話履歴の文脈を保持する。
  */
-function formatContentForPrompt(content: string | ClaudeContentBlock[]): string {
+async function formatContentForPrompt(content: string | ClaudeContentBlock[], inlineDataParts: InlineDataPart[]): Promise<string> {
   if (typeof content === 'string') {
     return content;
   }
@@ -56,13 +55,43 @@ function formatContentForPrompt(content: string | ClaudeContentBlock[]): string 
       parts.push(block.text);
     } else if (block.type === 'tool_use' || block.type === 'server_tool_use') {
       parts.push(`[Tool Call: ${block.name}(${JSON.stringify(block.input)})]`);
-    } else if (block.type === 'tool_result' || block.type === 'web_search_tool_result') {
-      const resultText = typeof (block as any).content === 'string'
-        ? (block as any).content
-        : Array.isArray((block as any).content)
-          ? (block as any).content.map((b: any) => b.type === 'text' ? b.text : JSON.stringify(b)).join('\n')
+    } else if (block.type === 'tool_result') {
+      const resultText = typeof block.content === 'string'
+        ? block.content
+        : block.content.map((b: ClaudeContentBlock) => b.type === 'text' ? b.text : JSON.stringify(b)).join('\n');
+      parts.push(`[Tool Result ${block.tool_use_id}: ${resultText}]`);
+    } else if (block.type === 'web_search_tool_result') {
+      const wb = block;
+      const resultText = typeof wb.content === 'string'
+        ? wb.content
+        : Array.isArray(wb.content)
+          ? wb.content.map((b: any) => b.type === 'text' ? b.text : JSON.stringify(b)).join('\n')
           : '';
-      parts.push(`[Tool Result ((block as any).tool_use_id): ${resultText}]`);
+      parts.push(`[Tool Result ${wb.tool_use_id}: ${resultText}]`);
+    } else if (block.type === 'image') {
+      try {
+        const mediaType = block.source.media_type;
+        const base64Data = block.source.data;
+        if (mediaType && base64Data) {
+          inlineDataParts.push({ inlineData: { mimeType: mediaType, data: base64Data } });
+          parts.push(`[Attached: ${mediaType}]`);
+        }
+      } catch (err) {
+        console.error(`[Converter] Error processing image block:`, err);
+        parts.push('[Error: Failed to process attached file]');
+      }
+    } else if (block.type === 'document') {
+      try {
+        const mediaType = block.source.media_type;
+        const base64Data = block.source.data;
+        if (mediaType && base64Data) {
+          inlineDataParts.push({ inlineData: { mimeType: mediaType, data: base64Data } });
+          parts.push(`[Attached: ${mediaType}]`);
+        }
+      } catch (err) {
+        console.error(`[Converter] Error processing document block:`, err);
+        parts.push('[Error: Failed to process attached file]');
+      }
     }
   }
   return parts.join('\n');
@@ -73,26 +102,29 @@ function formatContentForPrompt(content: string | ClaudeContentBlock[]): string 
  * 単一の user メッセージの場合はテキストをそのまま返す。
  * 複数メッセージ（マルチターン）の場合はロール付きの会話テキストにまとめる。
  */
-export function convertMessagesToPrompt(messages: ClaudeMessage[]): string {
+export async function convertMessagesToPrompt(messages: ClaudeMessage[]): Promise<ConvertedPrompt> {
   if (messages.length === 0) {
     throw new Error('messages に user ロールのメッセージが含まれていません');
   }
 
+  const inlineDataParts: InlineDataPart[] = [];
+
   // 単一メッセージの場合はシンプルにテキストのみ返す
   if (messages.length === 1 && messages[0].role === 'user') {
-    return extractTextFromContent(messages[0].content);
+    const prompt = await formatContentForPrompt(messages[0].content, inlineDataParts);
+    return { prompt, inlineDataParts };
   }
 
   // マルチターン: ロール付きの会話テキストに変換
   const parts: string[] = [];
   for (const msg of messages) {
     const roleLabel = msg.role === 'user' ? 'User' : 'Assistant';
-    const text = formatContentForPrompt(msg.content);
+    const text = await formatContentForPrompt(msg.content, inlineDataParts);
     if (text) {
       parts.push(`${roleLabel}: ${text}`);
     }
   }
-  return parts.join('\n\n');
+  return { prompt: parts.join('\n\n'), inlineDataParts };
 }
 
 /**
