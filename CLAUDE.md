@@ -1,13 +1,11 @@
 # CLAUDE.md (Project Instructions)
 
 ## Build Commands
-- Build project: `npm run build`
-- Build Gemini CLI SDK submodule: `cd gemini-cli && npm install && npm run build`
-- Development mode: `npm run dev`
+- Development mode: `npm run dev` (runs `uv run python -m claude2gemini`)
 
 ## Test Commands
-- Run all tests: `npm test`
-- Run specific test file: `npx vitest run tests/server/path/to/test.test.ts`
+- Run all tests: `npm test` (runs `uv run pytest tests/`)
+- Run specific test file: `uv run pytest tests/test_types.py -v`
 
 ## Technical Writing Guidelines (Language)
 - **English Only**: All technical artifacts including **Pull Request titles/descriptions**, **Commit messages**, and **Source code comments** must be written in **English**.

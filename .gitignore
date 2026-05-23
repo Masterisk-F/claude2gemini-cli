@@ -4,5 +4,9 @@ dist/
 *.d.ts
 data/
 .gemini-test-env*
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
 
 # gemini-cli のビルド成果物はサブモジュール内なので追跡不要

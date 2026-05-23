@@ -2,7 +2,20 @@
 
 ## What is this?
 
-Claude2Gemini-CLI is a proxy server that makes [Google Gemini CLI SDK](https://github.com/google-gemini/gemini-cli) accessible through the [Anthropic Claude Messages API](https://docs.anthropic.com/en/api/messages). It translates Claude API requests into Gemini SDK calls in real-time, allowing any Claude-compatible client — such as [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Cursor](https://cursor.sh/), or [Cline](https://github.com/cline/cline) — to use Gemini models as a drop-in backend.
+Claude2Gemini-CLI is a proxy server that makes [Google Antigravity SDK](https://antigravity.google) accessible through the [Anthropic Claude Messages API](https://docs.anthropic.com/en/api/messages). It translates Claude API requests into Antigravity agent calls in real-time, allowing any Claude-compatible client — such as [Claude Code](https://docs.anthropic.com/en/docs/claude-code), [Cursor](https://cursor.sh/), or [Cline](https://github.com/cline/cline) — to use Gemini models as a drop-in backend.
+
+## Quick Start
+
+```bash
+# Install dependencies
+uv sync
+
+# Run the proxy server
+uv run python -m claude2gemini
+
+# Run tests
+uv run pytest
+```
 
 ```
 ┌──────────────┐     Claude API     ┌──────────────────┐     Gemini SDK     ┌──────────────┐
