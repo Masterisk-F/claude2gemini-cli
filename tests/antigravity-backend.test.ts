@@ -1,42 +1,57 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { AntigravityBackend, GeminiApiError } from '../server/gemini-backend.js';
 
+function makePlannerStep(text: string): any {
+  return {
+    status: 4, // COMPLETED
+    step: {
+      case: 'plannerResponse',
+      value: { response: text, thinking: '' },
+    },
+    requestedInteraction: null,
+  };
+}
+
 vi.mock('antigravity-client', () => {
   class MockCascade {
     cascadeId = 'cascade-test-1';
-    run = vi.fn().mockResolvedValue({
-      text: 'Hello! I am an AI assistant.',
-      newSteps: [],
-      finalStatus: 'idle',
-      timedOut: false,
-    });
+    run = vi.fn();
     sendMessage = vi.fn().mockResolvedValue({});
     getHistory = vi.fn().mockResolvedValue({ trajectory: { steps: [] } });
     dispose = vi.fn();
     on = vi.fn().mockReturnThis();
     off = vi.fn().mockReturnThis();
-    state = { status: 1, trajectory: null };
+    emit = vi.fn();
+    /** Simulates LS adding a plannerResponse step after a message round-trip. */
+    waitForTurnComplete = vi.fn().mockImplementation(async () => {
+      this.state.trajectory.steps.push(makePlannerStep('Hello! I am an AI assistant.'));
+      this.state.status = 4; // IDLE
+    });
+    state: any = {
+      status: 1, // RUNNING
+      trajectory: { steps: [] },
+    };
   }
 
+  const cascadeInstance = new MockCascade();
   const mockClient = {
-    startCascade: vi.fn().mockResolvedValue(new MockCascade()),
-    getCascade: vi.fn().mockReturnValue(new MockCascade()),
+    startCascade: vi.fn().mockResolvedValue(cascadeInstance),
+    getCascade: vi.fn().mockReturnValue(cascadeInstance),
     dispose: vi.fn(),
+    resolveModelId: vi.fn().mockResolvedValue(42),
+    lsClient: {
+      sendUserCascadeMessage: vi.fn().mockResolvedValue({}),
+    },
   };
-
-  class MockLauncher {
-    httpsPort = 12345;
-    csrfToken = 'test-token';
-    stop = vi.fn().mockResolvedValue(undefined);
-  }
 
   return {
     AntigravityClient: {
       launch: vi.fn().mockResolvedValue(mockClient),
     },
+    readAuthStatus: vi.fn().mockReturnValue({ apiKey: 'test-api-key' }),
     T: {
       Text: (val: string) => ({ chunk: { case: 'text', value: val } }),
-    }
+    },
   };
 });
 
