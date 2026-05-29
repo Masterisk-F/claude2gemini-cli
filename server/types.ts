@@ -49,6 +49,47 @@ export interface ClaudeDocumentBlock {
   };
 }
 
+// --- Bridge Types (Internal) ---
+
+export type BridgeMessage =
+    | {
+        type: 'stream_event';
+        sessionId: string;
+        event: {
+            type: string;
+            value?: any;
+        };
+    }
+    | {
+        type: 'tool_call';
+        sessionId: string;
+        callId: string;
+        name: string;
+        args: Record<string, unknown>;
+    }
+    | {
+        type: 'turn_end';
+        sessionId: string;
+        stopReason: string;
+        usage?: {
+            input_tokens: number;
+            output_tokens: number;
+            cache_read_input_tokens?: number;
+            cache_creation_input_tokens?: number;
+        };
+    }
+    | {
+        type: 'error';
+        sessionId: string;
+        message: string;
+        status?: number;
+    }
+    | {
+        type: 'fatal_error';
+        sessionId: string;
+        message: string;
+    };
+
 export type ClaudeContentBlock = ClaudeTextBlock | ClaudeToolUseBlock | ClaudeToolResultBlock | ClaudeWebSearchToolResultBlock | ClaudeImageBlock | ClaudeDocumentBlock;
 
 export interface ClaudeMessage {

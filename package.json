@@ -13,7 +13,7 @@
     "test": "vitest run --config ./vitest.config.ts"
   },
   "dependencies": {
-    "@google/gemini-cli-sdk": "file:./gemini-cli/packages/sdk",
+    "antigravity-client": "github:Masterisk-F/antigravity-client#feature/linux-support",
     "express": "^5.1.0",
     "zod": "^3.23.8"
   },

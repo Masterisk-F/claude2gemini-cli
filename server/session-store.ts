@@ -1,26 +1,14 @@
-interface SessionData {
-  accountId: string;
-}
+/**
+ * Session Store
+ *
+ * Manages conversation sessions and pending tool calls.
+ * Simplified for single-account Antigravity architecture.
+ */
 
 class SessionStore {
-  private sessions = new Map<string, SessionData>();
-  private pendingToolCalls = new Map<string, string>();
-
-  getSession(sessionId: string): SessionData | undefined {
-    return this.sessions.get(sessionId);
-  }
-
-  getOrCreateSession(sessionId: string): SessionData {
-    let session = this.sessions.get(sessionId);
-    if (!session) {
-      session = { accountId: '' };
-      this.sessions.set(sessionId, session);
-    }
-    return session;
-  }
+  private pendingToolCalls = new Map<string, string>(); // toolCallId -> sessionId
 
   deleteSession(sessionId: string): void {
-    this.sessions.delete(sessionId);
     for (const [callId, sId] of Array.from(this.pendingToolCalls.entries())) {
       if (sId === sessionId) {
         this.pendingToolCalls.delete(callId);

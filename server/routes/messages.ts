@@ -1,42 +1,40 @@
 import { Router } from 'express';
 import { randomUUID } from 'node:crypto';
 import type { Request, Response } from 'express';
-import { accountPool } from '../account-pool.js';
 import { sessionStore } from '../session-store.js';
 import { streamGeminiToClaudeSSE, setupSSEHeaders } from '../converters/stream.js';
-import { childManager } from '../child-manager.js';
-import { extractSystemPrompt, convertMessagesToPrompt } from '../converters/request.js';
-import { GeminiApiError } from '../gemini-backend.js';
-import type { ClaudeMessage, ClaudeToolUseBlock } from '../types.js';
-import type { ChildMessage, ParentMessage } from '../ipc-protocol.js';
+import { antigravityBackend, GeminiApiError } from '../gemini-backend.js';
 
 export const messagesRouter = Router();
 
-function normalizeToolResultContent(content: unknown): string {
-  if (!content) return '';
-  if (typeof content === 'string') return content;
-  if (Array.isArray(content)) {
-    return content
-      .map((block: any) => {
-        if (typeof block === 'string') return block;
-        if (block?.type === 'text' && typeof block.text === 'string') return block.text;
-        return JSON.stringify(block);
-      })
-      .join('\n');
+/**
+ * Claude モデル名 → Antigravity LS モデル名へのマッピング
+ */
+function mapModelName(model: string): string {
+  const lower = model.toLowerCase();
+  // Gemini ネイティブモデルはそのまま
+  if (lower.includes('gemini')) {
+    if (lower.includes('pro') || lower.includes('3.1')) return 'Gemini_3.1_Pro_High';
+    if (lower.includes('flash') && lower.includes('3.5')) return 'Gemini_3.5_Flash_High';
+    if (lower.includes('flash')) return 'Gemini_3.5_Flash_High';
+    return 'Gemini_3.5_Flash_Medium';
   }
-  return JSON.stringify(content);
+  // Claude → Antigravity マッピング
+  if (lower.includes('opus')) return 'Gemini_3.1_Pro_High';
+  if (lower.includes('sonnet') && lower.includes('4')) return 'Claude_Sonnet_4.6_Thinking';
+  if (lower.includes('sonnet')) return 'Gemini_3.5_Flash_High';
+  if (lower.includes('haiku')) return 'Gemini_3.5_Flash_Low';
+  return 'Gemini_3.5_Flash_High';
 }
 
 function buildClaudeResponse({
   contentBlocks,
   model,
   usage,
-  webSearchRequests,
 }: {
   contentBlocks: any[];
   model: string;
   usage?: { input_tokens: number; output_tokens: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number };
-  webSearchRequests?: number;
 }) {
   if (contentBlocks.length === 0) {
     throw new Error('Gemini API returned an empty response');
@@ -45,19 +43,12 @@ function buildClaudeResponse({
   const hasClientToolUse = contentBlocks.some(b => b.type === 'tool_use');
   const stopReason = hasClientToolUse ? 'tool_use' : 'end_turn';
 
-  // web_search が使用された場合にのみ server_tool_use フィールドを付与する
   const usageField: any = {
     input_tokens: usage?.input_tokens || 0,
     output_tokens: usage?.output_tokens || 0,
   };
   if (usage?.cache_read_input_tokens !== undefined) {
     usageField.cache_read_input_tokens = usage.cache_read_input_tokens;
-  }
-  if (usage?.cache_creation_input_tokens !== undefined) {
-    usageField.cache_creation_input_tokens = usage.cache_creation_input_tokens;
-  }
-  if (webSearchRequests && webSearchRequests > 0) {
-    usageField.server_tool_use = { web_search_requests: webSearchRequests };
   }
 
   return {
@@ -97,83 +88,6 @@ export function classifyError(error: unknown): { statusCode: number; errorType: 
   return { statusCode: 500, errorType: 'api_error', clientMessage: `Internal server error: ${errorMsg}` };
 }
 
-function mapModelName(model: string): string {
-  const lower = model.toLowerCase();
-  if (lower.includes('opus')) {
-    return 'gemini-3.1-pro-preview';
-  }
-  if (lower.includes('sonnet')) {
-    return 'gemini-3-flash-preview';
-  }
-  if (lower.includes('haiku')) {
-    return 'gemini-2.5-flash-lite';
-  }
-  if (!lower.includes('gemini')) {
-    return 'gemini-3-flash-preview';
-  }
-  return model;
-}
-
-// === NEW getSessionStream buffer logic ===
-function getSessionStream(accountId: string, sessionId: string): AsyncGenerator<ChildMessage> {
-  let resolveNext: ((msg: ChildMessage) => void) | null = null;
-  const buffer: ChildMessage[] = [];
-
-  const cleanup = childManager.onMessage(accountId, (msg) => {
-    if (('sessionId' in msg && msg.sessionId === sessionId) || (msg.type === 'fatal_error')) {
-      if (resolveNext) {
-        resolveNext(msg);
-        resolveNext = null;
-      } else {
-        buffer.push(msg);
-      }
-    }
-  });
-
-  // 子プロセス終了時のハンドラを登録
-  const exitCleanup = childManager.onChildExit((exitedAccountId) => {
-    if (exitedAccountId === accountId) {
-      // 子プロセスが終了したらエラーメッセージを生成
-      const exitMsg: ChildMessage = {
-        type: 'fatal_error',
-        sessionId,
-        message: 'Child process exited unexpectedly'
-      };
-      if (resolveNext) {
-        resolveNext(exitMsg);
-        resolveNext = null;
-      } else {
-        buffer.push(exitMsg);
-      }
-    }
-  });
-
-  async function* generator(): AsyncGenerator<ChildMessage> {
-    try {
-      while (true) {
-        let msg: ChildMessage;
-        if (buffer.length > 0) {
-          msg = buffer.shift()!;
-        } else {
-          msg = await new Promise<ChildMessage>((resolve) => {
-            resolveNext = resolve;
-          });
-        }
-        yield msg;
-
-        if (msg.type === 'turn_end' || msg.type === 'error' || msg.type === 'fatal_error') {
-          break;
-        }
-      }
-    } finally {
-      cleanup();
-      exitCleanup();
-    }
-  }
-
-  return generator();
-}
-
 // POST /v1/messages
 messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
   const body = req.body;
@@ -188,62 +102,14 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    let isResuming = false;
-    let accountId: string | undefined = undefined;
-    let sessionId: string | undefined = undefined;
-    const pendingToolResults: { toolCallId: string; result: string }[] = [];
-
-    const lastMessage = body.messages[body.messages.length - 1];
-    if (lastMessage.role === 'user' && Array.isArray(lastMessage.content)) {
-      const toolResults = lastMessage.content.filter((b: any) => b.type === 'tool_result') as any[];
-      const textBlocks = lastMessage.content.filter((b: any) => b.type === 'text') as any[];
-      let extraText = '';
-      if (textBlocks.length > 0) {
-        extraText = textBlocks.map((b: any) => b.text).join('\n');
-      }
-
-      if (toolResults.length > 0) {
-        if (extraText) {
-          // Mixed tool_result and text -> Cancel existing session and fallback to stateless
-          console.log(`[ToolResult] Mixed tool_result and text received - cancelling session and falling back to stateless`);
-          for (const tr of toolResults) {
-            const resolvedSessionId = sessionStore.resolveToolCall(tr.tool_use_id);
-            if (resolvedSessionId) {
-              const sessionData = sessionStore.getSession(resolvedSessionId);
-              if (sessionData && sessionData.accountId) {
-                // Send cancel message (don't await to avoid blocking)
-                childManager.sendRequest(sessionData.accountId, {
-                  type: 'cancel_session',
-                  sessionId: resolvedSessionId
-                }).catch(err => console.error(`Failed to send cancel_session`, err));
-              }
-              sessionStore.deleteSession(resolvedSessionId);
-            }
-          }
-          // Remains isResuming = false, sessionId = undefined, accountId = undefined
-        } else {
-          // Regular tool_result only -> Resume stream
-          console.log(`[ToolResult] ${toolResults.length} tool_result(s) received`);
-
-          for (let i = 0; i < toolResults.length; i++) {
-            const tr = toolResults[i];
-            const resolvedSessionId = sessionStore.resolveToolCall(tr.tool_use_id);
-
-            if (resolvedSessionId) {
-              sessionId = resolvedSessionId;
-              const sessionData = sessionStore.getSession(sessionId);
-              if (sessionData && sessionData.accountId) {
-                accountId = sessionData.accountId;
-              }
-              pendingToolResults.push({
-                toolCallId: tr.tool_use_id,
-                result: normalizeToolResultContent(tr.content),
-              });
-              isResuming = true;
-            } else {
-              console.warn(`[ToolResult] FAILED to resolve ${tr.tool_use_id} - falling back to stateless`);
-            }
-          }
+    let sessionId = req.headers['x-session-id'] as string;
+    if (!sessionId) {
+      // Try to resolve from last message tool_result
+      const lastMessage = body.messages[body.messages.length - 1];
+      if (lastMessage.role === 'user' && Array.isArray(lastMessage.content)) {
+        const toolResult = lastMessage.content.find((b: any) => b.type === 'tool_result');
+        if (toolResult) {
+          sessionId = sessionStore.resolveToolCall(toolResult.tool_use_id) || '';
         }
       }
     }
@@ -252,77 +118,27 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
       sessionId = `session_${Date.now()}_${randomUUID().slice(0, 6)}`;
     }
 
-    if (!accountId) {
-      accountId = accountPool.nextAccount();
-      if (accountId) {
-        const sessionData = sessionStore.getOrCreateSession(sessionId);
-        sessionData.accountId = accountId;
-        console.log(`[Session] Assigned account ${accountId} for session ${sessionId}`);
-      }
-    }
-
-    if (!accountId) {
-      throw new Error('No accounts available in pool');
-    }
-
-    // ストリームの初期化を一箇所に集約（最初のリクエスト送信前に行う）
-    const stream = getSessionStream(accountId, sessionId);
-
-    if (isResuming) {
-      // 解決済みの tool_result を順次送信
-      for (const ptr of pendingToolResults) {
-        await childManager.sendRequest(accountId, {
-          type: 'tool_result',
-          sessionId,
-          toolCallId: ptr.toolCallId,
-          result: ptr.result,
-        });
-      }
-      // ストリーム再開をリクエスト
-      await childManager.sendRequest(accountId, {
-        type: 'resume_stream',
-        sessionId,
-      });
-    } else {
-      // 通常の新規リクエストを送信
-      const promptRequest: ParentMessage = {
-        type: 'request',
-        id: `req-${Date.now()}`,
-        sessionId,
-        system: extractSystemPrompt(body.system),
-        messages: body.messages,
-        model: mapModelName(body.model),
-        tools: body.tools,
-      };
-      await childManager.sendRequest(accountId, promptRequest);
-    }
+    const resolvedModel = mapModelName(body.model);
+    const stream = antigravityBackend.createMessageStream(sessionId, {
+      model: resolvedModel,
+      messages: body.messages,
+      system: body.system,
+      tools: body.tools,
+    });
 
     const allowedToolNames = body.tools?.map((t: any) => t.name) || [];
 
     if (body.stream) {
       setupSSEHeaders(res);
       await streamGeminiToClaudeSSE(stream, res, body.model, sessionId, sessionStore, allowedToolNames);
-
     } else {
       const contentBlocks: any[] = [];
       let currentText = '';
-      let turnEndUsage: { input_tokens: number; output_tokens: number } | undefined;
-      let webSearchRequests = 0;
-      let pendingCitations: any[] = [];
+      let turnEndUsage: any;
 
       const flushText = () => {
         if (currentText) {
-          const block: any = { type: 'text', text: currentText };
-          if (pendingCitations.length > 0) {
-            block.citations = pendingCitations.map(src => ({
-              type: 'web_search_result_location',
-              url: src.url,
-              title: src.title,
-              encrypted_index: src.encrypted_content,
-              cited_text: currentText.slice(0, 150),
-            }));
-          }
-          contentBlocks.push(block);
+          contentBlocks.push({ type: 'text', text: currentText });
           currentText = '';
         }
       };
@@ -343,26 +159,6 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
               input: msg.args
             });
           }
-        } else if (msg.type === 'server_tool_call') {
-            flushText();
-            webSearchRequests++;
-            contentBlocks.push({
-              type: 'server_tool_use',
-              id: msg.callId,
-              name: msg.name,
-              input: msg.args
-            });
-        } else if (msg.type === 'server_tool_result') {
-            flushText();
-            contentBlocks.push({
-              type: 'web_search_tool_result',
-              tool_use_id: msg.callId,
-              content: msg.result
-            });
-            // 複数回検索時に過去のソースが消えないよう concat で累積する（stream.ts と同一の挙動）
-            if (Array.isArray(msg.result)) {
-              pendingCitations = pendingCitations.concat(msg.result);
-            }
         } else if (msg.type === 'error' || msg.type === 'fatal_error') {
           throw new GeminiApiError(msg.message, 'status' in msg ? msg.status : undefined);
         } else if (msg.type === 'turn_end') {
@@ -376,7 +172,6 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
         contentBlocks,
         model: body.model,
         usage: turnEndUsage,
-        webSearchRequests,
       });
 
       res.json(claudeResponse);
