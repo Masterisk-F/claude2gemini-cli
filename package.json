@@ -13,7 +13,7 @@
     "test": "vitest run --config ./vitest.config.ts"
   },
   "dependencies": {
-    "antigravity-client": "github:Masterisk-F/antigravity-client#feature/linux-support",
+    "antigravity-client": "file:./antigravity-client",
     "express": "^5.1.0",
     "zod": "^3.23.8"
   },

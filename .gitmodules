@@ -1,0 +1,4 @@
+[submodule "antigravity-client"]
+	path = antigravity-client
+	url = https://github.com/Masterisk-F/antigravity-client.git
+	branch = feature/linux-support
