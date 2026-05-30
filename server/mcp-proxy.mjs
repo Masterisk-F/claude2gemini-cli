@@ -55,7 +55,7 @@ if (!hubPort || Number.isNaN(hubPort)) {
 }
 
 const HUB_BASE = `http://127.0.0.1:${hubPort}`;
-const CALL_TIMEOUT_MS = 300_000; // 5 minutes
+const CALL_TIMEOUT_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 // ── Output ─────────────────────────────────────────────────────────────────
 

@@ -175,7 +175,7 @@ export class McpHub extends EventEmitter {
           this.pending.delete(callId);
           res.writeHead(504);
           res.end(JSON.stringify({ error: { code: -32001, message: 'tool call timed out' } }));
-        }, 300_000); // 5 min
+        }, 24 * 60 * 60 * 1000); // 24 hours
 
         this.pending.set(callId, {
           callId,
