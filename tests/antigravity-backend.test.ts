@@ -12,6 +12,13 @@ function makePlannerStep(text: string): any {
   };
 }
 
+/**
+ * Delay helper for yielding to the event loop so poll loops can progress.
+ */
+function tick(): Promise<void> {
+  return new Promise((r) => setTimeout(r, 10));
+}
+
 vi.mock('antigravity-client', () => {
   class MockCascade {
     cascadeId = 'cascade-test-1';
@@ -22,25 +29,37 @@ vi.mock('antigravity-client', () => {
     on = vi.fn().mockReturnThis();
     off = vi.fn().mockReturnThis();
     emit = vi.fn();
-    /** Simulates LS adding a plannerResponse step after a message round-trip. */
-    waitForTurnComplete = vi.fn().mockImplementation(async () => {
-      this.state.trajectory.steps.push(makePlannerStep('Hello! I am an AI assistant.'));
-      this.state.status = 4; // IDLE
-    });
+    // waitForTurnComplete is no longer used by the new code, but kept for compat
+    waitForTurnComplete = vi.fn().mockResolvedValue(undefined);
     state: any = {
-      status: 1, // RUNNING
+      status: 2, // RUNNING (= CascadeRunStatus.RUNNING)
       trajectory: { steps: [] },
     };
   }
 
   const cascadeInstance = new MockCascade();
+
+  // Helper: after sendUserCascadeMessage is called, transition to IDLE
+  // and add a plannerResponse step so collectTextFromSteps works.
+  const setCascadeIdle = vi.fn(() => {
+    cascadeInstance.state.status = 1; // IDLE (= CascadeRunStatus.IDLE)
+    cascadeInstance.state.trajectory.steps.push(makePlannerStep('Hello! I am an AI assistant.'));
+  });
+
   const mockClient = {
     startCascade: vi.fn().mockResolvedValue(cascadeInstance),
     getCascade: vi.fn().mockReturnValue(cascadeInstance),
     dispose: vi.fn(),
     resolveModelId: vi.fn().mockResolvedValue(42),
     lsClient: {
-      sendUserCascadeMessage: vi.fn().mockResolvedValue({}),
+      sendUserCascadeMessage: vi.fn().mockImplementation(async () => {
+        // Simulate LS processing: cascade becomes idle after receiving message
+        setCascadeIdle();
+      }),
+      createCustomizationFile: vi.fn().mockResolvedValue({
+        filePath: '/tmp/claude2gemini-mcp-proxy.mcp.json',
+      }),
+      refreshMcpServers: vi.fn().mockResolvedValue({}),
     },
   };
 
@@ -60,9 +79,11 @@ describe('AntigravityBackend', () => {
     const backend = new AntigravityBackend();
     await backend.initialize();
     expect(backend).toBeDefined();
+    // McpHub should have started
+    expect(backend.mcpHub.port).toBeGreaterThan(0);
   });
 
-  it('should stream text response via cascade.run()', async () => {
+  it('should stream text response via createMessageStream', async () => {
     const backend = new AntigravityBackend();
     await backend.initialize();
 
@@ -80,6 +101,10 @@ describe('AntigravityBackend', () => {
     const streamEvent = events.find((e: any) => e.type === 'stream_event');
     expect(streamEvent).toBeDefined();
     expect(streamEvent.event.value).toContain('AI assistant');
+
+    const turnEnd = events.find((e: any) => e.type === 'turn_end');
+    expect(turnEnd).toBeDefined();
+    expect(turnEnd.stopReason).toBe('end_turn');
   });
 
   it('should handle GeminApiError', () => {

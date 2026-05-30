@@ -5,9 +5,9 @@
 Claude2Gemini-CLI is a translation proxy that bridges two fundamentally different API paradigms:
 
 - **Claude Messages API** — Stateless, request/response model. Every HTTP request contains the full conversation history.
-- **Gemini CLI SDK** — Stateful agent loop. A single `sendStream()` call runs an internal loop that automatically handles tool execution via callbacks.
+- **Antigravity Language Server (LS) / Cascades** — Stateful agent loop managed via Connect gRPC. A Cascade runs an internal agent loop that invokes tools.
 
-Historically, the proxy ran the Gemini CLI SDK in-process. However, the SDK uses a global module-level cache for authentication clients. To safely support multiple accounts operating concurrently, the proxy now uses a **Parent/Child Process Isolation** architecture.
+Historically, the proxy ran the Gemini CLI SDK in-process via multiple child processes. The architecture has since been simplified to a **Single-Process** design. The proxy now directly interfaces with the **Antigravity Language Server** (a Go-based subprocess managed by `antigravity-client`) and delegates tool execution back to the external client using an **MCP Proxy & Hub** mechanism.
 
 ---
 
@@ -15,26 +15,22 @@ Historically, the proxy ran the Gemini CLI SDK in-process. However, the SDK uses
 
 ```mermaid
 flowchart TD
-    subgraph Parent_Process ["Parent Process (Express Server)"]
-        A[POST /v1/messages] --> B[messages.ts]
-        B -->|Round-Robin| C[AccountPool]
-        B -->|Session Routing| D[SessionStore]
-        B --> E[ChildManager]
-        E -->|UNIX Socket| F[IPC stream / SSE conversion]
+    subgraph Express_Server ["Express Server Process"]
+        A[POST /v1/messages] --> B["routes/messages.ts"]
+        B -->|1. setTools| C[McpHub]
+        B -->|2. createMessageStream| D[AntigravityBackend]
     end
 
-    subgraph Child_Processes ["Child Processes (Node.js Workers)"]
-        G[ChildWorker Account A]
-        H[ChildWorker Account B]
-        
-        G -.->|SDK instance| G1[GeminiCliAgent]
-        H -.->|SDK instance| H1[GeminiCliAgent]
+    subgraph Client_Bridge ["Client Bridge & Hub"]
+        C <.->|HTTP GET & POST /call| F[mcp-proxy.mjs]
+        B -->|3. resolveCall| C
     end
-    
-    E == NDJSON IPC ==> G
-    E == NDJSON IPC ==> H
-    G1 -.->|Network| I[Google Gemini API]
-    H1 -.->|Network| I
+
+    subgraph LS_Layer ["Language Server Layer"]
+        D -->|AntigravityClient.launch| E[Antigravity Language Server]
+        E -->|stdio JSON-RPC| F
+        E <-->|Network| G[Google Gemini API]
+    end
 ```
 
 ---
@@ -43,136 +39,104 @@ flowchart TD
 
 ### `server/index.ts`
 
-Express application entry point. Configures JSON body parsing (200MB limit for large conversation histories), registers the `/v1/messages` route, and initializes the `accountPool` and `childManager` upon startup.
+Express application entry point. Configures JSON body parsing (200MB limit for large conversation histories), registers the `/v1/messages` route, and initializes the `AntigravityBackend` upon startup.
 
-### `server/child-manager.ts`
+### `server/gemini-backend.ts`
 
-Manages the lifecycle of child worker processes.
-- Spawns a dedicated Node.js child process (`child-worker.ts`) for each configured account.
-- Connects to each worker via UNIX Domain Sockets.
-- Handles message routing (Parent ↔ Child) and auto-restarts workers if they crash.
+Manages the lifecycle of the Antigravity Language Server (LS) and provides the interface for sending prompts and handling Cascades.
+- Starts the `McpHub` HTTP server before launching the LS.
+- Launches the actual Antigravity Language Server via `AntigravityClient.launch`.
+- Writes `.mcp.json` to the workspace root and registers the proxy server on startup using the LS `refreshMcpServers` RPC.
+- Converts request tools via `McpHub.setTools` and schedules the first synchronization check.
+- Extracts the latest `user` message as the main prompt, merging subsequent contexts (like Git statuses or custom system hooks) at the beginning of the message stream inside `=== SYSTEM CONTEXT ===` block tags.
 
-### `server/child-worker.ts`
+### `server/mcp-hub.ts`
 
-The isolated execution boundary for the Gemini CLI SDK.
-- Restricts `process.env.GEMINI_CLI_HOME` to a specific temporary account directory.
-- Runs a UNIX socket server to receive instructions (NDJSON) from the Parent process.
-- Instantiates `GeminiCliAgent`, executes SDK flows, and intercepts `ServerGeminiStreamEvent`.
-- Forwards output chunks, tool requests, and errors back to the Parent process. It also tracks token usage (including Prompt Caching) with a fallback mechanism that queries internal SDK services (`ChatRecordingService` and `GeminiChat`) to ensure metrics are captured even if stream chunks lack metadata.
+An internal, lightweight HTTP server that acts as a bridge between the external client (which provides tool definitions and executes them) and the LS.
+- **`GET /tools`**: Exposes registered tools formatted in the MCP `tools/list` schema.
+- **`POST /call`**: Receives tool execution requests from the LS (via `mcp-proxy.mjs`). It **holds the HTTP response** (blocks via Promise) until the client provides the result.
+- **`POST /resolve`**: Receives the execution results from the external client and resolves the blocked `/call` request.
 
-### `server/ipc-protocol.ts`
+### `server/mcp-proxy.mjs`
 
-Defines TypeScript interfaces for NDJSON communication between Parent and Child processes.
-- **ParentMessage**: `request`, `tool_result`, `resume_stream`
-- **ChildMessage**: `stream_event`, `tool_call`, `turn_end`, `error`, `fatal_error`, `ready`, `model_info`
+A Node.js script spawned directly as a subprocess of the Antigravity Language Server.
+- Acts as a stdio-to-HTTP translator, communicating with the LS via line-delimited JSON-RPC (stdio) and forwarding requests to `McpHub` (HTTP).
+- Handles the MCP `initialize` handshake, `tools/list` routing, and `tools/call` routing.
+- Runs an internal 1-second polling timer checking `/tools` of `McpHub` for updates. If a modification is detected, it pushes a `notifications/tools/list_changed` JSON-RPC notification to the LS, triggering a tool re-sync without restarting the process.
 
 ### `server/routes/messages.ts`
 
-The core request handler for `POST /v1/messages`. Responsibilities:
-1. **Request validation** — Checks `messages`, `max_tokens`, and `model` fields
-2. **Tool result routing** — Inspects the last message for `tool_result` blocks. Lookups pending tool calls in `SessionStore` and forwards results via `ChildManager`.
-3. **Session resume** — Sends a `resume_stream` IPC message to instruct the Child Worker to continue consumption of an active SDK stream.
-4. **Response dispatch** — Consumes `ChildMessage` streams and routes to formatting functions.
-5. **Error handling** — Returns Claude-compatible error responses.
+The core request handler for `POST /v1/messages`.
+- Maps incoming model names (e.g. `sonnet` or `opus`) to corresponding Gemini equivalents.
+- Intercepts incoming messages for `tool_result` blocks. If present, it resolves the pending call in `McpHub` via `resolveCall`, allowing the blocked Cascade step to proceed.
+- Consumes the `AntigravityBackend.createMessageStream` stream and converts events into Claude-compatible SSE events in real-time.
 
 ### `server/session-store.ts`
 
-Lightweight state management for the Parent process:
-- Directs clients back to the correct child worker by maintaining a map of `sessionId → accountId`.
-- Resolves stateless tool results to their original sessions via a reverse index: `toolCallId → sessionId`.
-
-### `server/converters/request.ts`
-
-Converts Claude message arrays into Gemini prompt strings:
-- **Role-labeled conversation text** (`User: ...`, `Assistant: ...`)
-- **Tool blocks** → Text representations (`[Tool Call: ...]`)
-- **Multimodal blocks** → For `image` and `document` blocks, the proxy converts them into Gemini's native `inlineData` format within `ConvertedPrompt.inlineDataParts`. The `child-worker.ts` patches the SDK's `sendMessageStream` method to inject these `inlineData` parts into the first request of the stream, allowing the model to process them without any temporary file I/O or tool-based file reads.
-- **Model name mapping** — Converts Claude model names to Gemini equivalents (e.g. sonnet → `gemini-3-flash-preview`)
+Tracks active tool calls to mapping IDs, helping target stateless `tool_result` blocks back to the correct session and Cascade.
 
 ### `server/converters/stream.ts`
 
-Transforms NDJSON IPC events emitted by `ChildWorker` into standard Claude SSE events in real-time:
+Transforms NDJSON events emitted by `AntigravityBackend` into standard Claude SSE events:
 
 ```
-IPC Event (ChildMessage)             Claude SSE Event Flow
-────────────────────────             ─────────────────────
-                                     event: message_start
-stream_event (content)   ──────►     event: content_block_start (text)
-                                     event: content_block_delta (text_delta)
-                                     event: content_block_stop
+Bridge Message Event                  Claude SSE Event Flow
+────────────────────                  ─────────────────────
+                                      event: message_start
+stream_event (content)   ──────►      event: content_block_start (text)
+                                      event: content_block_delta (text_delta)
+                                      event: content_block_stop
 
-tool_call                ──────►     event: content_block_start (tool_use)
-                                     event: content_block_delta (input_json_delta)
-                                     event: content_block_stop
+tool_call                ──────►      event: content_block_start (tool_use)
+                                      event: content_block_delta (input_json_delta)
+                                      event: content_block_stop
 
-turn_end                 ──────►     event: message_delta (stop_reason)
-                                     event: message_stop
+turn_end                 ──────►      event: message_delta (stop_reason)
+                                      event: message_stop
 ```
-
-To combat race conditions, `stream.ts` implements a buffer layer within `getSessionStream` that caches IPC messages arriving before the Parent has initiated `await new Promise(...)` pulling loops.
 
 ---
 
 ## Core Design: Tool Use and Process Bridging
 
-The most challenging aspect of this proxy is bridging the synchronous Claude tool paradigm with the stateful, callback-based SDK across a process boundary.
+The proxy bridges the stateless, synchronous Claude API paradigm with the stateful, subprocess-based Antigravity Cascade loop by delaying the response of MCP `tools/call`.
 
 ### Execution Flow
 
 ```mermaid
 sequenceDiagram
     participant C as Claude Client
-    participant P as Parent Router
-    participant Ch as Child Worker (account-A)
-    participant SDK as Gemini SDK
+    participant P as Proxy Router
+    participant Hub as McpHub (HTTP)
+    participant Proxy as mcp-proxy.mjs (stdio)
+    participant LS as Antigravity LS
     
     C->>P: POST /v1/messages {prompt, tools}
-    P->>P: Select account "A"
-    P->>Ch: IPC: { type: "request", prompt, ... }
+    P->>Hub: Register tools
+    P->>LS: Send Message via Cascade (MCP enabled)
     
-    Note over Ch,SDK: Child process isolation
-    Ch->>SDK: createAgent().sendStream()
+    LS->>Proxy: JSON-RPC tools/call {name: "get_weather", args}
+    Proxy->>Hub: POST /call
+    Note over Hub: Hold HTTP response<br/>(Promise pending)
     
-    loop Stream Output
-        SDK-->>Ch: Stream event (content)
-        Ch->>P: IPC: { type: "stream_event", ... }
-        P->>C: SSE content_block_delta
-    end
+    Hub-->>P: pending_call event
+    P-->>C: SSE tool_use block
+    P-->>C: SSE message_stop (stop_reason: tool_use)
     
-    SDK-->>Ch: tool_call_request
-    Ch->>P: IPC: { type: "tool_call", args: {...} }
-    P->>P: Register in SessionStore
-    P->>C: SSE tool_use block
-    
-    SDK-->>Ch: turn_end
-    Ch->>P: IPC: { type: "turn_end", stopReason: "tool_use" }
-    P->>C: SSE message_stop
-    
-    Note over Ch: Child Worker halts stream loop,<br>SDK Action Promise is pending
+    C->>C: Execute Tool Locally
     
     C->>P: POST /v1/messages {tool_result}
-    P->>P: Lookup SessionStore -> account "A"
-    P->>Ch: IPC: { type: "tool_result", result: "..." }
-    Note over Ch,SDK: SDK tool callback resolves
+    P->>Hub: resolveCall(tool_use_id, result)
+    Note over Hub: Resolve pending Promise
     
-    P->>Ch: IPC: { type: "resume_stream" }
-    Note over Ch: Child Worker resumes stream loop
-    
-    SDK-->>Ch: Next chunk / turn_end
-    Ch->>P: IPC: { type: "turn_end", stopReason: "end_turn" }
-    P->>C: SSE message_stop
+    Hub-->>Proxy: HTTP 200 {result}
+    Proxy-->>LS: JSON-RPC tools/call response
+    LS-->>P: Next chunks / Final response
+    P-->>C: SSE text_delta & message_stop
 ```
 
-### Multi-Account Concurrency & Isolation
-
-- **Bypassing Global Caches**: The Gemini CLI SDK uses file-system global config reads and cache modules per Node.js memory space. Previously, the proxy attempted to isolate these using an `AsyncLocalStorage` proxy over `process.env`.
-- **Absolute Process Separation**: Currently, every account gets its own fully-isolated Node.js `fork()`, ensuring the global Node.js module cache is 100% safe.
-- **Resilience**: If a Child Worker encounters an unexpected error or exits, `ChildManager` immediately reconstructs it, preventing process-level corruption from bleeding into other active accounts.
-
----
-
-## Limitations
-
-- **No conversation caching** — Gemini SDK manages its own conversation state; multi-turn history is flattened into prompt text
-- **In-memory sessions** — Parent sessions and Child streams are lost on proxy restart
-- **Single-node** — Designed for single-server execution; multiple proxies would require external session orchestration (e.g. Redis).
+### Advantages of the New Design
+- **Single-Process Simplicity**: No more complex socket management or round-robin process pools. The main Express application handles everything in a single process.
+- **LS Subprocess Isolation**: The Go-based language server process is launched cleanly as a subprocess.
+- **Dynamic Tool Changes**: The `notifications/tools/list_changed` polling implementation in the proxy enables hot-reloading tool specifications safely without needing to crash/SIGTERM the proxy connection, preventing socket EOF failures.
+- **Robust Message Context Ordering**: Places background parameters (like Git logs or environment states) explicitly in a `=== SYSTEM CONTEXT ===` block at the start of the message, leaving user prompts in a clean `=== USER INSTRUCTION ===` block, preserving model focus.

@@ -3,9 +3,6 @@
  *
  * Manages the lifecycle of the Antigravity Language Server (LS)
  * and provides a bridge between Claude API requests and Antigravity Cascades.
- *
- * NOTE: All Antigravity built-in tools are disabled when sending messages,
- * since this project delegates tool execution to its own MCP mechanism.
  */
 
 import { AntigravityClient, readAuthStatus } from 'antigravity-client';
@@ -21,7 +18,14 @@ import {
   NotebookEditToolConfig, AskQuestionToolConfig, ReadKnowledgeBaseItemToolConfig,
   WorkspaceAPIToolConfig, SuggestedResponseConfig,
 } from 'antigravity-client/dist/src/gen/exa/cortex_pb/cortex_pb.js';
-import { SendUserCascadeMessageRequest } from 'antigravity-client/dist/src/gen/exa/language_server_pb/language_server_pb.js';
+import {
+  SendUserCascadeMessageRequest,
+  RefreshMcpServersRequest,
+} from 'antigravity-client/dist/src/gen/exa/language_server_pb/language_server_pb.js';
+import { McpHub } from './mcp-hub.js';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { writeFile, mkdir, readFile } from 'node:fs/promises';
 import type { ClaudeMessage, ClaudeToolDefinition, BridgeMessage } from './types.js';
 
 export class GeminiApiError extends Error {
@@ -39,9 +43,24 @@ export class AntigravityBackend {
   private cascades = new Map<string, any>(); // sessionId -> Cascade
   /** Singleton: all tools disabled */
   private static disabledToolConfig: CascadeToolConfig | null = null;
+  /** MCP proxy hub (tool registry) */
+  public readonly mcpHub: McpHub = new McpHub();
+  private lastRegisteredToolsHash = '';
 
   async initialize(): Promise<void> {
     if (this.client) return;
+
+    // Start the MCP Hub first so we know the port before LS starts
+    try {
+      await this.mcpHub.start();
+      console.log(`[Backend] McpHub started on port ${this.mcpHub.port}`);
+    } catch (error) {
+      console.error('[Backend] Failed to start McpHub:', error);
+    }
+
+    // Write .mcp.json to workspace root BEFORE LS launches so it
+    // discovers the proxy on startup (avoids LS internal caching issues)
+    await this.#writeMcpConfigToWorkspace();
 
     console.log('[Backend] Launching Antigravity Language Server...');
     try {
@@ -54,15 +73,83 @@ export class AntigravityBackend {
       console.error('[Backend] Failed to launch Antigravity LS:', error);
       throw error;
     }
+
+    // Refresh MCP servers to ensure proxy is recognized
+    await this.#refreshMcpProxyOnLS();
   }
 
   /**
-   * Build a CascadeToolConfig that explicitly disables every tool Antigravity LS
-   * knows about. Tools that lack a `forceDisable` field are simply omitted from
-   * the config (the LS falls back to its internal defaults, which we cannot
-   * control from the client side).
+   * Write .mcp.json to the workspace root BEFORE LS starts, so the LS
+   * discovers the proxy on initialization. Also writes to gemini_dir
+   * after LS is up as a fallback.
    */
-  private static createDisabledToolConfig(): CascadeToolConfig {
+  async #writeMcpConfigToWorkspace(): Promise<void> {
+    try {
+      const workspaceMcpPath = join(process.cwd(), '.mcp.json');
+      const mcpConfig = {
+        mcpServers: {
+          'claude2gemini-mcp-proxy': {
+            command: process.execPath,
+            args: [
+              new URL('./mcp-proxy.mjs', import.meta.url).pathname,
+              '--hub-port',
+              String(this.mcpHub.port),
+            ],
+          }
+        }
+      };
+      await writeFile(workspaceMcpPath, JSON.stringify(mcpConfig, null, 2), 'utf-8');
+      console.log(`[Backend] MCP spec written to ${workspaceMcpPath}`);
+    } catch (error) {
+      console.warn('[Backend] Failed to write workspace .mcp.json:', error);
+    }
+  }
+
+  /**
+   * After LS is running, write mcp_config.json to gemini_dir and call
+   * refreshMcpServers so the LS discovers the proxy subprocess.
+   */
+  async #refreshMcpProxyOnLS(): Promise<void> {
+    if (!this.client) return;
+
+    const workspaceId = this.client.launcher?.workspaceId;
+    if (workspaceId) {
+      const geminiDir = join(tmpdir(), `gemini_${workspaceId}`);
+      const configDir = join(geminiDir, 'config');
+      const mcpConfigPath = join(configDir, 'mcp_config.json');
+      try {
+        await mkdir(configDir, { recursive: true });
+        const mcpConfig = {
+          mcpServers: {
+            'claude2gemini-mcp-proxy': {
+              command: process.execPath,
+              args: [
+                new URL('./mcp-proxy.mjs', import.meta.url).pathname,
+                '--hub-port',
+                String(this.mcpHub.port),
+              ],
+            }
+          }
+        };
+        await writeFile(mcpConfigPath, JSON.stringify(mcpConfig, null, 2), 'utf-8');
+      } catch { /* best-effort */ }
+    }
+
+    try {
+      await this.client.lsClient.refreshMcpServers(
+        new RefreshMcpServersRequest({ shallow: false, serverName: 'claude2gemini-mcp-proxy' }),
+      );
+      console.log('[Backend] MCP proxy registered with LS (refreshMcpServers OK)');
+    } catch (error: any) {
+      console.warn('[Backend] refreshMcpServers failed:', error);
+    }
+  }
+
+  /**
+   * Build a CascadeToolConfig that disables every built-in Antigravity tool
+   * EXCEPT MCP, which is needed for the proxy-based tool execution flow.
+   */
+  private static createToolConfig(): CascadeToolConfig {
     if (AntigravityBackend.disabledToolConfig) {
       return AntigravityBackend.disabledToolConfig;
     }
@@ -71,7 +158,8 @@ export class AntigravityBackend {
       runCommand:  new RunCommandToolConfig({ forceDisable: true }),
       searchWeb:   new SearchWebToolConfig({ forceDisable: true }),
       memory:      new MemoryToolConfig({ forceDisable: true }),
-      mcp:         new McpToolConfig({ forceDisable: true }),
+      // MCP is ENABLED for our proxy-based tool delegation
+      mcp:         new McpToolConfig({ forceDisable: false, maxOutputBytes: 1_000_000 }),
       mquery:      new MqueryToolConfig({ forceDisable: true }),
       find:        new FindToolConfig({ forceDisable: true }),
       generateImage: new GenerateImageToolConfig({ forceDisable: true }),
@@ -92,19 +180,15 @@ export class AntigravityBackend {
   }
 
   /**
-   * Send a message directly via sendUserCascadeMessage with all tools disabled,
-   * bypassing Cascade.sendMessage() which has no toolConfig injection point.
-   *
-   * After calling this, wait for the cascade to finish with
-   * `cascade.waitForTurnComplete()` and collect text from `cascade.state`.
+   * Send a message via sendUserCascadeMessage with our selective tool config.
    */
-  private async sendMessageWithDisabledTools(
+  private async sendMessage(
     cascade: any,
     text: string,
     modelName: string,
     apiKey: string,
   ): Promise<void> {
-    const toolConfig = AntigravityBackend.createDisabledToolConfig();
+    const toolConfig = AntigravityBackend.createToolConfig();
 
     const metadata = new Metadata({
       apiKey,
@@ -164,12 +248,48 @@ export class AntigravityBackend {
   }
 
   /**
+   * Wait for the next turn to complete OR a tool call to arrive, whichever
+   * happens first. Uses the Cascade's event-driven waitForTurnComplete()
+   * raced against an McpHub event notification.
+   */
+  private async waitForTurnOrToolCall(
+    cascade: any,
+    timeoutMs = 120_000,
+  ): Promise<'idle' | 'tool_call'> {
+    // If a tool call is already pending, return immediately
+    if (this.mcpHub.hasPendingCalls()) return 'tool_call';
+
+    return new Promise<'idle' | 'tool_call'>((resolve) => {
+      let settled = false;
+
+      // Listen for McpHub tool call events
+      const onPending = () => {
+        if (!settled) { settled = true; cleanup(); resolve('tool_call'); }
+      };
+      this.mcpHub.on('pending_call', onPending);
+
+      // Use the cascade's event-driven idle waiter
+      cascade.waitForTurnComplete({ timeoutMs })
+        .then(() => {
+          if (!settled) { settled = true; cleanup(); resolve('idle'); }
+        })
+        .catch(() => {
+          if (!settled) { settled = true; cleanup(); resolve('idle'); }
+        });
+
+      const cleanup = () => {
+        this.mcpHub.off('pending_call', onPending);
+      };
+    });
+  }
+
+  /**
    * Creates an asynchronous stream of bridge messages for a given session.
    *
-   * Unlike cascade.run(), this sends the message via sendUserCascadeMessage
-   * directly so we can inject a CascadeToolConfig that disables all built-in
-   * Antigravity tools. Text is collected from cascade.state after the turn
-   * completes.
+   * Tools from the request are registered with McpHub so the LS can discover
+   * them via the MCP proxy. Tool calls from the LS are forwarded to the
+   * external client as tool_use bridge messages — execution happens in the
+   * client, and results come back in a subsequent request.
    */
   async *createMessageStream(
     sessionId: string,
@@ -182,8 +302,20 @@ export class AntigravityBackend {
   ): AsyncGenerator<BridgeMessage> {
     if (!this.client) await this.initialize();
 
-    const { messages } = request;
-    const lastMessage = messages[messages.length - 1];
+    const { messages, tools } = request;
+    
+    // Find the last user message in the messages chain
+    let lastUserMsgIdx = -1;
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === 'user') {
+        lastUserMsgIdx = i;
+        break;
+      }
+    }
+    const lastUserMessage = lastUserMsgIdx !== -1 ? messages[lastUserMsgIdx] : null;
+    if (!lastUserMessage) {
+      throw new Error('No user message found in request');
+    }
 
     let cascade = this.cascades.get(sessionId);
 
@@ -191,75 +323,123 @@ export class AntigravityBackend {
       cascade = await this.client!.startCascade();
       this.cascades.set(sessionId, cascade);
       console.log(`[Backend] New cascade created: ${cascade.cascadeId}`);
+
+      // Auto-approve any interactive prompts from the LS (permissions, commands)
+      cascade.on('interaction', (event: any) => {
+        if (event.needsApproval) {
+          console.log(`[Backend] Auto-approving cascade interaction: index=${event.stepIndex}, cmd=${event.commandLine || 'none'}`);
+          event.approve('once').catch((err: any) => {
+            console.error('[Backend] Auto-approve failed:', err);
+          });
+        }
+      });
     }
 
-    // Resolve API key for Metadata (same logic as antigravity-client internals)
+    // Register tools from the request with McpHub (for MCP tools/list)
+    if (tools && tools.length > 0) {
+      this.mcpHub.setTools(tools);
+      const toolsHash = JSON.stringify(tools);
+      if (this.lastRegisteredToolsHash !== toolsHash) {
+        this.lastRegisteredToolsHash = toolsHash;
+        // Refresh MCP servers so LS re-reads the tool list and writes JSON definitions
+        await this.#refreshMcpProxyOnLS();
+      }
+    }
+
+    // Resolve API key for Metadata
     const apiKey = process.env.ANTIGRAVITY_API_KEY || readAuthStatus()?.apiKey || '';
 
     try {
       const isToolResult =
-        lastMessage.role === 'user' &&
-        Array.isArray(lastMessage.content) &&
-        lastMessage.content.some((b: any) => b.type === 'tool_result');
+        lastUserMessage.role === 'user' &&
+        Array.isArray(lastUserMessage.content) &&
+        lastUserMessage.content.some((b: any) => b.type === 'tool_result');
 
-      let text: string;
+      // ── Tool result continuation ──────────────────────────────
       if (isToolResult) {
-        text = (lastMessage.content as any[])
-          .filter((b: any) => b.type === 'text')
-          .map((b: any) => b.text)
-          .join('\n');
-        if (!text.trim()) {
-          // Pure tool_result – nothing to send
-          yield { type: 'stream_event', sessionId, event: { type: 'content', value: '' } };
+        const toolResultBlock = (lastUserMessage.content as any[]).find(
+          (b: any) => b.type === 'tool_result',
+        );
+        if (toolResultBlock) {
+          const { tool_use_id, content, is_error } = toolResultBlock;
+          const mcpResult = {
+            content: [{
+              type: 'text',
+              text: typeof content === 'string' ? content : JSON.stringify(content),
+            }],
+            isError: !!is_error,
+          };
+          try {
+            await this.mcpHub.resolveCall(tool_use_id, mcpResult);
+          } catch {
+            // callId not in hub — first message in a new cascade, proceed
+          }
+        }
+
+        // Wait for the cascade to generate the next response (tool result processed).
+        const turnStartCount = cascade.state?.trajectory?.steps?.length ?? 0;
+        const turn = await this.waitForTurnOrToolCall(cascade);
+        if (turn === 'tool_call') {
+          for (const call of this.mcpHub.getPendingCalls()) {
+            yield { type: 'tool_call', sessionId, callId: call.callId, name: call.name, args: call.args };
+          }
+          yield { type: 'turn_end', sessionId, stopReason: 'tool_use' };
           return;
         }
-      } else {
-        text = typeof lastMessage.content === 'string'
-          ? lastMessage.content
-          : lastMessage.content.map((b: any) => b.text || '').filter(Boolean).join('\n');
+
+        // idle — collect text from new steps only
+        const collected = this.collectTextFromSteps(cascade, turnStartCount);
+        if (collected) {
+          yield { type: 'stream_event', sessionId, event: { type: 'content', value: collected } };
+        }
+        yield { type: 'turn_end', sessionId, stopReason: 'end_turn' };
+        return;
       }
 
-      console.log(`[Backend] Sending message with all tools disabled, text_length=${text.length}, model=${request.model}`);
+      // ── New message (user text, possibly with tools) ──────────
+      let userText = typeof lastUserMessage.content === 'string'
+        ? lastUserMessage.content
+        : lastUserMessage.content.map((b: any) => b.text || '').filter(Boolean).join('\n');
 
-      const startStepCount = cascade.state?.trajectory?.steps?.length ?? 0;
-
-      // Send via sendUserCascadeMessage with toolConfig that disables everything
-      await this.sendMessageWithDisabledTools(cascade, text, request.model, apiKey);
-
-      // Wait for the turn to complete
-      await cascade.waitForTurnComplete({ timeoutMs: 120000 });
-      console.log(`[Backend] Cascade turn complete`);
-
-      // Collect text from new steps since startStepCount
-      const collected = this.collectTextFromSteps(cascade, startStepCount);
-      if (collected) {
-        yield { type: 'stream_event', sessionId, event: { type: 'content', value: collected } };
-      }
-
-      // Check for interactions – with all tools disabled, none should appear,
-      // but we handle the runCommand case just in case
-      const trajectory = cascade.state?.trajectory;
-      if (trajectory?.steps) {
-        for (const step of trajectory.steps) {
-          if (step.requestedInteraction?.interaction?.case === 'runCommand') {
-            const val = step.requestedInteraction.interaction.value as any;
-            const stepIndex = trajectory.steps.indexOf(step);
-            yield {
-              type: 'tool_call',
-              sessionId,
-              callId: `step_call_${stepIndex}`,
-              name: 'run_command',
-              args: { command: val.proposedCommandLine || val.commandLine || '' },
-            };
+      // Append any subsequent system or non-assistant messages as context
+      const extraContexts: string[] = [];
+      for (let i = lastUserMsgIdx + 1; i < messages.length; i++) {
+        const msg = messages[i];
+        if ((msg.role as string) === 'system' || msg.role === 'user') {
+          const contentText = typeof msg.content === 'string'
+            ? msg.content
+            : msg.content.map((b: any) => b.text || '').filter(Boolean).join('\n');
+          if (contentText) {
+            extraContexts.push(contentText);
           }
         }
       }
 
-      yield {
-        type: 'turn_end',
-        sessionId,
-        stopReason: 'end_turn',
-      };
+      const text = extraContexts.length > 0
+        ? `=== SYSTEM CONTEXT ===\n${extraContexts.join('\n')}\n======================\n\n=== USER INSTRUCTION ===\n${userText}`
+        : userText;
+
+      console.log(`[Backend] Sending message (MCP proxy enabled), text_length=${text.length}, model=${request.model}`);
+
+      const startStepCount = cascade.state?.trajectory?.steps?.length ?? 0;
+
+      await this.sendMessage(cascade, text, request.model, apiKey);
+      const turn = await this.waitForTurnOrToolCall(cascade);
+
+      if (turn === 'tool_call') {
+        for (const call of this.mcpHub.getPendingCalls()) {
+          yield { type: 'tool_call', sessionId, callId: call.callId, name: call.name, args: call.args };
+        }
+        yield { type: 'turn_end', sessionId, stopReason: 'tool_use' };
+        return;
+      }
+
+      // idle — collect text
+      const collected = this.collectTextFromSteps(cascade, startStepCount);
+      if (collected) {
+        yield { type: 'stream_event', sessionId, event: { type: 'content', value: collected } };
+      }
+      yield { type: 'turn_end', sessionId, stopReason: 'end_turn' };
     } catch (error) {
       console.error('[Backend] Stream error:', error);
       yield { type: 'error', sessionId, message: String(error) };
@@ -267,6 +447,11 @@ export class AntigravityBackend {
   }
 
   async shutdown(): Promise<void> {
+    try {
+      await this.mcpHub.stop();
+    } catch (e) {
+      console.error('[Backend] McpHub shutdown error:', e);
+    }
     if (this.client) {
       console.log('[Backend] Shutting down Antigravity LS...');
       try {

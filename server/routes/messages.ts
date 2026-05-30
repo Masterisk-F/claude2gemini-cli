@@ -92,6 +92,15 @@ export function classifyError(error: unknown): { statusCode: number; errorType: 
 messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
   const body = req.body;
 
+  console.log(`[API] Received messages request. Model: ${body.model}, Stream: ${body.stream}`);
+  if (body.messages && Array.isArray(body.messages)) {
+    console.log(`[API] Messages chain:`, body.messages.map((m: any, idx: number) => `[${idx}] ${m.role} (len=${typeof m.content === 'string' ? m.content.length : JSON.stringify(m.content).length})`));
+    const lastMsg = body.messages[body.messages.length - 1];
+    if (lastMsg) {
+      console.log(`[API] Last message content snippet:`, typeof lastMsg.content === 'string' ? lastMsg.content.slice(0, 200) : JSON.stringify(lastMsg.content).slice(0, 200));
+    }
+  }
+
   try {
     if (!body.messages || !Array.isArray(body.messages) || body.messages.length === 0) {
       res.status(400).json({ type: 'error', error: { type: 'invalid_request_error', message: 'messages are required' } });
