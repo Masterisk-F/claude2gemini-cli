@@ -18,7 +18,7 @@ function buildClaudeResponse({
 }: {
   contentBlocks: any[];
   model: string;
-  usage?: { input_tokens: number; output_tokens: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number };
+  usage?: { input_tokens: number; output_tokens: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number; context_window_estimated_tokens?: number };
 }) {
   if (contentBlocks.length === 0) {
     throw new Error('Gemini API returned an empty response');
@@ -33,6 +33,12 @@ function buildClaudeResponse({
   };
   if (usage?.cache_read_input_tokens !== undefined) {
     usageField.cache_read_input_tokens = usage.cache_read_input_tokens;
+  }
+  if (usage?.cache_creation_input_tokens !== undefined) {
+    usageField.cache_creation_input_tokens = usage.cache_creation_input_tokens;
+  }
+  if (usage?.context_window_estimated_tokens !== undefined) {
+    usageField.context_window_estimated_tokens = usage.context_window_estimated_tokens;
   }
 
   return {

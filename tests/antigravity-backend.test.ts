@@ -37,6 +37,29 @@ vi.mock('antigravity-client', () => {
     cascadeInstance.state.trajectory.steps.push(makePlannerStep('Hello! I am an AI assistant.'));
   });
 
+  const mockUsageResponse = {
+    generatorMetadata: [
+      {
+        metadata: {
+          case: 'chatModel',
+          value: {
+            usage: {
+              inputTokens: 42,
+              outputTokens: 128,
+              cacheReadTokens: 8,
+              cacheWriteTokens: 0,
+            },
+            chatStartMetadata: {
+              contextWindowMetadata: {
+                estimatedTokensUsed: 25000,
+              },
+            },
+          },
+        },
+      },
+    ],
+  };
+
   const mockClient = {
     startCascade: vi.fn().mockResolvedValue(cascadeInstance),
     getCascade: vi.fn().mockReturnValue(cascadeInstance),
@@ -52,6 +75,7 @@ vi.mock('antigravity-client', () => {
       refreshMcpServers: vi.fn().mockResolvedValue({}),
       revertToCascadeStep: vi.fn().mockResolvedValue({}),
       deleteCascadeTrajectory: vi.fn().mockResolvedValue({}),
+      getCascadeTrajectoryGeneratorMetadata: vi.fn().mockResolvedValue(mockUsageResponse),
     },
   };
 
@@ -307,5 +331,29 @@ describe('AntigravityBackend', () => {
     expect(sentText).toContain('FB 1');
     expect(sentText).toContain('Tool Use ID: fallback_2');
     expect(sentText).toContain('FB 2');
+  });
+
+  it('should return usage metadata from getCascadeTrajectoryGeneratorMetadata on turn_end', async () => {
+    const backend = new AntigravityBackend();
+    await backend.initialize();
+
+    const stream = backend.createMessageStream('session-usage-test', {
+      model: 'Gemini_3.5_Flash_High',
+      messages: [{ role: 'user', content: 'Hello' }],
+    });
+
+    const events: any[] = [];
+    for await (const event of stream) {
+      events.push(event);
+    }
+
+    const turnEnd = events.find((e: any) => e.type === 'turn_end');
+    expect(turnEnd).toBeDefined();
+    expect(turnEnd.usage).toBeDefined();
+    expect(turnEnd.usage.input_tokens).toBe(42);
+    expect(turnEnd.usage.output_tokens).toBe(128);
+    expect(turnEnd.usage.cache_read_input_tokens).toBe(8);
+    expect(turnEnd.usage.cache_creation_input_tokens).toBeUndefined(); // 0 → undefined
+    expect(turnEnd.usage.context_window_estimated_tokens).toBe(25000);
   });
 });

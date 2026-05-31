@@ -241,6 +241,7 @@ export async function streamGeminiToClaudeSSE(
             output_tokens: msg.usage?.output_tokens || 0,
             cache_read_input_tokens: msg.usage?.cache_read_input_tokens || 0,
             cache_creation_input_tokens: msg.usage?.cache_creation_input_tokens || 0,
+            ...(msg.usage?.context_window_estimated_tokens !== undefined ? { context_window_estimated_tokens: msg.usage.context_window_estimated_tokens } : {}),
             ...(webSearchRequests > 0 ? { server_tool_use: { web_search_requests: webSearchRequests } } : {}),
           },
         });

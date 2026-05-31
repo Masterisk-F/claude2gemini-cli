@@ -22,6 +22,7 @@ import {
   SendUserCascadeMessageRequest,
   RefreshMcpServersRequest,
   RevertToCascadeStepRequest,
+  GetCascadeTrajectoryGeneratorMetadataRequest,
 } from 'antigravity-client/dist/src/gen/exa/language_server_pb/language_server_pb.js';
 import { McpHub } from './mcp-hub.js';
 import { tmpdir } from 'node:os';
@@ -235,6 +236,61 @@ export class AntigravityBackend {
     });
 
     await this.client!.lsClient.sendUserCascadeMessage(req);
+  }
+
+  /**
+   * Fetch token usage statistics from the LS after a turn completes.
+   * Best-effort: returns undefined if the RPC fails or no metadata is available.
+   */
+  async #fetchUsage(cascade: any): Promise<{
+    input_tokens: number;
+    output_tokens: number;
+    cache_read_input_tokens?: number;
+    cache_creation_input_tokens?: number;
+    context_window_estimated_tokens?: number;
+  } | undefined> {
+    if (!this.client) return undefined;
+    try {
+      const resp = await this.client.lsClient.getCascadeTrajectoryGeneratorMetadata(
+        new GetCascadeTrajectoryGeneratorMetadataRequest({
+          cascadeId: cascade.cascadeId,
+        }),
+      );
+      const metas = resp.generatorMetadata;
+      if (!metas || metas.length === 0) return undefined;
+      // Use the last generator metadata entry (latest turn)
+      const last = metas[metas.length - 1];
+      // chatModel is inside a "metadata" oneof: { case: "chatModel", value: ChatModelMetadata }
+      const chatModel = last.metadata?.case === 'chatModel' ? last.metadata.value : undefined;
+      if (!chatModel?.usage) return undefined;
+      const usage = chatModel.usage;
+      const result: {
+        input_tokens: number;
+        output_tokens: number;
+        cache_read_input_tokens?: number;
+        cache_creation_input_tokens?: number;
+        context_window_estimated_tokens?: number;
+      } = {
+        input_tokens: Number(usage.inputTokens),
+        output_tokens: Number(usage.outputTokens),
+      };
+      if (Number(usage.cacheReadTokens) > 0) {
+        result.cache_read_input_tokens = Number(usage.cacheReadTokens);
+      }
+      if (Number(usage.cacheWriteTokens) > 0) {
+        result.cache_creation_input_tokens = Number(usage.cacheWriteTokens);
+      }
+      // Also prefer context_window_estimated_tokens from ChatStartMetadata if available
+      const ctxMeta = chatModel.chatStartMetadata?.contextWindowMetadata;
+      if (ctxMeta?.estimatedTokensUsed !== undefined &&
+          ctxMeta.estimatedTokensUsed !== null) {
+        result.context_window_estimated_tokens = Number(ctxMeta.estimatedTokensUsed);
+      }
+      return result;
+    } catch (e) {
+      console.warn('[Backend] Failed to fetch usage metadata (non-fatal):', e);
+      return undefined;
+    }
   }
 
   /**
@@ -522,7 +578,8 @@ export class AntigravityBackend {
           for (const call of this.mcpHub.getPendingCalls()) {
             yield { type: 'tool_call', sessionId, callId: call.callId, name: call.name, args: call.args };
           }
-          yield { type: 'turn_end', sessionId, stopReason: 'tool_use' };
+          const usage1 = await this.#fetchUsage(cascade);
+          yield { type: 'turn_end', sessionId, stopReason: 'tool_use', usage: usage1 };
           return;
         }
 
@@ -531,7 +588,8 @@ export class AntigravityBackend {
         if (collected) {
           yield { type: 'stream_event', sessionId, event: { type: 'content', value: collected } };
         }
-        yield { type: 'turn_end', sessionId, stopReason: 'end_turn' };
+        const usage1 = await this.#fetchUsage(cascade);
+        yield { type: 'turn_end', sessionId, stopReason: 'end_turn', usage: usage1 };
         return;
       }
 
@@ -587,7 +645,8 @@ export class AntigravityBackend {
         for (const call of this.mcpHub.getPendingCalls()) {
           yield { type: 'tool_call', sessionId, callId: call.callId, name: call.name, args: call.args };
         }
-        yield { type: 'turn_end', sessionId, stopReason: 'tool_use' };
+        const usage2 = await this.#fetchUsage(cascade);
+        yield { type: 'turn_end', sessionId, stopReason: 'tool_use', usage: usage2 };
         return;
       }
 
@@ -596,7 +655,8 @@ export class AntigravityBackend {
       if (collected) {
         yield { type: 'stream_event', sessionId, event: { type: 'content', value: collected } };
       }
-      yield { type: 'turn_end', sessionId, stopReason: 'end_turn' };
+      const usage2 = await this.#fetchUsage(cascade);
+      yield { type: 'turn_end', sessionId, stopReason: 'end_turn', usage: usage2 };
     } catch (error) {
       console.error('[Backend] Stream error:', error);
       yield { type: 'error', sessionId, message: String(error) };

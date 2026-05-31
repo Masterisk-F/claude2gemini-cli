@@ -65,7 +65,7 @@ describe('POST /', () => {
   it('returns successful response for a simple message', async () => {
     async function* mockStream() {
       yield { type: 'stream_event', event: { type: 'content', value: 'Hello' } };
-      yield { type: 'turn_end', usage: { input_tokens: 10, output_tokens: 5 } };
+      yield { type: 'turn_end', usage: { input_tokens: 10, output_tokens: 5, context_window_estimated_tokens: 30000 } };
     }
     (antigravityBackend.createMessageStream as any).mockReturnValue(mockStream());
 
@@ -81,5 +81,7 @@ describe('POST /', () => {
     expect(res.status).toBe(200);
     expect(res.body.content[0].text).toBe('Hello');
     expect(res.body.usage.input_tokens).toBe(10);
+    expect(res.body.usage.output_tokens).toBe(5);
+    expect(res.body.usage.context_window_estimated_tokens).toBe(30000);
   });
 });

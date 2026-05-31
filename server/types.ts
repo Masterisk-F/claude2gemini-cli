@@ -76,6 +76,7 @@ export type BridgeMessage =
             output_tokens: number;
             cache_read_input_tokens?: number;
             cache_creation_input_tokens?: number;
+            context_window_estimated_tokens?: number;
         };
     }
     | {
@@ -128,6 +129,8 @@ export interface ClaudeUsage {
   server_tool_use?: {
     web_search_requests: number;
   };
+  /** Antigravity LS から取得した推定期間中のコンテキストウィンドウ合計トークン数 */
+  context_window_estimated_tokens?: number;
 }
 
 export type ClaudeStopReason = 'end_turn' | 'max_tokens' | 'stop_sequence' | 'tool_use';
