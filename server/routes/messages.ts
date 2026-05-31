@@ -158,6 +158,7 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
     });
 
     const allowedToolNames = body.tools?.map((t: any) => t.name) || [];
+    console.log(`[API] Allowed tool names: ${JSON.stringify(allowedToolNames)}`);
 
     if (body.stream) {
       setupSSEHeaders(res);

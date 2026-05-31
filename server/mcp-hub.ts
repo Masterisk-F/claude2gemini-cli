@@ -42,6 +42,7 @@ export class McpHub extends EventEmitter {
   private tools: { name: string; description: string; inputSchema: any }[] = [];
   private pending = new Map<string, PendingEntry>();
   private running = false;
+  private originalSchemas = new Map<string, any>();
 
   constructor() {
     super();
@@ -85,11 +86,17 @@ export class McpHub extends EventEmitter {
    * Converts `input_schema` → `inputSchema` for MCP compatibility.
    */
   setTools(defs: { name: string; description?: string; input_schema?: any }[]): void {
-    this.tools = defs.map((d) => ({
-      name: d.name,
-      description: d.description ?? '',
-      inputSchema: d.input_schema ?? {},
-    }));
+    this.originalSchemas.clear();
+    this.tools = defs.map((d) => {
+      const name = d.name;
+      const originalSchema = d.input_schema ?? {};
+      this.originalSchemas.set(name, originalSchema);
+      return {
+        name,
+        description: d.description ?? '',
+        inputSchema: simplifySchema(originalSchema),
+      };
+    });
   }
 
   /** Return the set of currently registered tools in MCP tools/list format. */
@@ -176,11 +183,21 @@ export class McpHub extends EventEmitter {
   #handleToolsCall(req: http.IncomingMessage, res: http.ServerResponse): void {
     this.#readBody(req)
       .then((data) => {
-        const { name, arguments: args } = data;
+        let { name, arguments: args } = data;
         if (!name || typeof name !== 'string') {
           res.writeHead(400);
           res.end(JSON.stringify({ error: { code: -32602, message: 'missing or invalid tool name' } }));
           return;
+        }
+
+        // Unpack metadata tool calls like call_mcp_tool
+        const unpacked = unpackMetaCall(name, args ?? {});
+        name = unpacked.name;
+        args = unpacked.args;
+
+        const originalSchema = this.originalSchemas.get(name);
+        if (originalSchema) {
+          args = cleanAndFixArguments(args ?? {}, originalSchema);
         }
 
         const callId = `call_${randomUUID().replace(/-/g, '').slice(0, 16)}`;
@@ -206,7 +223,7 @@ export class McpHub extends EventEmitter {
         });
 
         // Log the pending call and notify listeners
-        process.stderr.write(`[McpHub] Pending tool call: ${name} (${callId})\n`);
+        process.stderr.write(`[McpHub] Pending tool call: ${name} (${callId}) args: ${JSON.stringify(args)}\n`);
         this.emit('pending_call', { callId, name, args: args ?? {} });
       })
       .catch((err) => {
@@ -275,4 +292,226 @@ export class McpHub extends EventEmitter {
       req.on('error', reject);
     });
   }
+}
+
+/**
+ * Simplifies a JSON Schema to a cleaner subset that the Gemini/Antigravity LS
+ * model planner can easily understand.
+ */
+export function simplifySchema(schema: any): any {
+  if (!schema || typeof schema !== 'object') {
+    return schema;
+  }
+
+  // 1. Resolve anyOf or oneOf into a simpler model
+  if (schema.anyOf && Array.isArray(schema.anyOf)) {
+    const firstValid = schema.anyOf.find((s: any) => s && s.type !== 'null') || schema.anyOf[0];
+    if (firstValid) {
+      return simplifySchema({ ...schema, ...firstValid, anyOf: undefined });
+    }
+  }
+  if (schema.oneOf && Array.isArray(schema.oneOf)) {
+    const firstValid = schema.oneOf.find((s: any) => s && s.type !== 'null') || schema.oneOf[0];
+    if (firstValid) {
+      return simplifySchema({ ...schema, ...firstValid, oneOf: undefined });
+    }
+  }
+
+  // 2. Resolve allOf by merging all nested properties and required arrays
+  if (schema.allOf && Array.isArray(schema.allOf)) {
+    const merged: any = {
+      ...schema,
+      type: schema.type || 'object',
+      properties: { ...schema.properties },
+      required: [...(schema.required || [])]
+    };
+    for (const sub of schema.allOf) {
+      const simplifiedSub = simplifySchema(sub);
+      if (simplifiedSub.properties) {
+        merged.properties = { ...merged.properties, ...simplifiedSub.properties };
+      }
+      if (Array.isArray(simplifiedSub.required)) {
+        merged.required = Array.from(new Set([...merged.required, ...simplifiedSub.required]));
+      }
+      if (simplifiedSub.type && simplifiedSub.type !== 'object') {
+        merged.type = simplifiedSub.type;
+      }
+    }
+    delete merged.allOf;
+    return simplifySchema(merged);
+  }
+
+  // 3. Handle arrays
+  if (schema.type === 'array' || schema.items) {
+    const newSchema = { ...schema };
+    if (schema.items) {
+      newSchema.items = simplifySchema(schema.items);
+    }
+    return newSchema;
+  }
+
+  // 4. Handle objects
+  if (schema.type === 'object' || schema.properties) {
+    const newSchema = { ...schema, type: 'object' };
+    if (schema.properties) {
+      const newProps: any = {};
+      for (const [key, prop] of Object.entries(schema.properties)) {
+        newProps[key] = simplifySchema(prop);
+      }
+      newSchema.properties = newProps;
+    }
+    if ('additionalProperties' in newSchema) {
+      delete newSchema.additionalProperties;
+    }
+    return newSchema;
+  }
+
+  // 5. Handle multi-type array declarations like type: ['string', 'null']
+  if (Array.isArray(schema.type)) {
+    const newSchema = { ...schema };
+    const mainType = schema.type.find((t: string) => t !== 'null') || schema.type[0];
+    newSchema.type = mainType;
+    return newSchema;
+  }
+
+  return schema;
+}
+
+/**
+ * Cleanses and coerces arguments generated by LS to match the constraints
+ * defined in the original schema (e.g. types, required fields, and additionalProperties restriction).
+ */
+export function cleanAndFixArguments(args: any, schema: any): any {
+  if (!schema || typeof schema !== 'object') {
+    return args;
+  }
+  if (!args || typeof args !== 'object') {
+    return args;
+  }
+
+  let activeSchema = { ...schema };
+
+  // Resolve multi-schema options to find the best match based on keys
+  if (schema.anyOf && Array.isArray(schema.anyOf)) {
+    let bestSchema = schema.anyOf[0];
+    let maxMatches = -1;
+    for (const sub of schema.anyOf) {
+      if (sub && sub.properties) {
+        const matches = Object.keys(args).filter(k => k in sub.properties).length;
+        if (matches > maxMatches) {
+          maxMatches = matches;
+          bestSchema = sub;
+        }
+      }
+    }
+    activeSchema = { ...schema, ...bestSchema };
+  } else if (schema.oneOf && Array.isArray(schema.oneOf)) {
+    let bestSchema = schema.oneOf[0];
+    let maxMatches = -1;
+    for (const sub of schema.oneOf) {
+      if (sub && sub.properties) {
+        const matches = Object.keys(args).filter(k => k in sub.properties).length;
+        if (matches > maxMatches) {
+          maxMatches = matches;
+          bestSchema = sub;
+        }
+      }
+    }
+    activeSchema = { ...schema, ...bestSchema };
+  } else if (schema.allOf && Array.isArray(schema.allOf)) {
+    const mergedProperties = { ...schema.properties };
+    const mergedRequired = [...(schema.required || [])];
+    for (const sub of schema.allOf) {
+      if (sub.properties) {
+        Object.assign(mergedProperties, sub.properties);
+      }
+      if (Array.isArray(sub.required)) {
+        mergedRequired.push(...sub.required);
+      }
+    }
+    activeSchema = { ...schema, properties: mergedProperties, required: Array.from(new Set(mergedRequired)) };
+  }
+
+  const result: any = {};
+  const properties = activeSchema.properties || {};
+  const required = activeSchema.required || [];
+
+  // Copy defined properties, applying coercion
+  for (const [key, propSchema] of Object.entries(properties)) {
+    const value = args[key];
+    const expectedType = (propSchema as any).type;
+
+    if (value !== undefined) {
+      if (expectedType === 'integer' || expectedType === 'number') {
+        const numVal = Number(value);
+        result[key] = isNaN(numVal) ? value : numVal;
+      } else if (expectedType === 'boolean') {
+        if (typeof value === 'string') {
+          result[key] = value.toLowerCase() === 'true';
+        } else {
+          result[key] = Boolean(value);
+        }
+      } else if (expectedType === 'string') {
+        if (typeof value === 'object') {
+          result[key] = JSON.stringify(value);
+        } else {
+          result[key] = String(value);
+        }
+      } else if (expectedType === 'array' && Array.isArray(value)) {
+        const itemSchema = (propSchema as any).items;
+        if (itemSchema) {
+          result[key] = value.map(item => {
+            if (typeof item === 'object' && item !== null) {
+              return cleanAndFixArguments(item, itemSchema);
+            }
+            return item;
+          });
+        } else {
+          result[key] = value;
+        }
+      } else if (expectedType === 'object' && typeof value === 'object' && value !== null) {
+        result[key] = cleanAndFixArguments(value, propSchema);
+      } else {
+        result[key] = value;
+      }
+    } else {
+      // If default is defined, always apply it
+      if ((propSchema as any).default !== undefined) {
+        result[key] = (propSchema as any).default;
+      } else if (required.includes(key)) {
+        if (expectedType === 'integer' || expectedType === 'number') {
+          result[key] = 0;
+        } else if (expectedType === 'boolean') {
+          result[key] = false;
+        } else if (expectedType === 'string') {
+          result[key] = '';
+        } else if (expectedType === 'array') {
+          result[key] = [];
+        } else if (expectedType === 'object') {
+          result[key] = {};
+        } else {
+          result[key] = null;
+        }
+      }
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Unpacks metadata tool calls (e.g. call_mcp_tool) into their target tool name and arguments.
+ */
+export function unpackMetaCall(name: string, args: any): { name: string; args: any } {
+  if (name === 'call_mcp_tool' && args && typeof args === 'object') {
+    const toolName = args.ToolName || args.toolName;
+    const toolArgs = args.Arguments || args.arguments;
+    if (toolName && typeof toolName === 'string') {
+      return {
+        name: toolName,
+        args: toolArgs ?? {},
+      };
+    }
+  }
+  return { name, args };
 }

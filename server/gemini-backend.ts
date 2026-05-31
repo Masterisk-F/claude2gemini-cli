@@ -602,6 +602,11 @@ export class AntigravityBackend {
         Array.isArray(lastUserMessage.content) &&
         lastUserMessage.content.some((b: any) => b.type === 'tool_result');
 
+      // Clear pending calls from previous turns if this is a fresh user instruction
+      if (!isToolResult) {
+        this.mcpHub.clearPendingCalls('New user instruction received, clearing stale calls');
+      }
+
       const toolResultBlocks = isToolResult
         ? (lastUserMessage.content as any[]).filter((b: any) => b.type === 'tool_result')
         : [];
@@ -642,7 +647,16 @@ export class AntigravityBackend {
         }
 
         if (turn === 'tool_call') {
+          const allowedToolNames = request.tools?.map((t) => t.name) || [];
           for (const call of this.mcpHub.getPendingCalls()) {
+            if (allowedToolNames.length > 0 && !allowedToolNames.includes(call.name)) {
+              console.log(`[Backend] Rejecting disallowed tool call: ${call.name} (${call.callId})`);
+              this.mcpHub.resolveCall(call.callId, {
+                content: [{ type: 'text', text: `Error: Tool ${call.name} is not allowed or available in this context.` }],
+                isError: true,
+              }).catch(() => {});
+              continue;
+            }
             yield { type: 'tool_call', sessionId, callId: call.callId, name: call.name, args: call.args };
           }
           const usage1 = await this.#fetchUsage(cascade);
@@ -726,7 +740,16 @@ export class AntigravityBackend {
       }
 
       if (turn === 'tool_call') {
+        const allowedToolNames = request.tools?.map((t) => t.name) || [];
         for (const call of this.mcpHub.getPendingCalls()) {
+          if (allowedToolNames.length > 0 && !allowedToolNames.includes(call.name)) {
+            console.log(`[Backend] Rejecting disallowed tool call: ${call.name} (${call.callId})`);
+            this.mcpHub.resolveCall(call.callId, {
+              content: [{ type: 'text', text: `Error: Tool ${call.name} is not allowed or available in this context.` }],
+              isError: true,
+            }).catch(() => {});
+            continue;
+          }
           yield { type: 'tool_call', sessionId, callId: call.callId, name: call.name, args: call.args };
         }
         const usage2 = await this.#fetchUsage(cascade);
