@@ -480,25 +480,18 @@ export class AntigravityBackend {
         Array.isArray(lastUserMessage.content) &&
         lastUserMessage.content.some((b: any) => b.type === 'tool_result');
 
-      let isWaitingForThisTool = false;
-      let toolResultBlock: any = null;
+      const toolResultBlocks = isToolResult
+        ? (lastUserMessage.content as any[]).filter((b: any) => b.type === 'tool_result')
+        : [];
 
-      if (isToolResult) {
-        toolResultBlock = (lastUserMessage.content as any[]).find(
-          (b: any) => b.type === 'tool_result',
-        );
-        if (toolResultBlock) {
-          const { tool_use_id } = toolResultBlock;
-          isWaitingForThisTool = this.mcpHub.getPendingCalls().some(
-            (c) => c.callId === tool_use_id
-          );
-        }
-      }
+      const isWaitingForThisTool = toolResultBlocks.some((b) =>
+        this.mcpHub.getPendingCalls().some((c) => c.callId === b.tool_use_id)
+      );
 
       // ── Tool result continuation ──────────────────────────────
       if (isToolResult && isWaitingForThisTool) {
-        if (toolResultBlock) {
-          const { tool_use_id, content, is_error } = toolResultBlock;
+        for (const block of toolResultBlocks) {
+          const { tool_use_id, content, is_error } = block;
           const mcpResult = {
             content: [{
               type: 'text',
@@ -535,11 +528,13 @@ export class AntigravityBackend {
 
       // ── New message (user text, possibly with tools or tool fallback) ──────────
       let userText = '';
-      if (isToolResult && !isWaitingForThisTool && toolResultBlock) {
+      if (isToolResult && !isWaitingForThisTool && toolResultBlocks.length > 0) {
         // Fallback: tool result received but cascade is not waiting for it
-        const { tool_use_id, content, is_error } = toolResultBlock;
-        const contentText = typeof content === 'string' ? content : JSON.stringify(content);
-        userText = `=== TOOL RESULT ===\nTool Use ID: ${tool_use_id}\nIs Error: ${!!is_error}\nResult:\n${contentText}\n===================`;
+        userText = toolResultBlocks.map(b => {
+          const { tool_use_id, content, is_error } = b;
+          const contentText = typeof content === 'string' ? content : JSON.stringify(content);
+          return `=== TOOL RESULT ===\nTool Use ID: ${tool_use_id}\nIs Error: ${!!is_error}\nResult:\n${contentText}\n===================`;
+        }).join('\n\n');
       } else {
         userText = typeof lastUserMessage.content === 'string'
           ? lastUserMessage.content

@@ -229,4 +229,83 @@ describe('AntigravityBackend', () => {
     expect(sentText).toContain('Tool Use ID: call_abc123');
     expect(sentText).toContain('Mocked tool output success');
   });
+
+  it('should handle multiple simultaneous tool results', async () => {
+    const backend = new AntigravityBackend();
+    await backend.initialize();
+
+    const mockCascade = await (backend as any).client.startCascade();
+    mockCascade.state.trajectory.steps = [];
+
+    // Register two pending calls
+    backend.mcpHub.pending.set('call_1', {
+      callId: 'call_1',
+      name: 'tool_1',
+      args: {},
+      resolve: vi.fn(),
+      reject: vi.fn(),
+      timer: setTimeout(() => {}, 10000),
+    });
+    backend.mcpHub.pending.set('call_2', {
+      callId: 'call_2',
+      name: 'tool_2',
+      args: {},
+      resolve: vi.fn(),
+      reject: vi.fn(),
+      timer: setTimeout(() => {}, 10000),
+    });
+
+    const stream = backend.createMessageStream('session-multi-tool', {
+      model: 'Gemini_3.5_Flash_High',
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'call_1', content: 'Result 1' },
+            { type: 'tool_result', tool_use_id: 'call_2', content: 'Result 2' }
+          ]
+        }
+      ],
+    });
+
+    for await (const _ of stream) {}
+
+    expect(backend.mcpHub.pending.has('call_1')).toBe(false);
+    expect(backend.mcpHub.pending.has('call_2')).toBe(false);
+  });
+
+  it('should handle multiple tool result fallbacks', async () => {
+    const backend = new AntigravityBackend();
+    await backend.initialize();
+
+    const mockCascade = await (backend as any).client.startCascade();
+    mockCascade.state.trajectory.steps = [];
+
+    const sendSpy = vi.spyOn((backend as any).client.lsClient, 'sendUserCascadeMessage');
+
+    const stream = backend.createMessageStream('session-multi-fallback', {
+      model: 'Gemini_3.5_Flash_High',
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'fallback_1', content: 'FB 1' },
+            { type: 'tool_result', tool_use_id: 'fallback_2', content: 'FB 2' }
+          ]
+        }
+      ],
+    });
+
+    for await (const _ of stream) {}
+
+    expect(sendSpy).toHaveBeenCalled();
+    const lastCallReq = sendSpy.mock.calls[0][0] as any;
+    const sentText = lastCallReq.items[0].chunk.value;
+
+    expect(sentText).toContain('=== TOOL RESULT ===');
+    expect(sentText).toContain('Tool Use ID: fallback_1');
+    expect(sentText).toContain('FB 1');
+    expect(sentText).toContain('Tool Use ID: fallback_2');
+    expect(sentText).toContain('FB 2');
+  });
 });
