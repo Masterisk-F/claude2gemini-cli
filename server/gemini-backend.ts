@@ -458,6 +458,9 @@ export class AntigravityBackend {
           await this.client!.lsClient.revertToCascadeStep(req);
           cascadeUserTurns.splice(mismatchIdx);
         }
+
+        // Clear any pending MCP tool calls as they are no longer valid after a rewind
+        this.mcpHub.clearPendingCalls('Cascade history mismatch (rewind) cancelled this tool call');
       }
 
       // 5. Construct conversation history prefix for missing turns

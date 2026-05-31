@@ -128,6 +128,19 @@ export class McpHub extends EventEmitter {
     entry.resolve(result);
   }
 
+  /**
+   * Clear all pending tool calls and reject their associated HTTP requests.
+   * Useful when the cascade history is reverted and old tool calls are no longer valid.
+   * @param reason The error message to send to the proxy.
+   */
+  clearPendingCalls(reason: string = 'Pending calls cleared'): void {
+    for (const entry of this.pending.values()) {
+      clearTimeout(entry.timer);
+      entry.reject(new Error(reason));
+    }
+    this.pending.clear();
+  }
+
   // ── HTTP handlers ──
 
   #onRequest(req: http.IncomingMessage, res: http.ServerResponse): void {

@@ -165,6 +165,17 @@ describe('AntigravityBackend', () => {
 
     const revertSpy = vi.spyOn((backend as any).client.lsClient, 'revertToCascadeStep');
 
+    // Add a mock pending call to verify it gets cleared
+    backend.mcpHub.pending.set('mock_call_123', {
+      callId: 'mock_call_123',
+      name: 'some_tool',
+      args: {},
+      resolve: vi.fn(),
+      reject: vi.fn(),
+      timer: setTimeout(() => {}, 10000),
+    });
+    expect(backend.mcpHub.hasPendingCalls()).toBe(true);
+
     const stream = backend.createMessageStream('session-rewind', {
       model: 'Gemini_3.5_Flash_High',
       messages: [
@@ -179,6 +190,7 @@ describe('AntigravityBackend', () => {
     expect(revertSpy).toHaveBeenCalled();
     const lastCallReq = revertSpy.mock.calls[0][0] as any;
     expect(lastCallReq.stepIndex).toBe(1); // Q2 の直前である A1（ステップ 1）まで巻き戻す
+    expect(backend.mcpHub.hasPendingCalls()).toBe(false); // Pending call should be cleared
   });
 
   it('should fallback to plain text message when tool result is received but cascade is not waiting for tool', async () => {
