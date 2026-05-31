@@ -21,6 +21,7 @@ import {
 import {
   SendUserCascadeMessageRequest,
   RefreshMcpServersRequest,
+  RevertToCascadeStepRequest,
 } from 'antigravity-client/dist/src/gen/exa/language_server_pb/language_server_pb.js';
 import { McpHub } from './mcp-hub.js';
 import { tmpdir } from 'node:os';
@@ -350,16 +351,149 @@ export class AntigravityBackend {
     const apiKey = process.env.ANTIGRAVITY_API_KEY || readAuthStatus()?.apiKey || '';
 
     try {
+      // 1. Build client turns (excluding the current last message and tool results messages)
+      interface ClientTurn {
+        userText: string;
+        assistantText: string;
+      }
+      const clientTurns: ClientTurn[] = [];
+      let currentUserText = '';
+      for (let i = 0; i < messages.length - 1; i++) {
+        const msg = messages[i];
+        if (msg.role === 'user') {
+          const content = msg.content;
+          const isToolResult = Array.isArray(content) && content.every((b: any) => b.type === 'tool_result');
+          if (!isToolResult) {
+            currentUserText = typeof content === 'string'
+              ? content
+              : content.map((b: any) => b.text || '').filter(Boolean).join('\n');
+          }
+        } else if (msg.role === 'assistant' && currentUserText) {
+          const assistantText = typeof msg.content === 'string'
+            ? msg.content
+            : msg.content.map((b: any) => b.text || '').filter(Boolean).join('\n');
+          clientTurns.push({
+            userText: currentUserText,
+            assistantText: assistantText,
+          });
+          currentUserText = '';
+        }
+      }
+
+      // Helper function to extract user input text from step
+      const getUserInputText = (step: any): string => {
+        if (step?.step?.case === 'userInput') {
+          const value = step.step.value;
+          if (value.userResponse) return value.userResponse;
+          if (Array.isArray(value.items)) {
+            return value.items
+              .map((item: any) => item.chunk?.case === 'text' ? item.chunk.value : '')
+              .filter(Boolean)
+              .join('\n');
+          }
+        }
+        return '';
+      };
+
+      // 2. Build cascade user turns
+      const cascadeUserTurns: { stepIndex: number; text: string }[] = [];
+      const steps = cascade.state?.trajectory?.steps ?? [];
+      for (let i = 0; i < steps.length; i++) {
+        const step = steps[i];
+        if (step?.step?.case === 'userInput') {
+          const text = getUserInputText(step);
+          cascadeUserTurns.push({ stepIndex: i, text });
+        }
+      }
+
+      // 3. Detect first mismatch index
+      let mismatchIdx = -1;
+      const compareLen = Math.min(cascadeUserTurns.length, clientTurns.length);
+      for (let i = 0; i < compareLen; i++) {
+        const cascadeText = cascadeUserTurns[i].text;
+        const clientText = clientTurns[i].userText;
+        const normalizedCascade = cascadeText.replace(/\s+/g, '');
+        const normalizedClient = clientText.replace(/\s+/g, '');
+        if (!normalizedCascade.includes(normalizedClient) && !normalizedClient.includes(normalizedCascade)) {
+          mismatchIdx = i;
+          break;
+        }
+      }
+      if (mismatchIdx === -1 && cascadeUserTurns.length > clientTurns.length) {
+        mismatchIdx = clientTurns.length;
+      }
+
+      // 4. Revert or re-create cascade if mismatch is detected
+      if (mismatchIdx !== -1) {
+        const metadata = new Metadata({
+          apiKey,
+          ideName: 'vscode',
+          ideVersion: '1.107.0',
+          extensionName: 'antigravity',
+          extensionVersion: '0.2.0',
+        });
+
+        if (mismatchIdx === 0) {
+          console.log(`[Backend] History mismatch at turn 0. Re-creating cascade.`);
+          this.cascades.delete(sessionId);
+          cascade = await this.client!.startCascade();
+          this.cascades.set(sessionId, cascade);
+          cascade.on('interaction', (event: any) => {
+            if (event.needsApproval) {
+              console.log(`[Backend] Auto-approving cascade interaction: index=${event.stepIndex}, cmd=${event.commandLine || 'none'}`);
+              event.approve('once').catch((err: any) => {
+                console.error('[Backend] Auto-approve failed:', err);
+              });
+            }
+          });
+          cascadeUserTurns.splice(0);
+        } else {
+          const revertStepIndex = cascadeUserTurns[mismatchIdx].stepIndex - 1;
+          console.log(`[Backend] History mismatch at turn ${mismatchIdx}. Reverting cascade to step ${revertStepIndex}.`);
+          const req = new RevertToCascadeStepRequest({
+            cascadeId: cascade.cascadeId,
+            stepIndex: revertStepIndex,
+            metadata,
+          });
+          await this.client!.lsClient.revertToCascadeStep(req);
+          cascadeUserTurns.splice(mismatchIdx);
+        }
+      }
+
+      // 5. Construct conversation history prefix for missing turns
+      let historyPrefix = '';
+      const startFeedIdx = mismatchIdx !== -1 ? mismatchIdx : cascadeUserTurns.length;
+      if (startFeedIdx < clientTurns.length) {
+        historyPrefix += '=== CONVERSATION HISTORY ===\n';
+        for (let i = startFeedIdx; i < clientTurns.length; i++) {
+          historyPrefix += `User: ${clientTurns[i].userText}\n\nAssistant: ${clientTurns[i].assistantText}\n\n`;
+        }
+        historyPrefix += '============================\n\n';
+      }
+
+      // 6. Check if current message is a tool result and check for waiting state
       const isToolResult =
         lastUserMessage.role === 'user' &&
         Array.isArray(lastUserMessage.content) &&
         lastUserMessage.content.some((b: any) => b.type === 'tool_result');
 
-      // ── Tool result continuation ──────────────────────────────
+      let isWaitingForThisTool = false;
+      let toolResultBlock: any = null;
+
       if (isToolResult) {
-        const toolResultBlock = (lastUserMessage.content as any[]).find(
+        toolResultBlock = (lastUserMessage.content as any[]).find(
           (b: any) => b.type === 'tool_result',
         );
+        if (toolResultBlock) {
+          const { tool_use_id } = toolResultBlock;
+          isWaitingForThisTool = this.mcpHub.getPendingCalls().some(
+            (c) => c.callId === tool_use_id
+          );
+        }
+      }
+
+      // ── Tool result continuation ──────────────────────────────
+      if (isToolResult && isWaitingForThisTool) {
         if (toolResultBlock) {
           const { tool_use_id, content, is_error } = toolResultBlock;
           const mcpResult = {
@@ -396,10 +530,18 @@ export class AntigravityBackend {
         return;
       }
 
-      // ── New message (user text, possibly with tools) ──────────
-      let userText = typeof lastUserMessage.content === 'string'
-        ? lastUserMessage.content
-        : lastUserMessage.content.map((b: any) => b.text || '').filter(Boolean).join('\n');
+      // ── New message (user text, possibly with tools or tool fallback) ──────────
+      let userText = '';
+      if (isToolResult && !isWaitingForThisTool && toolResultBlock) {
+        // Fallback: tool result received but cascade is not waiting for it
+        const { tool_use_id, content, is_error } = toolResultBlock;
+        const contentText = typeof content === 'string' ? content : JSON.stringify(content);
+        userText = `=== TOOL RESULT ===\nTool Use ID: ${tool_use_id}\nIs Error: ${!!is_error}\nResult:\n${contentText}\n===================`;
+      } else {
+        userText = typeof lastUserMessage.content === 'string'
+          ? lastUserMessage.content
+          : lastUserMessage.content.map((b: any) => b.text || '').filter(Boolean).join('\n');
+      }
 
       // Append any subsequent system or non-assistant messages as context
       const extraContexts: string[] = [];
@@ -415,9 +557,14 @@ export class AntigravityBackend {
         }
       }
 
-      const text = extraContexts.length > 0
-        ? `=== SYSTEM CONTEXT ===\n${extraContexts.join('\n')}\n======================\n\n=== USER INSTRUCTION ===\n${userText}`
-        : userText;
+      let text = '';
+      if (historyPrefix) {
+        text += historyPrefix;
+      }
+      if (extraContexts.length > 0) {
+        text += `=== SYSTEM CONTEXT ===\n${extraContexts.join('\n')}\n======================\n\n`;
+      }
+      text += `=== USER INSTRUCTION ===\n${userText}`;
 
       console.log(`[Backend] Sending message (MCP proxy enabled), text_length=${text.length}, model=${request.model}`);
 

@@ -12,13 +12,6 @@ function makePlannerStep(text: string): any {
   };
 }
 
-/**
- * Delay helper for yielding to the event loop so poll loops can progress.
- */
-function tick(): Promise<void> {
-  return new Promise((r) => setTimeout(r, 10));
-}
-
 vi.mock('antigravity-client', () => {
   class MockCascade {
     cascadeId = 'cascade-test-1';
@@ -29,8 +22,8 @@ vi.mock('antigravity-client', () => {
     on = vi.fn().mockReturnThis();
     off = vi.fn().mockReturnThis();
     emit = vi.fn();
-    // waitForTurnComplete is no longer used by the new code, but kept for compat
     waitForTurnComplete = vi.fn().mockResolvedValue(undefined);
+    waitForTurnOrToolCall = vi.fn().mockResolvedValue('idle');
     state: any = {
       status: 2, // RUNNING (= CascadeRunStatus.RUNNING)
       trajectory: { steps: [] },
@@ -39,8 +32,6 @@ vi.mock('antigravity-client', () => {
 
   const cascadeInstance = new MockCascade();
 
-  // Helper: after sendUserCascadeMessage is called, transition to IDLE
-  // and add a plannerResponse step so collectTextFromSteps works.
   const setCascadeIdle = vi.fn(() => {
     cascadeInstance.state.status = 1; // IDLE (= CascadeRunStatus.IDLE)
     cascadeInstance.state.trajectory.steps.push(makePlannerStep('Hello! I am an AI assistant.'));
@@ -53,13 +44,14 @@ vi.mock('antigravity-client', () => {
     resolveModelId: vi.fn().mockResolvedValue(42),
     lsClient: {
       sendUserCascadeMessage: vi.fn().mockImplementation(async () => {
-        // Simulate LS processing: cascade becomes idle after receiving message
         setCascadeIdle();
       }),
       createCustomizationFile: vi.fn().mockResolvedValue({
         filePath: '/tmp/claude2gemini-mcp-proxy.mcp.json',
       }),
       refreshMcpServers: vi.fn().mockResolvedValue({}),
+      revertToCascadeStep: vi.fn().mockResolvedValue({}),
+      deleteCascadeTrajectory: vi.fn().mockResolvedValue({}),
     },
   };
 
@@ -75,11 +67,14 @@ vi.mock('antigravity-client', () => {
 });
 
 describe('AntigravityBackend', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
   it('should initialize successfully', async () => {
     const backend = new AntigravityBackend();
     await backend.initialize();
     expect(backend).toBeDefined();
-    // McpHub should have started
     expect(backend.mcpHub.port).toBeGreaterThan(0);
   });
 
@@ -107,10 +102,119 @@ describe('AntigravityBackend', () => {
     expect(turnEnd.stopReason).toBe('end_turn');
   });
 
-  it('should handle GeminApiError', () => {
+  it('should handle GeminiApiError', () => {
     const err = new GeminiApiError('test error', 500);
     expect(err.message).toBe('test error');
     expect(err.status).toBe(500);
     expect(err.name).toBe('GeminiApiError');
+  });
+
+  // --- 新しい機能のテストケース ---
+
+  it('should merge conversation history when starting a session with past messages', async () => {
+    const backend = new AntigravityBackend();
+    await backend.initialize();
+
+    const mockCascade = await (backend as any).client.startCascade();
+    mockCascade.state.trajectory.steps = [];
+
+    const sendSpy = vi.spyOn((backend as any).client.lsClient, 'sendUserCascadeMessage');
+
+    const stream = backend.createMessageStream('session-past-history', {
+      model: 'Gemini_3.5_Flash_High',
+      messages: [
+        { role: 'user', content: 'What is 1+1?' },
+        { role: 'assistant', content: 'It is 2.' },
+        { role: 'user', content: 'And what is 2+2?' }
+      ],
+    });
+
+    for await (const _ of stream) {}
+
+    expect(sendSpy).toHaveBeenCalled();
+    const lastCallReq = sendSpy.mock.calls[0][0] as any;
+    const sentText = lastCallReq.items[0].chunk.value;
+
+    expect(sentText).toContain('=== CONVERSATION HISTORY ===');
+    expect(sentText).toContain('User: What is 1+1?');
+    expect(sentText).toContain('Assistant: It is 2.');
+    expect(sentText).toContain('=== USER INSTRUCTION ===\nAnd what is 2+2?');
+  });
+
+  it('should revert cascade when history mismatch is detected (rewind)', async () => {
+    const backend = new AntigravityBackend();
+    await backend.initialize();
+
+    const mockCascade = await (backend as any).client.startCascade();
+    mockCascade.state.trajectory.steps = [
+      {
+        step: {
+          case: 'userInput',
+          value: { userResponse: 'What is 1+1?' }
+        }
+      },
+      makePlannerStep('It is 2.'),
+      {
+        step: {
+          case: 'userInput',
+          value: { userResponse: 'And what is 2+2?' }
+        }
+      },
+      makePlannerStep('It is 4.')
+    ];
+
+    const revertSpy = vi.spyOn((backend as any).client.lsClient, 'revertToCascadeStep');
+
+    const stream = backend.createMessageStream('session-rewind', {
+      model: 'Gemini_3.5_Flash_High',
+      messages: [
+        { role: 'user', content: 'What is 1+1?' },
+        { role: 'assistant', content: 'It is 2.' },
+        { role: 'user', content: 'And what is 3+3?' }
+      ],
+    });
+
+    for await (const _ of stream) {}
+
+    expect(revertSpy).toHaveBeenCalled();
+    const lastCallReq = revertSpy.mock.calls[0][0] as any;
+    expect(lastCallReq.stepIndex).toBe(1); // Q2 の直前である A1（ステップ 1）まで巻き戻す
+  });
+
+  it('should fallback to plain text message when tool result is received but cascade is not waiting for tool', async () => {
+    const backend = new AntigravityBackend();
+    await backend.initialize();
+
+    const mockCascade = await (backend as any).client.startCascade();
+    mockCascade.state.trajectory.steps = [];
+
+    const sendSpy = vi.spyOn((backend as any).client.lsClient, 'sendUserCascadeMessage');
+
+    const stream = backend.createMessageStream('session-tool-fallback', {
+      model: 'Gemini_3.5_Flash_High',
+      messages: [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_abc123',
+              content: 'Mocked tool output success',
+              is_error: false
+            }
+          ]
+        }
+      ],
+    });
+
+    for await (const _ of stream) {}
+
+    expect(sendSpy).toHaveBeenCalled();
+    const lastCallReq = sendSpy.mock.calls[0][0] as any;
+    const sentText = lastCallReq.items[0].chunk.value;
+
+    expect(sentText).toContain('=== TOOL RESULT ===');
+    expect(sentText).toContain('Tool Use ID: call_abc123');
+    expect(sentText).toContain('Mocked tool output success');
   });
 });
