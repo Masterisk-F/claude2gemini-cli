@@ -26,7 +26,7 @@ import {
 import { McpHub } from './mcp-hub.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { writeFile, mkdir, readFile } from 'node:fs/promises';
+import { writeFile, mkdir, readFile, rm } from 'node:fs/promises';
 import type { ClaudeMessage, ClaudeToolDefinition, BridgeMessage } from './types.js';
 
 export class GeminiApiError extends Error {
@@ -42,6 +42,7 @@ export class GeminiApiError extends Error {
 export class AntigravityBackend {
   private client: (AntigravityClient & { launcher?: any }) | null = null;
   private cascades = new Map<string, any>(); // sessionId -> Cascade
+  private workspaceDir: string | null = null;
   /** Singleton: all tools disabled */
   private static disabledToolConfig: CascadeToolConfig | null = null;
   /** MCP proxy hub (tool registry) */
@@ -59,6 +60,11 @@ export class AntigravityBackend {
       console.error('[Backend] Failed to start McpHub:', error);
     }
 
+    if (!this.workspaceDir) {
+      this.workspaceDir = join(tmpdir(), `claude2gemini_workspace_${process.pid}_${Date.now()}`);
+      await mkdir(this.workspaceDir, { recursive: true });
+    }
+
     // Write .mcp.json to workspace root BEFORE LS launches so it
     // discovers the proxy on startup (avoids LS internal caching issues)
     await this.#writeMcpConfigToWorkspace();
@@ -66,7 +72,7 @@ export class AntigravityBackend {
     console.log('[Backend] Launching Antigravity Language Server...');
     try {
       this.client = await AntigravityClient.launch({
-        workspacePath: process.cwd(),
+        workspacePath: this.workspaceDir!,
         verbose: process.env.VERBOSE === 'true',
       });
       console.log('[Backend] Antigravity LS launched successfully.');
@@ -86,7 +92,7 @@ export class AntigravityBackend {
    */
   async #writeMcpConfigToWorkspace(): Promise<void> {
     try {
-      const workspaceMcpPath = join(process.cwd(), '.mcp.json');
+      const workspaceMcpPath = join(this.workspaceDir!, '.mcp.json');
       const mcpConfig = {
         mcpServers: {
           'claude2gemini-mcp-proxy': {
@@ -608,6 +614,15 @@ export class AntigravityBackend {
         console.error('[Backend] Shutdown error:', e);
       }
       this.client = null;
+    }
+
+    if (this.workspaceDir) {
+      try {
+        await rm(this.workspaceDir, { recursive: true, force: true });
+      } catch (e) {
+        console.error('[Backend] Failed to remove temp workspace dir:', e);
+      }
+      this.workspaceDir = null;
     }
   }
 }
