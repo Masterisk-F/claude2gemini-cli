@@ -19,9 +19,22 @@ vi.mock('antigravity-client', () => {
     sendMessage = vi.fn().mockResolvedValue({});
     getHistory = vi.fn().mockResolvedValue({ trajectory: { steps: [] } });
     dispose = vi.fn();
-    on = vi.fn().mockReturnThis();
-    off = vi.fn().mockReturnThis();
+    on = vi.fn((event: string, handler: Function) => {
+      if (!this._handlers.has(event)) this._handlers.set(event, []);
+      this._handlers.get(event)!.push(handler);
+      return this;
+    });
+    off = vi.fn((event: string, handler: Function) => {
+      const h = this._handlers.get(event);
+      if (h) { const i = h.indexOf(handler); if (i >= 0) h.splice(i, 1); }
+      return this;
+    });
     emit = vi.fn();
+    /** Fire a stored event handler (for testing async error events) */
+    emitEvent(event: string, ...args: any[]) {
+      (this._handlers.get(event) || []).forEach((h: Function) => h(...args));
+    }
+    private _handlers: Map<string, Function[]> = new Map();
     waitForTurnComplete = vi.fn().mockResolvedValue(undefined);
     waitForTurnOrToolCall = vi.fn().mockResolvedValue('idle');
     state: any = {
@@ -331,6 +344,109 @@ describe('AntigravityBackend', () => {
     expect(sentText).toContain('FB 1');
     expect(sentText).toContain('Tool Use ID: fallback_2');
     expect(sentText).toContain('FB 2');
+  });
+
+  it('should yield error message when cascade emits error event', async () => {
+    const backend = new AntigravityBackend();
+    await backend.initialize();
+
+    const mockCascade = await (backend as any).client.startCascade();
+    mockCascade.state.trajectory.steps = [];
+
+    // Override sendUserCascadeMessage to fire the error event during processing
+    const origSend = (backend as any).client.lsClient.sendUserCascadeMessage;
+    (backend as any).client.lsClient.sendUserCascadeMessage = vi.fn().mockImplementation(async () => {
+      mockCascade.emitEvent('error', Object.assign(new Error('LS stream connection lost'), { code: 14 }));
+    });
+
+    const stream = backend.createMessageStream('session-cascade-error', {
+      model: 'Gemini_3.5_Flash_High',
+      messages: [{ role: 'user', content: 'Hello' }],
+    });
+
+    const events: any[] = [];
+    for await (const event of stream) {
+      events.push(event);
+    }
+
+    expect(events.length).toBe(1);
+    expect(events[0].type).toBe('error');
+    expect(events[0].message).toContain('LS stream connection lost');
+    expect(events[0].status).toBe(503);
+
+    // Restore
+    (backend as any).client.lsClient.sendUserCascadeMessage = origSend;
+  });
+
+  it('should yield error when trajectory contains errorMessage step', async () => {
+    const backend = new AntigravityBackend();
+    await backend.initialize();
+
+    const mockCascade = await (backend as any).client.startCascade();
+    mockCascade.state.trajectory.steps = [];
+
+    // Override sendUserCascadeMessage to populate an errorMessage step
+    const origSend = (backend as any).client.lsClient.sendUserCascadeMessage;
+    (backend as any).client.lsClient.sendUserCascadeMessage = vi.fn().mockImplementation(async () => {
+      mockCascade.state.trajectory.steps.push({
+        status: 11, // error
+        step: {
+          case: 'errorMessage',
+          value: {
+            userErrorMessage: 'Gemini API quota exhausted. Please wait and try again.',
+            shortError: 'QuotaExhausted',
+            fullError: 'API returned: RESOURCE_EXHAUSTED',
+            isBenign: false,
+            errorCode: 8,
+          },
+        },
+        requestedInteraction: null,
+      });
+    });
+
+    const stream = backend.createMessageStream('session-error-step', {
+      model: 'Gemini_3.5_Flash_High',
+      messages: [{ role: 'user', content: 'Hello' }],
+    });
+
+    const events: any[] = [];
+    for await (const event of stream) {
+      events.push(event);
+    }
+
+    expect(events.length).toBe(1);
+    expect(events[0].type).toBe('error');
+    expect(events[0].message).toContain('Gemini API quota exhausted');
+    expect(events[0].status).toBe(500);
+
+    // Restore
+    (backend as any).client.lsClient.sendUserCascadeMessage = origSend;
+  });
+
+  it('should yield 504 error on waitForTurnComplete timeout', async () => {
+    const backend = new AntigravityBackend();
+    await backend.initialize();
+
+    const mockCascade = await (backend as any).client.startCascade();
+    mockCascade.state.trajectory.steps = [];
+
+    // Use one-time rejection so the mock auto-restores after this test
+    mockCascade.waitForTurnComplete.mockRejectedValueOnce(new Error('waitForTurnComplete: timeout after 120000ms'));
+
+    const stream = backend.createMessageStream('session-timeout', {
+      model: 'Gemini_3.5_Flash_High',
+      messages: [{ role: 'user', content: 'Hello' }],
+    });
+
+    const events: any[] = [];
+    for await (const event of stream) {
+      events.push(event);
+    }
+
+    expect(events.length).toBe(1);
+    expect(events[0].type).toBe('error');
+    expect(events[0].message).toContain('timeout period');
+    expect(events[0].status).toBe(504);
   });
 
   it('should return usage metadata from getCascadeTrajectoryGeneratorMetadata on turn_end', async () => {

@@ -75,6 +75,38 @@ export function classifyError(error: unknown): { statusCode: number; errorType: 
     return { statusCode: 500, errorType: 'overloaded_error', clientMessage: `Gemini API quota exhausted or rate limit exceeded.` };
   }
 
+  // Map ConnectRPC / gRPC status codes to HTTP status codes
+  const connectCode = (error as any)?.code;
+  if (typeof connectCode === 'number') {
+    if (connectCode === 8 /* ResourceExhausted */) {
+      return { statusCode: 429, errorType: 'overloaded_error', clientMessage: `Gemini API quota exhausted or rate limit exceeded.` };
+    }
+    if (connectCode === 16 /* Unauthenticated */) {
+      return { statusCode: 401, errorType: 'authentication_error', clientMessage: `Gemini API auth error: ${errorMsg}` };
+    }
+    if (connectCode === 7 /* PermissionDenied */) {
+      return { statusCode: 403, errorType: 'authentication_error', clientMessage: `Gemini API auth error: ${errorMsg}` };
+    }
+    if (connectCode === 14 /* Unavailable */) {
+      return { statusCode: 503, errorType: 'api_error', clientMessage: `Antigravity LS unavailable: ${errorMsg}` };
+    }
+    if (connectCode === 4 /* DeadlineExceeded */) {
+      return { statusCode: 504, errorType: 'api_error', clientMessage: `Antigravity LS timeout: ${errorMsg}` };
+    }
+    if (connectCode === 3 /* InvalidArgument */) {
+      return { statusCode: 400, errorType: 'invalid_request_error', clientMessage: `Invalid request error: ${errorMsg}` };
+    }
+    if (connectCode === 5 /* NotFound */) {
+      return { statusCode: 404, errorType: 'not_found_error', clientMessage: `Not found error: ${errorMsg}` };
+    }
+    if (connectCode === 1 /* Canceled */) {
+      return { statusCode: 499, errorType: 'api_error', clientMessage: `Request canceled: ${errorMsg}` };
+    }
+    if (connectCode === 13 /* Internal */) {
+      return { statusCode: 500, errorType: 'api_error', clientMessage: `Internal server error: ${errorMsg}` };
+    }
+  }
+
   return { statusCode: 500, errorType: 'api_error', clientMessage: `Internal server error: ${errorMsg}` };
 }
 

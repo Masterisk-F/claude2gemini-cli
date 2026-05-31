@@ -54,6 +54,46 @@ describe('messages route error handling', () => {
       expect(result.statusCode).toBe(500);
       expect(result.errorType).toBe('api_error');
     });
+
+    it('maps ConnectRPC ResourceExhausted (code=8) to 429 overloaded_error', () => {
+      const error: any = new Error('[resource_exhausted] quota exceeded');
+      error.code = 8;
+      const result = classifyError(error);
+      expect(result.statusCode).toBe(429);
+      expect(result.errorType).toBe('overloaded_error');
+    });
+
+    it('maps ConnectRPC Unauthenticated (code=16) to 401 authentication_error', () => {
+      const error: any = new Error('[unauthenticated] auth required');
+      error.code = 16;
+      const result = classifyError(error);
+      expect(result.statusCode).toBe(401);
+      expect(result.errorType).toBe('authentication_error');
+    });
+
+    it('maps ConnectRPC Unavailable (code=14) to 503 api_error', () => {
+      const error: any = new Error('[unavailable] service unavailable');
+      error.code = 14;
+      const result = classifyError(error);
+      expect(result.statusCode).toBe(503);
+      expect(result.errorType).toBe('api_error');
+    });
+
+    it('maps ConnectRPC DeadlineExceeded (code=4) to 504 api_error', () => {
+      const error: any = new Error('[deadline_exceeded] timeout');
+      error.code = 4;
+      const result = classifyError(error);
+      expect(result.statusCode).toBe(504);
+      expect(result.errorType).toBe('api_error');
+    });
+
+    it('maps ConnectRPC PermissionDenied (code=7) to 403 authentication_error', () => {
+      const error: any = new Error('[permission_denied] denied');
+      error.code = 7;
+      const result = classifyError(error);
+      expect(result.statusCode).toBe(403);
+      expect(result.errorType).toBe('authentication_error');
+    });
   });
 });
 

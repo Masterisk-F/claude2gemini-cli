@@ -50,6 +50,8 @@ export class AntigravityBackend {
   /** MCP proxy hub (tool registry) */
   public readonly mcpHub: McpHub = new McpHub();
   private lastRegisteredToolsHash = '';
+  /** Error captured from cascade's 'error' event (if any) */
+  #cascadeError: Error | null = null;
 
   async initialize(): Promise<void> {
     if (this.client) return;
@@ -312,9 +314,51 @@ export class AntigravityBackend {
   }
 
   /**
+   * Map a cascade error to an appropriate HTTP status code.
+   * ConnectRPC errors carry a numeric `code` property (gRPC status codes).
+   */
+  #classifyConnectErrorCode(err: any): number {
+    const code = typeof err?.code === 'number' ? err.code : 0;
+    // ConnectRPC / gRPC status codes
+    if (code === 8 /* ResourceExhausted */) return 429;
+    if (code === 4 /* DeadlineExceeded */) return 504;
+    if (code === 14 /* Unavailable */) return 503;
+    if (code === 13 /* Internal */) return 500;
+    if (code === 7 /* PermissionDenied */) return 403;
+    if (code === 16 /* Unauthenticated */) return 401;
+    if (code === 3 /* InvalidArgument */) return 400;
+    if (code === 5 /* NotFound */) return 404;
+    if (code === 1 /* Canceled */) return 499;
+    return 500;
+  }
+
+  /**
+   * Scan the cascade's trajectory for errorMessage steps added after
+   * `startStepCount`. Returns a user-facing error string, or null.
+   */
+  #findErrorStep(cascade: any, startStepCount: number): string | null {
+    const steps = cascade.state?.trajectory?.steps ?? [];
+    for (let i = startStepCount; i < steps.length; i++) {
+      const step = steps[i];
+      if (!step) continue;
+      // Check errorMessage step type
+      if (step.step?.case === 'errorMessage') {
+        const errMsg = step.step.value;
+        return errMsg.userErrorMessage || errMsg.shortError || errMsg.fullError || 'Unknown Antigravity LS error';
+      }
+      // Check step status === error
+      if (step.status === 11 /* StepStatus.ERROR */) {
+        return `Step ${i} failed with status: error`;
+      }
+    }
+    return null;
+  }
+
+  /**
    * Wait for the next turn to complete OR a tool call to arrive, whichever
    * happens first. Uses the Cascade's event-driven waitForTurnComplete()
    * raced against an McpHub event notification.
+   * Throws on timeout so the caller can handle it with an appropriate error code.
    */
   private async waitForTurnOrToolCall(
     cascade: any,
@@ -323,7 +367,7 @@ export class AntigravityBackend {
     // If a tool call is already pending, return immediately
     if (this.mcpHub.hasPendingCalls()) return 'tool_call';
 
-    return new Promise<'idle' | 'tool_call'>((resolve) => {
+    return new Promise<'idle' | 'tool_call'>((resolve, reject) => {
       let settled = false;
 
       // Listen for McpHub tool call events
@@ -337,8 +381,15 @@ export class AntigravityBackend {
         .then(() => {
           if (!settled) { settled = true; cleanup(); resolve('idle'); }
         })
-        .catch(() => {
-          if (!settled) { settled = true; cleanup(); resolve('idle'); }
+        .catch((err: Error) => {
+          if (!settled) { settled = true; cleanup();
+            // Timeout → propagate to outer handler with 504
+            if (err.message?.includes('timeout')) {
+              reject(err);
+            } else {
+              resolve('idle');
+            }
+          }
         });
 
       const cleanup = () => {
@@ -396,6 +447,12 @@ export class AntigravityBackend {
             console.error('[Backend] Auto-approve failed:', err);
           });
         }
+      });
+
+      // Capture LS stream errors (quota, shutdown, etc.)
+      cascade.on('error', (err: any) => {
+        console.error('[Backend] Cascade error event:', err);
+        this.#cascadeError = err instanceof Error ? err : new Error(String(err));
       });
     }
 
@@ -574,6 +631,16 @@ export class AntigravityBackend {
         // Wait for the cascade to generate the next response (tool result processed).
         const turnStartCount = cascade.state?.trajectory?.steps?.length ?? 0;
         const turn = await this.waitForTurnOrToolCall(cascade);
+
+        // Check for cascade error (quota, shutdown, etc.)
+        if (this.#cascadeError) {
+          const err = this.#cascadeError;
+          this.#cascadeError = null;
+          const status = this.#classifyConnectErrorCode(err);
+          yield { type: 'error', sessionId, message: `Antigravity LS error: ${err.message}`, status };
+          return;
+        }
+
         if (turn === 'tool_call') {
           for (const call of this.mcpHub.getPendingCalls()) {
             yield { type: 'tool_call', sessionId, callId: call.callId, name: call.name, args: call.args };
@@ -585,6 +652,14 @@ export class AntigravityBackend {
 
         // idle — collect text from new steps only
         const collected = this.collectTextFromSteps(cascade, turnStartCount);
+
+        // Check for errorMessage steps in new trajectory steps
+        const errorMsg = this.#findErrorStep(cascade, turnStartCount);
+        if (errorMsg) {
+          yield { type: 'error', sessionId, message: errorMsg, status: 500 };
+          return;
+        }
+
         if (collected) {
           yield { type: 'stream_event', sessionId, event: { type: 'content', value: collected } };
         }
@@ -641,6 +716,15 @@ export class AntigravityBackend {
       await this.sendMessage(cascade, text, request.model, apiKey);
       const turn = await this.waitForTurnOrToolCall(cascade);
 
+      // Check for cascade error (quota, shutdown, etc.)
+      if (this.#cascadeError) {
+        const err = this.#cascadeError;
+        this.#cascadeError = null;
+        const status = this.#classifyConnectErrorCode(err);
+        yield { type: 'error', sessionId, message: `Antigravity LS error: ${err.message}`, status };
+        return;
+      }
+
       if (turn === 'tool_call') {
         for (const call of this.mcpHub.getPendingCalls()) {
           yield { type: 'tool_call', sessionId, callId: call.callId, name: call.name, args: call.args };
@@ -652,6 +736,14 @@ export class AntigravityBackend {
 
       // idle — collect text
       const collected = this.collectTextFromSteps(cascade, startStepCount);
+
+      // Check for errorMessage steps in new trajectory steps
+      const errorMsg = this.#findErrorStep(cascade, startStepCount);
+      if (errorMsg) {
+        yield { type: 'error', sessionId, message: errorMsg, status: 500 };
+        return;
+      }
+
       if (collected) {
         yield { type: 'stream_event', sessionId, event: { type: 'content', value: collected } };
       }
@@ -659,7 +751,20 @@ export class AntigravityBackend {
       yield { type: 'turn_end', sessionId, stopReason: 'end_turn', usage: usage2 };
     } catch (error) {
       console.error('[Backend] Stream error:', error);
-      yield { type: 'error', sessionId, message: String(error) };
+
+      // Detect timeout and cancel the cascade
+      const errorMsg = String(error);
+      if (errorMsg.includes('timeout')) {
+        yield {
+          type: 'error',
+          sessionId,
+          message: `Antigravity LS did not respond within the timeout period.`,
+          status: 504,
+        };
+        return;
+      }
+
+      yield { type: 'error', sessionId, message: errorMsg };
     }
   }
 
