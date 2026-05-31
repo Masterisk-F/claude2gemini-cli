@@ -32,7 +32,29 @@ This proxy uses the **Gemini CLI SDK**, which is included in the `gemini-cli` pa
 **Recommendations:**
 - Monitor your API usage and billing dashboard regularly
 - Be mindful of rate limits — high-frequency tool use loops can generate many API calls
-- Consider using `gemini-2.5-flash` (via model mapping) for lighter workloads to reduce costs
+- Consider using `gemini-flash` (via model mapping) for lighter workloads to reduce costs
+
+## Model Selection & Mapping
+
+Claude model names are automatically mapped to appropriate Antigravity/Gemini models. You can also use formal Antigravity model names directly.
+
+| Category | Input Model / Alias | Mapped Antigravity Model |
+| :--- | :--- | :--- |
+| **Claude Aliases** | `claude-opus` | `Claude_Opus_4.6_Thinking` |
+| | `claude-sonnet` | `Claude_Sonnet_4.6_Thinking` |
+| | `claude-haiku` | `Gemini_3.1_Flash_Lite` |
+| **Gemini Aliases** | `gemini-pro` | `Gemini_3.1_Pro_High` |
+| | `gemini-pro-low` | `Gemini_3.1_Pro_Low` |
+| | `gemini-flash` | `Gemini_3.5_Flash_High` |
+| | `gemini-flash-medium` | `Gemini_3.5_Flash_Medium` |
+| | `gemini-flash-low` | `Gemini_3.5_Flash_Low` |
+| | `gemini-flash-lite` | `Gemini_3.1_Flash_Lite` |
+| **Simple Aliases** | `pro`, `flash`, `flash-lite` | (Mapped to corresponding Gemini models) |
+| **Formal Names** | `Gemini_3.1_Pro_High`, etc. | (Used as-is) |
+| **Default** | (Unknown model names) | `Gemini_3.5_Flash_High` |
+
+> [!TIP]
+> Partial matches are also supported for aliases (e.g., `claude-3-5-sonnet-20240620` maps to `Claude_Sonnet_4.6_Thinking`).
 
 ## Installation & Setup
 

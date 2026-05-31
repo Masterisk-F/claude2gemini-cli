@@ -27,6 +27,7 @@ import { McpHub } from './mcp-hub.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { writeFile, mkdir, readFile, rm } from 'node:fs/promises';
+import { extractSystemPrompt } from './converters/request.js';
 import type { ClaudeMessage, ClaudeToolDefinition, BridgeMessage } from './types.js';
 
 export class GeminiApiError extends Error {
@@ -480,6 +481,8 @@ export class AntigravityBackend {
         historyPrefix += '============================\n\n';
       }
 
+      const systemPrompt = extractSystemPrompt(request.system);
+
       // 6. Check if current message is a tool result and check for waiting state
       const isToolResult =
         lastUserMessage.role === 'user' &&
@@ -562,6 +565,9 @@ export class AntigravityBackend {
       }
 
       let text = '';
+      if (systemPrompt) {
+        text += `=== SYSTEM PROMPT ===\n${systemPrompt}\n=====================\n\n`;
+      }
       if (historyPrefix) {
         text += historyPrefix;
       }

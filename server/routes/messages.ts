@@ -3,30 +3,14 @@ import { randomUUID } from 'node:crypto';
 import type { Request, Response } from 'express';
 import { sessionStore } from '../session-store.js';
 import { streamGeminiToClaudeSSE, setupSSEHeaders } from '../converters/stream.js';
+import { mapModelName } from '../converters/request.js';
 import { antigravityBackend, GeminiApiError } from '../gemini-backend.js';
 
 export const messagesRouter = Router();
 
 /**
- * Claude モデル名 → Antigravity LS モデル名へのマッピング
+ * Claude Response Builder
  */
-function mapModelName(model: string): string {
-  const lower = model.toLowerCase();
-  // Gemini ネイティブモデルはそのまま
-  if (lower.includes('gemini')) {
-    if (lower.includes('pro') || lower.includes('3.1')) return 'Gemini_3.1_Pro_High';
-    if (lower.includes('flash') && lower.includes('3.5')) return 'Gemini_3.5_Flash_High';
-    if (lower.includes('flash')) return 'Gemini_3.5_Flash_High';
-    return 'Gemini_3.5_Flash_Medium';
-  }
-  // Claude → Antigravity マッピング
-  if (lower.includes('opus')) return 'Gemini_3.1_Pro_High';
-  if (lower.includes('sonnet') && lower.includes('4')) return 'Claude_Sonnet_4.6_Thinking';
-  if (lower.includes('sonnet')) return 'Gemini_3.5_Flash_High';
-  if (lower.includes('haiku')) return 'Gemini_3.5_Flash_Low';
-  return 'Gemini_3.5_Flash_High';
-}
-
 function buildClaudeResponse({
   contentBlocks,
   model,
