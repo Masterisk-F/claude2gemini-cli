@@ -33,7 +33,9 @@ if (!hubPort || Number.isNaN(hubPort)) {
 }
 
 const HUB_BASE = `http://127.0.0.1:${hubPort}`;
-const CALL_TIMEOUT_MS = 24 * 60 * 60 * 1000; // 24 hours
+const CALL_TIMEOUT_MS = process.env.MCP_PROXY_TIMEOUT_MS
+  ? parseInt(process.env.MCP_PROXY_TIMEOUT_MS, 10)
+  : 24 * 60 * 60 * 1000; // 24 hours
 
 // ── Output ─────────────────────────────────────────────────────────────────
 
@@ -110,7 +112,7 @@ async function handleToolsCall(requestId, params) {
         id: requestId,
         error: {
           code: -32001,
-          message: 'tool call timed out after 5 minutes',
+          message: 'tool call timed out after 24 hours',
         },
       });
     } else {
