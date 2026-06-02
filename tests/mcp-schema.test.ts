@@ -142,3 +142,16 @@ describe('Unpack Meta Tool Call', () => {
     expect(unpacked.args.command).toBe('ls -la');
   });
 });
+
+describe('MCP Hub Request Parsing Mock', () => {
+  it('should resolve arguments from either arguments or Arguments field', () => {
+    const rawData1 = { name: 'Bash', arguments: { command: 'ls' } };
+    const rawData2 = { name: 'Bash', Arguments: { command: 'ls' } };
+
+    const getArgs = (data: any) => data.arguments ?? data.Arguments;
+
+    expect(getArgs(rawData1)).toEqual({ command: 'ls' });
+    expect(getArgs(rawData2)).toEqual({ command: 'ls' });
+  });
+});
+

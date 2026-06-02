@@ -82,7 +82,7 @@ async function handleToolsCall(requestId, params) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         name: params.name,
-        arguments: params.arguments ?? {},
+        arguments: params.arguments ?? params.Arguments ?? {},
         _meta: params._meta,
       }),
       signal: controller.signal,

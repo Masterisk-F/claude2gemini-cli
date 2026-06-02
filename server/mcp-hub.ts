@@ -183,7 +183,8 @@ export class McpHub extends EventEmitter {
   #handleToolsCall(req: http.IncomingMessage, res: http.ServerResponse): void {
     this.#readBody(req)
       .then((data) => {
-        let { name, arguments: args } = data;
+        let name = data.name;
+        let args = data.arguments ?? data.Arguments;
         if (!name || typeof name !== 'string') {
           res.writeHead(400);
           res.end(JSON.stringify({ error: { code: -32602, message: 'missing or invalid tool name' } }));
