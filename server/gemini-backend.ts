@@ -7,7 +7,7 @@
 
 import { AntigravityClient, readAuthStatus } from 'antigravity-client';
 import {
-  TextOrScopeItem, ModelOrAlias, Metadata,
+  TextOrScopeItem, ModelOrAlias, Metadata, ImageData, ContextScopeItem, PathScopeItem,
 } from 'antigravity-client/dist/src/gen/exa/codeium_common_pb/codeium_common_pb.js';
 import {
   CascadeConfig, CascadePlannerConfig, CascadeConversationalPlannerConfig,
@@ -198,6 +198,8 @@ export class AntigravityBackend {
     text: string,
     modelName: string,
     apiKey: string,
+    images: { base64Data: string; mimeType: string }[] = [],
+    documents: { data: string; mediaType: string; index: number }[] = [],
   ): Promise<void> {
     const toolConfig = AntigravityBackend.createToolConfig();
 
@@ -211,14 +213,49 @@ export class AntigravityBackend {
 
     const modelId = await this.client!.resolveModelId(modelName || '');
 
+    const items: TextOrScopeItem[] = [
+      new TextOrScopeItem({
+        chunk: { case: 'text', value: text },
+      }),
+    ];
+
+    // Handle documents by writing them to the workspace and adding as file scope items
+    for (const doc of documents) {
+      try {
+        const ext = doc.mediaType.split('/')[1] || 'binary';
+        const fileName = `input_doc_${doc.index}_${Date.now()}.${ext}`;
+        const filePath = join(this.workspaceDir!, fileName);
+        const buffer = Buffer.from(doc.data, 'base64');
+        await writeFile(filePath, buffer);
+
+        items.push(new TextOrScopeItem({
+          chunk: {
+            case: 'item',
+            value: new ContextScopeItem({
+              scopeItem: {
+                case: 'file',
+                value: new PathScopeItem({
+                  absolutePathMigrateMeToUri: filePath,
+                  absoluteUri: `file://${filePath}`,
+                }),
+              },
+            }),
+          },
+        }));
+        console.log(`[Backend] Document attached: ${filePath} (${doc.mediaType})`);
+      } catch (err) {
+        console.warn(`[Backend] Failed to attach document ${doc.index}:`, err);
+      }
+    }
+
     const req = new SendUserCascadeMessageRequest({
       cascadeId: cascade.cascadeId,
       metadata,
-      items: [
-        new TextOrScopeItem({
-          chunk: { case: 'text', value: text },
-        }),
-      ],
+      items,
+      images: images.map(img => new ImageData({
+        base64Data: img.base64Data,
+        mimeType: img.mimeType,
+      })),
       cascadeConfig: new CascadeConfig({
         plannerConfig: new CascadePlannerConfig({
           toolConfig,
@@ -683,6 +720,23 @@ export class AntigravityBackend {
       }
 
       // ── New message (user text, possibly with tools or tool fallback) ──────────
+      const images: { base64Data: string; mimeType: string }[] = [];
+      const documents: { data: string; mediaType: string; index: number }[] = [];
+
+      /** Helper to extract text and collect multimodal blocks */
+      const extractContent = (content: string | any[]): string => {
+        if (typeof content === 'string') return content;
+        return content.map((b: any) => {
+          if (b.type === 'text') return b.text || '';
+          if (b.type === 'image' && b.source?.data) {
+            images.push({ base64Data: b.source.data, mimeType: b.source.media_type });
+          } else if (b.type === 'document' && b.source?.data) {
+            documents.push({ data: b.source.data, mediaType: b.source.media_type, index: documents.length });
+          }
+          return '';
+        }).filter(Boolean).join('\n');
+      };
+
       let userText = '';
       if (isToolResult && !isWaitingForThisTool && toolResultBlocks.length > 0) {
         // Fallback: tool result received but cascade is not waiting for it
@@ -692,9 +746,7 @@ export class AntigravityBackend {
           return `=== TOOL RESULT ===\nTool Use ID: ${tool_use_id}\nIs Error: ${!!is_error}\nResult:\n${contentText}\n===================`;
         }).join('\n\n');
       } else {
-        userText = typeof lastUserMessage.content === 'string'
-          ? lastUserMessage.content
-          : lastUserMessage.content.map((b: any) => b.text || '').filter(Boolean).join('\n');
+        userText = extractContent(lastUserMessage.content);
       }
 
       // Append any subsequent system or non-assistant messages as context
@@ -702,9 +754,7 @@ export class AntigravityBackend {
       for (let i = lastUserMsgIdx + 1; i < messages.length; i++) {
         const msg = messages[i];
         if ((msg.role as string) === 'system' || msg.role === 'user') {
-          const contentText = typeof msg.content === 'string'
-            ? msg.content
-            : msg.content.map((b: any) => b.text || '').filter(Boolean).join('\n');
+          const contentText = extractContent(msg.content);
           if (contentText) {
             extraContexts.push(contentText);
           }
@@ -727,7 +777,7 @@ export class AntigravityBackend {
 
       const startStepCount = cascade.state?.trajectory?.steps?.length ?? 0;
 
-      await this.sendMessage(cascade, text, request.model, apiKey);
+      await this.sendMessage(cascade, text, request.model, apiKey, images, documents);
       const turn = await this.waitForTurnOrToolCall(cascade);
 
       // Check for cascade error (quota, shutdown, etc.)
