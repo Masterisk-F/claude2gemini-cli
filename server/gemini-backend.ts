@@ -24,12 +24,18 @@ import {
   RevertToCascadeStepRequest,
   GetCascadeTrajectoryGeneratorMetadataRequest,
 } from 'antigravity-client/dist/src/gen/exa/language_server_pb/language_server_pb.js';
+import { Cascade } from 'antigravity-client';
+import { Launcher } from 'antigravity-client/dist/src/server/launcher.js';
+import type { ApprovalRequest } from 'antigravity-client/dist/src/types.js';
+import type { Step } from 'antigravity-client/dist/src/gen/exa/gemini_coder/proto/trajectory_pb.js';
+import { CortexStepPlannerResponse } from 'antigravity-client/dist/src/gen/exa/cortex_pb/cortex_pb.js';
+import type { ConnectError } from '@connectrpc/connect';
 import { McpHub } from './mcp-hub.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { writeFile, mkdir, readFile, rm } from 'node:fs/promises';
 import { extractSystemPrompt } from './converters/request.js';
-import type { ClaudeMessage, ClaudeToolDefinition, BridgeMessage } from './types.js';
+import type { ClaudeMessage, ClaudeContentBlock, ClaudeToolResultBlock, ClaudeToolDefinition, BridgeMessage } from './types.js';
 
 export class GeminiApiError extends Error {
   constructor(
@@ -42,8 +48,8 @@ export class GeminiApiError extends Error {
 }
 
 export class AntigravityBackend {
-  private client: (AntigravityClient & { launcher?: any }) | null = null;
-  private cascades = new Map<string, any>(); // sessionId -> Cascade
+  private client: (AntigravityClient & { launcher?: Launcher }) | null = null;
+  private cascades = new Map<string, Cascade>(); // sessionId -> Cascade
   private workspaceDir: string | null = null;
   /** Singleton: all tools disabled */
   private static disabledToolConfig: CascadeToolConfig | null = null;
@@ -151,7 +157,7 @@ export class AntigravityBackend {
         new RefreshMcpServersRequest({ shallow: false, serverName: 'claude2gemini-mcp-proxy' }),
       );
       console.log('[Backend] MCP proxy registered with LS (refreshMcpServers OK)');
-    } catch (error: any) {
+    } catch (error: unknown) {
       console.warn('[Backend] refreshMcpServers failed:', error);
     }
   }
@@ -194,7 +200,7 @@ export class AntigravityBackend {
    * Send a message via sendUserCascadeMessage with our selective tool config.
    */
   private async sendMessage(
-    cascade: any,
+    cascade: Cascade,
     text: string,
     modelName: string,
     apiKey: string,
@@ -281,7 +287,7 @@ export class AntigravityBackend {
    * Fetch token usage statistics from the LS after a turn completes.
    * Best-effort: returns undefined if the RPC fails or no metadata is available.
    */
-  async #fetchUsage(cascade: any): Promise<{
+  async #fetchUsage(cascade: Cascade): Promise<{
     input_tokens: number;
     output_tokens: number;
     cache_read_input_tokens?: number;
@@ -336,14 +342,14 @@ export class AntigravityBackend {
    * Collect text from the cascade's trajectory steps that were added after
    * `startStepCount`.
    */
-  private collectTextFromSteps(cascade: any, startStepCount: number): string {
+  private collectTextFromSteps(cascade: Cascade, startStepCount: number): string {
     const steps = cascade.state?.trajectory?.steps ?? [];
     const parts: string[] = [];
     for (let i = startStepCount; i < steps.length; i++) {
       const step = steps[i];
       if (!step) continue;
       if (step.step?.case !== 'plannerResponse') continue;
-      const planner = step.step.value as any;
+      const planner = step.step.value as CortexStepPlannerResponse;
       const response = planner.modifiedResponse || planner.response || '';
       if (response) parts.push(response);
     }
@@ -354,8 +360,8 @@ export class AntigravityBackend {
    * Map a cascade error to an appropriate HTTP status code.
    * ConnectRPC errors carry a numeric `code` property (gRPC status codes).
    */
-  #classifyConnectErrorCode(err: any): number {
-    const code = typeof err?.code === 'number' ? err.code : 0;
+  #classifyConnectErrorCode(err: unknown): number {
+    const code = typeof (err as ConnectError)?.code === 'number' ? (err as ConnectError).code : 0;
     // ConnectRPC / gRPC status codes
     if (code === 8 /* ResourceExhausted */) return 429;
     if (code === 4 /* DeadlineExceeded */) return 504;
@@ -373,7 +379,7 @@ export class AntigravityBackend {
    * Scan the cascade's trajectory for errorMessage steps added after
    * `startStepCount`. Returns a user-facing error string, or null.
    */
-  #findErrorStep(cascade: any, startStepCount: number): string | null {
+  #findErrorStep(cascade: Cascade, startStepCount: number): string | null {
     const steps = cascade.state?.trajectory?.steps ?? [];
     for (let i = startStepCount; i < steps.length; i++) {
       const step = steps[i];
@@ -381,7 +387,8 @@ export class AntigravityBackend {
       // Check errorMessage step type
       if (step.step?.case === 'errorMessage') {
         const errMsg = step.step.value;
-        return errMsg.userErrorMessage || errMsg.shortError || errMsg.fullError || 'Unknown Antigravity LS error';
+        const details = errMsg.error;
+        return details?.userErrorMessage || details?.shortError || details?.fullError || 'Unknown Antigravity LS error';
       }
       // Check step status === error
       if (step.status === 11 /* StepStatus.ERROR */) {
@@ -398,7 +405,7 @@ export class AntigravityBackend {
    * Throws on timeout so the caller can handle it with an appropriate error code.
    */
   private async waitForTurnOrToolCall(
-    cascade: any,
+    cascade: Cascade,
     timeoutMs = 120_000,
   ): Promise<'idle' | 'tool_call'> {
     // If a tool call is already pending, return immediately
@@ -448,7 +455,7 @@ export class AntigravityBackend {
     request: {
       model: string;
       messages: ClaudeMessage[];
-      system?: any;
+      system?: string;
       tools?: ClaudeToolDefinition[];
     }
   ): AsyncGenerator<BridgeMessage> {
@@ -477,17 +484,17 @@ export class AntigravityBackend {
       console.log(`[Backend] New cascade created: ${cascade.cascadeId}`);
 
       // Auto-approve any interactive prompts from the LS (permissions, commands)
-      cascade.on('interaction', (event: any) => {
+      cascade.on('interaction', (event: ApprovalRequest) => {
         if (event.needsApproval) {
           console.log(`[Backend] Auto-approving cascade interaction: index=${event.stepIndex}, cmd=${event.commandLine || 'none'}`);
-          event.approve('once').catch((err: any) => {
+          event.approve('once').catch((err: unknown) => {
             console.error('[Backend] Auto-approve failed:', err);
           });
         }
       });
 
       // Capture LS stream errors (quota, shutdown, etc.)
-      cascade.on('error', (err: any) => {
+      cascade.on('error', (err: unknown) => {
         console.error('[Backend] Cascade error event:', err);
         this.#cascadeError = err instanceof Error ? err : new Error(String(err));
       });
@@ -519,16 +526,16 @@ export class AntigravityBackend {
         const msg = messages[i];
         if (msg.role === 'user') {
           const content = msg.content;
-          const isToolResult = Array.isArray(content) && content.every((b: any) => b.type === 'tool_result');
+          const isToolResult = Array.isArray(content) && content.every((b: ClaudeContentBlock) => b.type === 'tool_result');
           if (!isToolResult) {
             currentUserText = typeof content === 'string'
               ? content
-              : content.map((b: any) => b.text || '').filter(Boolean).join('\n');
+              : content.map((b: ClaudeContentBlock) => (b.type === 'text' ? b.text : '') || '').filter(Boolean).join('\n');
           }
         } else if (msg.role === 'assistant' && currentUserText) {
           const assistantText = typeof msg.content === 'string'
             ? msg.content
-            : msg.content.map((b: any) => b.text || '').filter(Boolean).join('\n');
+            : msg.content.map((b: ClaudeContentBlock) => (b.type === 'text' ? b.text : '') || '').filter(Boolean).join('\n');
           clientTurns.push({
             userText: currentUserText,
             assistantText: assistantText,
@@ -538,13 +545,13 @@ export class AntigravityBackend {
       }
 
       // Helper function to extract user input text from step
-      const getUserInputText = (step: any): string => {
+      const getUserInputText = (step: Step): string => {
         if (step?.step?.case === 'userInput') {
           const value = step.step.value;
           if (value.userResponse) return value.userResponse;
           if (Array.isArray(value.items)) {
             return value.items
-              .map((item: any) => item.chunk?.case === 'text' ? item.chunk.value : '')
+              .map((item: TextOrScopeItem) => item.chunk?.case === 'text' ? item.chunk.value : '')
               .filter(Boolean)
               .join('\n');
           }
@@ -595,10 +602,10 @@ export class AntigravityBackend {
           this.cascades.delete(sessionId);
           cascade = await this.client!.startCascade();
           this.cascades.set(sessionId, cascade);
-          cascade.on('interaction', (event: any) => {
+          cascade.on('interaction', (event: ApprovalRequest) => {
             if (event.needsApproval) {
               console.log(`[Backend] Auto-approving cascade interaction: index=${event.stepIndex}, cmd=${event.commandLine || 'none'}`);
-              event.approve('once').catch((err: any) => {
+              event.approve('once').catch((err: unknown) => {
                 console.error('[Backend] Auto-approve failed:', err);
               });
             }
@@ -637,7 +644,7 @@ export class AntigravityBackend {
       const isToolResult =
         lastUserMessage.role === 'user' &&
         Array.isArray(lastUserMessage.content) &&
-        lastUserMessage.content.some((b: any) => b.type === 'tool_result');
+        lastUserMessage.content.some((b: ClaudeContentBlock) => b.type === 'tool_result');
 
       // Clear pending calls from previous turns if this is a fresh user instruction
       if (!isToolResult) {
@@ -645,7 +652,7 @@ export class AntigravityBackend {
       }
 
       const toolResultBlocks = isToolResult
-        ? (lastUserMessage.content as any[]).filter((b: any) => b.type === 'tool_result')
+        ? (lastUserMessage.content as ClaudeContentBlock[]).filter((b): b is ClaudeToolResultBlock => b.type === 'tool_result')
         : [];
 
       const isWaitingForThisTool = toolResultBlocks.some((b) =>
@@ -724,9 +731,9 @@ export class AntigravityBackend {
       const documents: { data: string; mediaType: string; index: number }[] = [];
 
       /** Helper to extract text and collect multimodal blocks */
-      const extractContent = (content: string | any[]): string => {
+      const extractContent = (content: string | ClaudeContentBlock[]): string => {
         if (typeof content === 'string') return content;
-        return content.map((b: any) => {
+        return content.map((b) => {
           if (b.type === 'text') return b.text || '';
           if (b.type === 'image' && b.source?.data) {
             images.push({ base64Data: b.source.data, mimeType: b.source.media_type });

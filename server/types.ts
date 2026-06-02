@@ -23,6 +23,7 @@ export interface ClaudeToolResultBlock {
   type: 'tool_result';
   tool_use_id: string;
   content: string | ClaudeContentBlock[];
+  is_error?: boolean;
 }
 
 export interface ClaudeWebSearchToolResultBlock {

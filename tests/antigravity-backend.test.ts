@@ -393,11 +393,13 @@ describe('AntigravityBackend', () => {
         step: {
           case: 'errorMessage',
           value: {
-            userErrorMessage: 'Gemini API quota exhausted. Please wait and try again.',
-            shortError: 'QuotaExhausted',
-            fullError: 'API returned: RESOURCE_EXHAUSTED',
-            isBenign: false,
-            errorCode: 8,
+            error: {
+              userErrorMessage: 'Gemini API quota exhausted. Please wait and try again.',
+              shortError: 'QuotaExhausted',
+              fullError: 'API returned: RESOURCE_EXHAUSTED',
+              isBenign: false,
+              errorCode: 8,
+            },
           },
         },
         requestedInteraction: null,
