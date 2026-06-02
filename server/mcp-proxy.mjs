@@ -1,32 +1,10 @@
 #!/usr/bin/env node
 
-import fs from 'fs';
-try {
-  fs.writeFileSync('/tmp/mcp-debug.log', `mcp-proxy init at ${new Date().toISOString()}\nargv: ${JSON.stringify(process.argv)}\n`);
-} catch (e) {}
-
-process.on('uncaughtException', (err) => {
-  try {
-    fs.appendFileSync('/tmp/mcp-debug.log', `Uncaught Exception: ${err.stack}\n`);
-  } catch (e) {}
-});
-process.on('unhandledRejection', (err) => {
-  try {
-    fs.appendFileSync('/tmp/mcp-debug.log', `Unhandled Rejection: ${err?.stack || err}\n`);
-  } catch (e) {}
-});
-
 process.on('SIGTERM', () => {
-  try {
-    fs.appendFileSync('/tmp/mcp-debug.log', `SIGTERM received, exiting cleanly\n`);
-  } catch (e) {}
   process.exit(0);
 });
 
 process.on('SIGINT', () => {
-  try {
-    fs.appendFileSync('/tmp/mcp-debug.log', `SIGINT received, exiting cleanly\n`);
-  } catch (e) {}
   process.exit(0);
 });
 
@@ -231,9 +209,6 @@ function main() {
             jsonrpc: '2.0',
             method: 'notifications/tools/list_changed',
           });
-          try {
-            fs.appendFileSync('/tmp/mcp-debug.log', `[mcp-proxy] tools changed! sending notification to LS\n`);
-          } catch (e) {}
         }
         lastToolsHash = hash;
       }
