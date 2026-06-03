@@ -19,6 +19,8 @@ vi.mock('antigravity-client', () => {
     sendMessage = vi.fn().mockResolvedValue({});
     getHistory = vi.fn().mockResolvedValue({ trajectory: { steps: [] } });
     dispose = vi.fn();
+    cancel = vi.fn().mockResolvedValue(undefined);
+    cancelAndWait = vi.fn().mockResolvedValue(undefined);
     on = vi.fn((event: string, handler: Function) => {
       if (!this._handlers.has(event)) this._handlers.set(event, []);
       this._handlers.get(event)!.push(handler);
@@ -473,5 +475,24 @@ describe('AntigravityBackend', () => {
     expect(turnEnd.usage.cache_read_input_tokens).toBe(8);
     expect(turnEnd.usage.cache_creation_input_tokens).toBeUndefined(); // 0 → undefined
     expect(turnEnd.usage.context_window_estimated_tokens).toBe(25000);
+  });
+
+  it('should call cascade.cancel when cancelSession is called', async () => {
+    const backend = new AntigravityBackend();
+    await backend.initialize();
+
+    const stream = backend.createMessageStream('session-cancel-test', {
+      model: 'Gemini_3.5_Flash_High',
+      messages: [{ role: 'user', content: 'Hello' }],
+    });
+
+    for await (const _ of stream) {}
+
+    const mockCascade = (backend as any).cascades.get('session-cancel-test');
+    expect(mockCascade).toBeDefined();
+
+    const cancelSpy = vi.spyOn(mockCascade, 'cancel');
+    await backend.cancelSession('session-cancel-test');
+    expect(cancelSpy).toHaveBeenCalled();
   });
 });

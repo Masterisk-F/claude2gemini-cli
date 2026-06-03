@@ -479,6 +479,24 @@ export class AntigravityBackend {
     let cascade = this.cascades.get(sessionId);
 
     if (!cascade) {
+      // Cancel and dispose all existing cascades before creating a new one.
+      // Claude Code doesn't send x-session-id, so each request gets a new
+      // sessionId. Without this cleanup, old cascades remain running and
+      // continue issuing tool calls even after the user moves on.
+      for (const [oldId, oldCascade] of this.cascades.entries()) {
+        console.log(`[Backend] Cleaning up old cascade: ${oldId} (cascadeId=${oldCascade.cascadeId})`);
+        this.mcpHub.clearPendingCalls(`Cleaning up old cascade ${oldId}`);
+        try {
+          const oldStatus = oldCascade.state?.status ?? 0;
+          if (oldStatus >= 2) { // RUNNING, CANCELING, or BUSY
+            await oldCascade.cancelAndWait({ timeoutMs: 5_000 });
+          }
+        } catch (err) {
+          console.warn(`[Backend] Failed to cancel old cascade ${oldId} (non-fatal):`, err);
+        }
+        this.cascades.delete(oldId);
+      }
+
       cascade = await this.client!.startCascade();
       this.cascades.set(sessionId, cascade);
       console.log(`[Backend] New cascade created: ${cascade.cascadeId}`);
@@ -514,6 +532,92 @@ export class AntigravityBackend {
     // Resolve API key for Metadata
     const apiKey = process.env.ANTIGRAVITY_API_KEY || readAuthStatus()?.apiKey || '';
 
+      // Early detection: is the current message a tool result?
+      // This must be checked BEFORE history matching (steps 1-5), because
+      // tool result requests are continuations of the previous turn, not new
+      // conversation turns. Running history matching on them causes false
+      // mismatches (cascadeUserTurns.length > clientTurns.length) which
+      // destroys the cascade and loses the user's original instruction.
+      const isToolResult =
+        lastUserMessage.role === 'user' &&
+        Array.isArray(lastUserMessage.content) &&
+        lastUserMessage.content.some((b: ClaudeContentBlock) => b.type === 'tool_result');
+
+      const toolResultBlocks = isToolResult
+        ? (lastUserMessage.content as ClaudeContentBlock[]).filter((b): b is ClaudeToolResultBlock => b.type === 'tool_result')
+        : [];
+
+      const isWaitingForThisTool = toolResultBlocks.some((b) =>
+        this.mcpHub.getPendingCalls().some((c) => c.callId === b.tool_use_id)
+      );
+
+      // ── Tool result continuation (skip history matching entirely) ──────
+      if (isToolResult && isWaitingForThisTool) {
+        for (const block of toolResultBlocks) {
+          const { tool_use_id, content, is_error } = block;
+          const mcpResult = {
+            content: [{
+              type: 'text',
+              text: typeof content === 'string' ? content : JSON.stringify(content),
+            }],
+            isError: !!is_error,
+          };
+          try {
+            await this.mcpHub.resolveCall(tool_use_id, mcpResult);
+          } catch {
+            // callId not in hub — first message in a new cascade, proceed
+          }
+        }
+
+        // Wait for the cascade to generate the next response (tool result processed).
+        const turnStartCount = cascade.state?.trajectory?.steps?.length ?? 0;
+        const turn = await this.waitForTurnOrToolCall(cascade);
+
+        // Check for cascade error (quota, shutdown, etc.)
+        if (this.#cascadeError) {
+          const err = this.#cascadeError;
+          this.#cascadeError = null;
+          const status = this.#classifyConnectErrorCode(err);
+          yield { type: 'error', sessionId, message: `Antigravity LS error: ${err.message}`, status };
+          return;
+        }
+
+        if (turn === 'tool_call') {
+          const allowedToolNames = request.tools?.map((t) => t.name) || [];
+          for (const call of this.mcpHub.getPendingCalls()) {
+            if (allowedToolNames.length > 0 && !allowedToolNames.includes(call.name)) {
+              console.log(`[Backend] Rejecting disallowed tool call: ${call.name} (${call.callId})`);
+              this.mcpHub.resolveCall(call.callId, {
+                content: [{ type: 'text', text: `Error: Tool ${call.name} is not allowed or available in this context.` }],
+                isError: true,
+              }).catch(() => {});
+              continue;
+            }
+            yield { type: 'tool_call', sessionId, callId: call.callId, name: call.name, args: call.args };
+          }
+          const usage1 = await this.#fetchUsage(cascade);
+          yield { type: 'turn_end', sessionId, stopReason: 'tool_use', usage: usage1 };
+          return;
+        }
+
+        // idle — collect text from new steps only
+        const collected = this.collectTextFromSteps(cascade, turnStartCount);
+
+        // Check for errorMessage steps in new trajectory steps
+        const errorMsg = this.#findErrorStep(cascade, turnStartCount);
+        if (errorMsg) {
+          yield { type: 'error', sessionId, message: errorMsg, status: 500 };
+          return;
+        }
+
+        if (collected) {
+          yield { type: 'stream_event', sessionId, event: { type: 'content', value: collected } };
+        }
+        const usage1 = await this.#fetchUsage(cascade);
+        yield { type: 'turn_end', sessionId, stopReason: 'end_turn', usage: usage1 };
+        return;
+      }
+
     try {
       // 1. Build client turns (excluding the current last message and tool results messages)
       interface ClientTurn {
@@ -522,26 +626,41 @@ export class AntigravityBackend {
       }
       const clientTurns: ClientTurn[] = [];
       let currentUserText = '';
+      let currentAssistantText = '';
+
       for (let i = 0; i < messages.length - 1; i++) {
         const msg = messages[i];
         if (msg.role === 'user') {
           const content = msg.content;
-          const isToolResult = Array.isArray(content) && content.every((b: ClaudeContentBlock) => b.type === 'tool_result');
-          if (!isToolResult) {
+          const hasToolResult = Array.isArray(content) && content.some((b: ClaudeContentBlock) => b.type === 'tool_result');
+          if (!hasToolResult) {
+            if (currentUserText && currentAssistantText) {
+              clientTurns.push({
+                userText: currentUserText,
+                assistantText: currentAssistantText,
+              });
+              currentUserText = '';
+              currentAssistantText = '';
+            }
             currentUserText = typeof content === 'string'
               ? content
               : content.map((b: ClaudeContentBlock) => (b.type === 'text' ? b.text : '') || '').filter(Boolean).join('\n');
           }
-        } else if (msg.role === 'assistant' && currentUserText) {
-          const assistantText = typeof msg.content === 'string'
-            ? msg.content
-            : msg.content.map((b: ClaudeContentBlock) => (b.type === 'text' ? b.text : '') || '').filter(Boolean).join('\n');
-          clientTurns.push({
-            userText: currentUserText,
-            assistantText: assistantText,
-          });
-          currentUserText = '';
+        } else if (msg.role === 'assistant') {
+          const content = msg.content;
+          const hasToolUse = Array.isArray(content) && content.some((b: ClaudeContentBlock) => b.type === 'tool_use');
+          if (!hasToolUse && currentUserText) {
+            currentAssistantText = typeof content === 'string'
+              ? content
+              : content.map((b: ClaudeContentBlock) => (b.type === 'text' ? b.text : '') || '').filter(Boolean).join('\n');
+          }
         }
+      }
+      if (currentUserText && currentAssistantText) {
+        clientTurns.push({
+          userText: currentUserText,
+          assistantText: currentAssistantText,
+        });
       }
 
       // Helper function to extract user input text from step
@@ -640,90 +759,27 @@ export class AntigravityBackend {
 
       const systemPrompt = extractSystemPrompt(request.system);
 
-      // 6. Check if current message is a tool result and check for waiting state
-      const isToolResult =
-        lastUserMessage.role === 'user' &&
-        Array.isArray(lastUserMessage.content) &&
-        lastUserMessage.content.some((b: ClaudeContentBlock) => b.type === 'tool_result');
-
-      // Clear pending calls from previous turns if this is a fresh user instruction
-      if (!isToolResult) {
-        this.mcpHub.clearPendingCalls('New user instruction received, clearing stale calls');
-      }
-
-      const toolResultBlocks = isToolResult
-        ? (lastUserMessage.content as ClaudeContentBlock[]).filter((b): b is ClaudeToolResultBlock => b.type === 'tool_result')
-        : [];
-
-      const isWaitingForThisTool = toolResultBlocks.some((b) =>
-        this.mcpHub.getPendingCalls().some((c) => c.callId === b.tool_use_id)
-      );
-
-      // ── Tool result continuation ──────────────────────────────
-      if (isToolResult && isWaitingForThisTool) {
-        for (const block of toolResultBlocks) {
-          const { tool_use_id, content, is_error } = block;
-          const mcpResult = {
-            content: [{
-              type: 'text',
-              text: typeof content === 'string' ? content : JSON.stringify(content),
-            }],
-            isError: !!is_error,
-          };
+      // Cancel in-flight cascade turn and clear stale pending tool calls
+      // when a fresh user instruction arrives.
+      // This handles the case where the user hit Esc mid-tool-execution:
+      // the LS may still be running (waiting for MCP results, or reacting to
+      // tool errors by issuing new calls). We must cancel the cascade and
+      // bring it back to idle before sending a new message.
+      // CascadeRunStatus: UNSPECIFIED=0, IDLE=1, RUNNING=2, CANCELING=3, BUSY=4
+      {
+        const status = cascade.state?.status ?? 0;
+        const cascadeIsRunning = status >= 2; // RUNNING, CANCELING, or BUSY
+        if (this.mcpHub.hasPendingCalls() || cascadeIsRunning) {
+          console.log(`[Backend] Fresh user instruction while cascade is active (status=${status}, pendingCalls=${this.mcpHub.getPendingCalls().length}). Cancelling cascade.`);
+          this.mcpHub.clearPendingCalls('New user instruction received, clearing stale calls');
           try {
-            await this.mcpHub.resolveCall(tool_use_id, mcpResult);
-          } catch {
-            // callId not in hub — first message in a new cascade, proceed
+            await cascade.cancelAndWait({ timeoutMs: 10_000 });
+          } catch (err) {
+            console.warn('[Backend] cancelAndWait failed (non-fatal):', err);
           }
         }
-
-        // Wait for the cascade to generate the next response (tool result processed).
-        const turnStartCount = cascade.state?.trajectory?.steps?.length ?? 0;
-        const turn = await this.waitForTurnOrToolCall(cascade);
-
-        // Check for cascade error (quota, shutdown, etc.)
-        if (this.#cascadeError) {
-          const err = this.#cascadeError;
-          this.#cascadeError = null;
-          const status = this.#classifyConnectErrorCode(err);
-          yield { type: 'error', sessionId, message: `Antigravity LS error: ${err.message}`, status };
-          return;
-        }
-
-        if (turn === 'tool_call') {
-          const allowedToolNames = request.tools?.map((t) => t.name) || [];
-          for (const call of this.mcpHub.getPendingCalls()) {
-            if (allowedToolNames.length > 0 && !allowedToolNames.includes(call.name)) {
-              console.log(`[Backend] Rejecting disallowed tool call: ${call.name} (${call.callId})`);
-              this.mcpHub.resolveCall(call.callId, {
-                content: [{ type: 'text', text: `Error: Tool ${call.name} is not allowed or available in this context.` }],
-                isError: true,
-              }).catch(() => {});
-              continue;
-            }
-            yield { type: 'tool_call', sessionId, callId: call.callId, name: call.name, args: call.args };
-          }
-          const usage1 = await this.#fetchUsage(cascade);
-          yield { type: 'turn_end', sessionId, stopReason: 'tool_use', usage: usage1 };
-          return;
-        }
-
-        // idle — collect text from new steps only
-        const collected = this.collectTextFromSteps(cascade, turnStartCount);
-
-        // Check for errorMessage steps in new trajectory steps
-        const errorMsg = this.#findErrorStep(cascade, turnStartCount);
-        if (errorMsg) {
-          yield { type: 'error', sessionId, message: errorMsg, status: 500 };
-          return;
-        }
-
-        if (collected) {
-          yield { type: 'stream_event', sessionId, event: { type: 'content', value: collected } };
-        }
-        const usage1 = await this.#fetchUsage(cascade);
-        yield { type: 'turn_end', sessionId, stopReason: 'end_turn', usage: usage1 };
-        return;
+        // Final sweep: clear any calls that arrived during cancel
+        this.mcpHub.clearPendingCalls('Post-cancel cleanup');
       }
 
       // ── New message (user text, possibly with tools or tool fallback) ──────────
@@ -846,6 +902,19 @@ export class AntigravityBackend {
 
       yield { type: 'error', sessionId, message: errorMsg };
     }
+  }
+
+  async cancelSession(sessionId: string): Promise<void> {
+    const cascade = this.cascades.get(sessionId);
+    if (cascade) {
+      console.log(`[Backend] Cancelling cascade for session ${sessionId} (cascadeId=${cascade.cascadeId})`);
+      try {
+        await cascade.cancel();
+      } catch (err) {
+        console.warn(`[Backend] Failed to cancel cascade for session ${sessionId}:`, err);
+      }
+    }
+    this.mcpHub.clearPendingCalls('Session cancelled');
   }
 
   async shutdown(): Promise<void> {
