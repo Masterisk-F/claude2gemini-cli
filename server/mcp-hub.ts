@@ -304,18 +304,80 @@ export function simplifySchema(schema: any): any {
     return schema;
   }
 
-  // 1. Resolve anyOf or oneOf into a simpler model
+  // 1. Resolve anyOf or oneOf by merging properties and required from ALL
+  // branches so the model knows about every possible parameter. Only the
+  // first non-null branch determines the primary type.
   if (schema.anyOf && Array.isArray(schema.anyOf)) {
-    const firstValid = schema.anyOf.find((s: any) => s && s.type !== 'null') || schema.anyOf[0];
-    if (firstValid) {
-      return simplifySchema({ ...schema, ...firstValid, anyOf: undefined });
+    const nonNullBranches = schema.anyOf.filter((s: any) => s && s.type !== 'null');
+    const branchesToMerge = nonNullBranches.length > 0 ? nonNullBranches : schema.anyOf;
+
+    const merged: any = { ...schema, anyOf: undefined };
+    // Remove parent type so branches can define it
+    delete merged.type;
+    // Only include properties/required if the parent actually has them
+    if (schema.properties) {
+      merged.properties = { ...schema.properties };
     }
+    const requiredArr = schema.required;
+    if (Array.isArray(requiredArr)) {
+      merged.required = [...requiredArr];
+    }
+
+    for (const branch of branchesToMerge) {
+      const simplified = simplifySchema(branch);
+      if (simplified.properties) {
+        merged.properties = { ...(merged.properties || {}), ...simplified.properties };
+      }
+      if (Array.isArray(simplified.required)) {
+        merged.required = Array.from(new Set([...(merged.required || []), ...simplified.required]));
+      }
+      if (simplified.type && !merged.type) {
+        merged.type = simplified.type;
+      }
+    }
+
+    // Clean up empty properties/required so step 4 doesn't falsely match
+    if (merged.properties && Object.keys(merged.properties).length === 0) {
+      delete merged.properties;
+    }
+    if (merged.required && merged.required.length === 0) {
+      delete merged.required;
+    }
+
+    return simplifySchema(merged);
   }
   if (schema.oneOf && Array.isArray(schema.oneOf)) {
-    const firstValid = schema.oneOf.find((s: any) => s && s.type !== 'null') || schema.oneOf[0];
-    if (firstValid) {
-      return simplifySchema({ ...schema, ...firstValid, oneOf: undefined });
+    const merged: any = { ...schema, oneOf: undefined };
+    delete merged.type;
+    if (schema.properties) {
+      merged.properties = { ...schema.properties };
     }
+    const requiredArr = schema.required;
+    if (Array.isArray(requiredArr)) {
+      merged.required = [...requiredArr];
+    }
+
+    for (const branch of schema.oneOf) {
+      const simplified = simplifySchema(branch);
+      if (simplified.properties) {
+        merged.properties = { ...(merged.properties || {}), ...simplified.properties };
+      }
+      if (Array.isArray(simplified.required)) {
+        merged.required = Array.from(new Set([...(merged.required || []), ...simplified.required]));
+      }
+      if (simplified.type && !merged.type) {
+        merged.type = simplified.type;
+      }
+    }
+
+    if (merged.properties && Object.keys(merged.properties).length === 0) {
+      delete merged.properties;
+    }
+    if (merged.required && merged.required.length === 0) {
+      delete merged.required;
+    }
+
+    return simplifySchema(merged);
   }
 
   // 2. Resolve allOf by merging all nested properties and required arrays
@@ -476,23 +538,14 @@ export function cleanAndFixArguments(args: any, schema: any): any {
         result[key] = value;
       }
     } else {
-      // If default is defined, always apply it
+      // If default is defined, always apply it.
+      // For required fields with no value provided, leave them undefined
+      // rather than filling with empty strings/zeros/false. Let the tool
+      // call fail with a meaningful error so the model can self-correct.
+      // Filling required strings with '' causes tools like browser_evaluate
+      // and browser_click to execute with nonsensical empty arguments.
       if ((propSchema as any).default !== undefined) {
         result[key] = (propSchema as any).default;
-      } else if (required.includes(key)) {
-        if (expectedType === 'integer' || expectedType === 'number') {
-          result[key] = 0;
-        } else if (expectedType === 'boolean') {
-          result[key] = false;
-        } else if (expectedType === 'string') {
-          result[key] = '';
-        } else if (expectedType === 'array') {
-          result[key] = [];
-        } else if (expectedType === 'object') {
-          result[key] = {};
-        } else {
-          result[key] = null;
-        }
       }
     }
   }

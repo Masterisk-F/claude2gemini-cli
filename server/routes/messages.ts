@@ -135,12 +135,16 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
 
     let sessionId = req.headers['x-session-id'] as string;
     if (!sessionId) {
-      // Try to resolve from last message tool_result
-      const lastMessage = body.messages[body.messages.length - 1];
-      if (lastMessage.role === 'user' && Array.isArray(lastMessage.content)) {
-        const toolResult = lastMessage.content.find((b: any) => b.type === 'tool_result');
-        if (toolResult) {
-          sessionId = sessionStore.resolveToolCall(toolResult.tool_use_id) || '';
+      // Scan backward to find a user message with tool_result for session
+      // resolution. Claude Code sometimes appends system messages at the
+      // end of the messages array, so we can't rely on just the last message.
+      for (let i = body.messages.length - 1; i >= 0 && !sessionId; i--) {
+        const msg = body.messages[i];
+        if (msg.role === 'user' && Array.isArray(msg.content)) {
+          const toolResult = msg.content.find((b: any) => b.type === 'tool_result');
+          if (toolResult) {
+            sessionId = sessionStore.resolveToolCall(toolResult.tool_use_id) || '';
+          }
         }
       }
     }
@@ -160,53 +164,75 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
     const allowedToolNames = body.tools?.map((t: any) => t.name) || [];
     console.log(`[API] Allowed tool names: ${JSON.stringify(allowedToolNames)}`);
 
-    if (body.stream) {
-      setupSSEHeaders(res);
-      await streamGeminiToClaudeSSE(stream, res, body.model, sessionId, sessionStore, allowedToolNames);
-    } else {
-      const contentBlocks: any[] = [];
-      let currentText = '';
-      let turnEndUsage: any;
-
-      const flushText = () => {
-        if (currentText) {
-          contentBlocks.push({ type: 'text', text: currentText });
-          currentText = '';
-        }
-      };
-
-      for await (const msg of stream) {
-        if (msg.type === 'stream_event') {
-          if (msg.event.type === 'content' && msg.event.value) {
-            currentText += msg.event.value;
-          }
-        } else if (msg.type === 'tool_call') {
-          if (allowedToolNames.includes(msg.name)) {
-            flushText();
-            sessionStore.addPendingToolCall(sessionId, msg.callId);
-            contentBlocks.push({
-              type: 'tool_use',
-              id: msg.callId,
-              name: msg.name,
-              input: msg.args
-            });
-          }
-        } else if (msg.type === 'error' || msg.type === 'fatal_error') {
-          throw new GeminiApiError(msg.message, 'status' in msg ? msg.status : undefined);
-        } else if (msg.type === 'turn_end') {
-          flushText();
-          turnEndUsage = msg.usage;
-          break;
+    let isFinished = false;
+    const cleanupOnClose = () => {
+      if (!isFinished && !res.writableEnded) {
+        console.log(`[API] Client disconnected. Cancelling session: ${sessionId}`);
+        antigravityBackend.cancelSession(sessionId).catch((err) => {
+          console.error(`[API] Error cancelling session ${sessionId}:`, err);
+        });
+        if (stream && typeof stream.return === 'function') {
+          stream.return(undefined).catch(() => {});
         }
       }
+    };
+    res.on('close', cleanupOnClose);
 
-      const claudeResponse = buildClaudeResponse({
-        contentBlocks,
-        model: body.model,
-        usage: turnEndUsage,
-      });
+    try {
+      if (body.stream) {
+        setupSSEHeaders(res);
+        await streamGeminiToClaudeSSE(stream, res, body.model, sessionId, sessionStore, allowedToolNames);
+      } else {
+        const contentBlocks: any[] = [];
+        let currentText = '';
+        let turnEndUsage: any;
 
-      res.json(claudeResponse);
+        const flushText = () => {
+          if (currentText) {
+            contentBlocks.push({ type: 'text', text: currentText });
+            currentText = '';
+          }
+        };
+
+        for await (const msg of stream) {
+          if (msg.type === 'stream_event') {
+            if (msg.event.type === 'content' && msg.event.value) {
+              currentText += msg.event.value;
+            }
+          } else if (msg.type === 'tool_call') {
+            if (allowedToolNames.includes(msg.name)) {
+              flushText();
+              sessionStore.addPendingToolCall(sessionId, msg.callId);
+              contentBlocks.push({
+                type: 'tool_use',
+                id: msg.callId,
+                name: msg.name,
+                input: msg.args
+              });
+            }
+          } else if (msg.type === 'error' || msg.type === 'fatal_error') {
+            throw new GeminiApiError(msg.message, 'status' in msg ? msg.status : undefined);
+          } else if (msg.type === 'turn_end') {
+            flushText();
+            turnEndUsage = msg.usage;
+            break;
+          }
+        }
+
+        const claudeResponse = buildClaudeResponse({
+          contentBlocks,
+          model: body.model,
+          usage: turnEndUsage,
+        });
+
+        res.json(claudeResponse);
+      }
+      isFinished = true;
+    } catch (err) {
+      isFinished = true;
+      throw err;
+    } finally {
+      res.off('close', cleanupOnClose);
     }
   } catch (error) {
     if (res.headersSent) {

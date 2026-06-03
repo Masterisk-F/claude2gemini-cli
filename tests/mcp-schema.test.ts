@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { simplifySchema, cleanAndFixArguments, unpackMetaCall } from '../server/mcp-hub.js';
 
 describe('Schema Simplification', () => {
-  it('should resolve anyOf/oneOf to a primitive type or first option', () => {
+  it('should merge all anyOf/oneOf branches properties and required', () => {
     const complexSchema = {
       type: 'object',
       properties: {
@@ -22,10 +22,39 @@ describe('Schema Simplification', () => {
     };
 
     const simplified = simplifySchema(complexSchema);
+    // anyOf: string branch kept, null branch discarded (type-level)
     expect(simplified.properties.command.type).toBe('string');
     expect(simplified.properties.command.anyOf).toBeUndefined();
-    expect(simplified.properties.timeout.type).toBe('integer');
+    // oneOf: merged from both branches — both types visible
+    expect(simplified.properties.timeout).toBeDefined();
     expect(simplified.properties.timeout.oneOf).toBeUndefined();
+  });
+
+  it('should merge anyOf branches at the top level', () => {
+    // Simulates a tool schema with two possible object shapes
+    const schema = {
+      anyOf: [
+        {
+          type: 'object',
+          properties: { id: { type: 'string' } },
+          required: ['id']
+        },
+        {
+          type: 'object',
+          properties: { name: { type: 'string' } },
+          required: ['name']
+        }
+      ]
+    };
+
+    const simplified = simplifySchema(schema);
+    expect(simplified.anyOf).toBeUndefined();
+    // Both properties from both branches should be present
+    expect(simplified.properties.id).toBeDefined();
+    expect(simplified.properties.name).toBeDefined();
+    // Required from both branches merged
+    expect(simplified.required).toContain('id');
+    expect(simplified.required).toContain('name');
   });
 
   it('should merge allOf schemas into a flat object', () => {
@@ -116,7 +145,56 @@ describe('Arguments Cleansing and Fixing', () => {
     const cleaned = cleanAndFixArguments(args, testSchema);
     expect(cleaned.command).toBe('echo test');
     expect(cleaned.timeout).toBe(30); // from default
-    expect(cleaned.verbose).toBe(false); // fallback for boolean
+    // Required boolean with no default: no longer filled with fallback
+    expect(cleaned.verbose).toBeUndefined();
+  });
+
+  it('should NOT fill missing required string parameters with empty strings', () => {
+    // browser_evaluate style schema: function is required string
+    const evalSchema = {
+      type: 'object',
+      properties: {
+        function: { type: 'string', description: 'JavaScript to evaluate' },
+        element: { type: 'string', description: 'Element selector' }
+      },
+      required: ['function']
+    };
+
+    // Model sends no arguments at all
+    const args = {};
+    const cleaned = cleanAndFixArguments(args, evalSchema);
+    // Required string should NOT be filled with empty string
+    expect(cleaned.function).toBeUndefined();
+  });
+
+  it('should NOT fill missing required string parameters with empty strings for browser_click', () => {
+    // browser_click style schema: target is required string
+    const clickSchema = {
+      type: 'object',
+      properties: {
+        target: { type: 'string', description: 'Element target' },
+        button: { type: 'string' }
+      },
+      required: ['target']
+    };
+
+    const args = {};
+    const cleaned = cleanAndFixArguments(args, clickSchema);
+    expect(cleaned.target).toBeUndefined();
+  });
+
+  it('should preserve provided values for required fields', () => {
+    const evalSchema = {
+      type: 'object',
+      properties: {
+        function: { type: 'string' }
+      },
+      required: ['function']
+    };
+
+    const args = { function: 'document.title' };
+    const cleaned = cleanAndFixArguments(args, evalSchema);
+    expect(cleaned.function).toBe('document.title');
   });
 });
 
