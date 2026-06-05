@@ -111,7 +111,6 @@ export async function streamGeminiToClaudeSSE(
   res: Response,
   model: string,
   sessionId: string,
-  sessionStore: typeof import('../session-store.js').sessionStore,
   allowedToolNames: string[]
 ): Promise<void> {
   const messageId = `msg_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
@@ -187,8 +186,8 @@ export async function streamGeminiToClaudeSSE(
           continue;
         }
 
-        // Parent 側のセッションストアに toolCallId -> sessionId のマッピングを登録
-        sessionStore.addPendingToolCall(sessionId, callId);
+        // Stateless: no session-scoped tool_call registry needed — each request
+        // is resolved in isolation against the live backend cascade.
 
         if (textBlockStarted) {
           sendContentBlockStop(res, blockIndex);

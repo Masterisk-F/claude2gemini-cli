@@ -24,7 +24,7 @@ export function mapModelName(model: string): string {
     return 'Claude_Sonnet_4.6_Thinking';
   }
   if (lower.includes('haiku')) {
-    return 'Gemini_3.1_Flash_Lite';
+    return 'Gemini_3.5_Flash_Low';
   }
 
   // Gemini エイリアス
@@ -34,7 +34,7 @@ export function mapModelName(model: string): string {
       return 'Gemini_3.1_Pro_High';
     }
     if (lower.includes('flash')) {
-      if (lower.includes('lite')) return 'Gemini_3.1_Flash_Lite';
+      if (lower.includes('lite')) return 'Gemini_3.5_Flash_Low';
       if (lower.includes('low')) return 'Gemini_3.5_Flash_Low';
       if (lower.includes('medium')) return 'Gemini_3.5_Flash_Medium';
       return 'Gemini_3.5_Flash_High';
@@ -44,7 +44,7 @@ export function mapModelName(model: string): string {
   // 簡易エイリアス
   if (lower === 'pro') return 'Gemini_3.1_Pro_High';
   if (lower === 'flash') return 'Gemini_3.5_Flash_High';
-  if (lower === 'flash-lite') return 'Gemini_3.1_Flash_Lite';
+  if (lower === 'flash-lite') return 'Gemini_3.5_Flash_Low';
 
   // デフォルト
   return 'Gemini_3.5_Flash_High';

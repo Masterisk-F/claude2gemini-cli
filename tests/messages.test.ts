@@ -1,7 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { classifyError } from '../server/routes/messages.js';
 import { antigravityBackend, GeminiApiError } from '../server/gemini-backend.js';
-import { sessionStore } from '../server/session-store.js';
 import express from 'express';
 import request from 'supertest';
 import { messagesRouter } from '../server/routes/messages.js';
@@ -21,14 +20,6 @@ vi.mock('../server/gemini-backend.js', () => {
     }
   };
 });
-
-vi.mock('../server/session-store.js', () => ({
-  sessionStore: {
-    resolveToolCall: vi.fn(),
-    addPendingToolCall: vi.fn(),
-    deleteSession: vi.fn(),
-  }
-}));
 
 const app = express();
 app.use(express.json());
@@ -126,10 +117,8 @@ describe('POST /', () => {
     expect(res.body.usage.context_window_estimated_tokens).toBe(30000);
   });
 
-  describe('session ID resolution', () => {
-    it('resolves session ID from tool_result when last message is user', async () => {
-      const resolveSpy = vi.spyOn(sessionStore, 'resolveToolCall').mockReturnValue('resolved-session-123');
-
+  describe('request ID generation', () => {
+    it('generates a fresh requestId prefixed with req_ for every request', async () => {
       async function* mockStream() {
         yield { type: 'turn_end', usage: { input_tokens: 5, output_tokens: 3 } };
       }
@@ -137,75 +126,16 @@ describe('POST /', () => {
 
       const payload = {
         model: 'claude-3-opus-20240229',
-        messages: [
-          { role: 'user', content: 'Hi' },
-          { role: 'assistant', content: [{ type: 'tool_use', id: 'tool-abc', name: 'Bash', input: {} }] },
-          { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tool-abc', content: 'done' }] },
-        ],
+        messages: [{ role: 'user', content: 'Just a simple message' }],
       };
 
       await request(app).post('/').send(payload);
 
-      expect(resolveSpy).toHaveBeenCalledWith('tool-abc');
-      expect(antigravityBackend.createMessageStream).toHaveBeenCalledWith(
-        'resolved-session-123',
-        expect.any(Object)
-      );
-    });
-
-    it('resolves session ID from tool_result even when Claude Code appends a system message at the end', async () => {
-      const resolveSpy = vi.spyOn(sessionStore, 'resolveToolCall').mockReturnValue('resolved-session-456');
-
-      async function* mockStream() {
-        yield { type: 'turn_end', usage: { input_tokens: 5, output_tokens: 3 } };
-      }
-      (antigravityBackend.createMessageStream as any).mockReturnValue(mockStream());
-
-      // Simulates the bug scenario: Claude Code appends a system message after the user tool_result
-      const payload = {
-        model: 'claude-3-opus-20240229',
-        messages: [
-          { role: 'user', content: 'Hi' },
-          { role: 'assistant', content: [{ type: 'tool_use', id: 'tool-xyz', name: 'Bash', input: {} }] },
-          { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tool-xyz', content: 'done' }] },
-          { role: 'system', content: 'The task tools haven\'t been used recently...' },
-        ],
-      };
-
-      await request(app).post('/').send(payload);
-
-      // Must find the tool_result in the user message, skipping the trailing system message
-      expect(resolveSpy).toHaveBeenCalledWith('tool-xyz');
-      expect(antigravityBackend.createMessageStream).toHaveBeenCalledWith(
-        'resolved-session-456',
-        expect.any(Object)
-      );
-    });
-
-    it('generates a new session ID when no tool_result is found in any message', async () => {
-      async function* mockStream() {
-        yield { type: 'turn_end', usage: { input_tokens: 5, output_tokens: 3 } };
-      }
-      (antigravityBackend.createMessageStream as any).mockReturnValue(mockStream());
-
-      const payload = {
-        model: 'claude-3-opus-20240229',
-        messages: [
-          { role: 'user', content: 'Just a simple message' },
-          { role: 'system', content: 'Some system prompt context' },
-        ],
-      };
-
-      await request(app).post('/').send(payload);
-
-      // Should create a new session with session_ prefix
       const callArgs = (antigravityBackend.createMessageStream as any).mock.calls[0];
-      expect(callArgs[0]).toMatch(/^session_/);
+      expect(callArgs[0]).toMatch(/^req_/);
     });
 
-    it('uses x-session-id header when provided, skipping tool_result resolution', async () => {
-      const resolveSpy = vi.spyOn(sessionStore, 'resolveToolCall');
-
+    it('does NOT honor x-session-id header (stateless — every request is independent)', async () => {
       async function* mockStream() {
         yield { type: 'turn_end', usage: { input_tokens: 5, output_tokens: 3 } };
       }
@@ -213,11 +143,7 @@ describe('POST /', () => {
 
       const payload = {
         model: 'claude-3-opus-20240229',
-        messages: [
-          { role: 'user', content: 'Hi' },
-          { role: 'assistant', content: [{ type: 'tool_use', id: 'tool-ignored', name: 'Bash', input: {} }] },
-          { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'tool-ignored', content: 'done' }] },
-        ],
+        messages: [{ role: 'user', content: 'Hi' }],
       };
 
       await request(app)
@@ -225,11 +151,31 @@ describe('POST /', () => {
         .set('x-session-id', 'explicit-session-id')
         .send(payload);
 
-      expect(resolveSpy).not.toHaveBeenCalled();
-      expect(antigravityBackend.createMessageStream).toHaveBeenCalledWith(
-        'explicit-session-id',
-        expect.any(Object)
-      );
+      const callArgs = (antigravityBackend.createMessageStream as any).mock.calls[0];
+      // x-session-id is ignored: a fresh req_ id is always generated.
+      expect(callArgs[0]).toMatch(/^req_/);
+      expect(callArgs[0]).not.toBe('explicit-session-id');
+    });
+
+    it('generates a unique requestId per call (no cross-request state)', async () => {
+      async function* mockStream() {
+        yield { type: 'turn_end', usage: { input_tokens: 5, output_tokens: 3 } };
+      }
+      (antigravityBackend.createMessageStream as any).mockReturnValue(mockStream());
+
+      const payload = {
+        model: 'claude-3-opus-20240229',
+        messages: [{ role: 'user', content: 'Hi' }],
+      };
+
+      await request(app).post('/').send(payload);
+      await request(app).post('/').send(payload);
+
+      const id1 = (antigravityBackend.createMessageStream as any).mock.calls[0][0];
+      const id2 = (antigravityBackend.createMessageStream as any).mock.calls[1][0];
+      expect(id1).toMatch(/^req_/);
+      expect(id2).toMatch(/^req_/);
+      expect(id1).not.toBe(id2);
     });
   });
 

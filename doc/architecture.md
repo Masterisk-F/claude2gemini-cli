@@ -46,7 +46,7 @@ Express application entry point. Configures JSON body parsing (200MB limit for l
 Manages the lifecycle of the Antigravity Language Server (LS) and provides the interface for sending prompts and handling Cascades.
 - Starts the `McpHub` HTTP server before launching the LS.
 - Launches the actual Antigravity Language Server via `AntigravityClient.launch`.
-- Writes `.mcp.json` to the workspace root and registers the proxy server on startup using the LS `refreshMcpServers` RPC.
+- Writes `.mcp.json` to its temp workspaceDir (under `/tmp`) and registers the proxy server on startup using the LS `refreshMcpServers` RPC. The `/tmp` location keeps Claude Code from auto-discovering the proxy as an MCP server.
 - Converts request tools via `McpHub.setTools` and schedules the first synchronization check.
 - Extracts the latest `user` message as the main prompt, merging subsequent contexts (like Git statuses or custom system hooks) at the beginning of the message stream inside `=== SYSTEM CONTEXT ===` block tags.
 

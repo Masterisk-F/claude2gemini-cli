@@ -3,8 +3,26 @@
  *
  * Manages the lifecycle of the Antigravity Language Server (LS)
  * and provides a bridge between Claude API requests and Antigravity Cascades.
+ *
+ * Stateful session continuation:
+ *   The LS holds trajectory state per Cascade. The proxy keeps a
+ *   `sessionStore` (sessionId → cascadeId) and re-attaches to the
+ *   same Cascade on every request in the same Claude Code session.
+ *   The first user message in the request is used as the session
+ *   anchor; we hash it (SHA-256) to derive a stable sessionId.
+ *
+ *   The production LS does NOT honor `baseTrajectoryIdentifier.trajectory`
+ *   with structured steps (the trajectory is discarded, observed
+ *   symptom: `total_steps` remains at 1 and the planner produces an
+ *   empty response). The session-continuation architecture sidesteps
+ *   this by keeping the Cascade alive across requests.
+ *
+ *   On Cascade error / disposal / LRU eviction, the trajectory is
+ *   deleted via `deleteCascadeTrajectory` so the LS does not leak
+ *   state for sessions that no longer exist.
  */
 
+import { randomUUID } from 'node:crypto';
 import { AntigravityClient, readAuthStatus } from 'antigravity-client';
 import {
   TextOrScopeItem, ModelOrAlias, Metadata, ImageData, ContextScopeItem, PathScopeItem,
@@ -17,25 +35,30 @@ import {
   AntigravityBrowserToolConfig, BrowserSubagentToolConfig, InvokeSubagentToolConfig,
   NotebookEditToolConfig, AskQuestionToolConfig, ReadKnowledgeBaseItemToolConfig,
   WorkspaceAPIToolConfig, SuggestedResponseConfig,
+  CortexStepPlannerResponse, CortexTrajectorySource,
 } from 'antigravity-client/dist/src/gen/exa/cortex_pb/cortex_pb.js';
 import {
   SendUserCascadeMessageRequest,
   RefreshMcpServersRequest,
-  RevertToCascadeStepRequest,
+  DeleteCascadeTrajectoryRequest,
   GetCascadeTrajectoryGeneratorMetadataRequest,
 } from 'antigravity-client/dist/src/gen/exa/language_server_pb/language_server_pb.js';
 import { Cascade } from 'antigravity-client';
 import { Launcher } from 'antigravity-client/dist/src/server/launcher.js';
 import type { ApprovalRequest } from 'antigravity-client/dist/src/types.js';
-import type { Step } from 'antigravity-client/dist/src/gen/exa/gemini_coder/proto/trajectory_pb.js';
-import { CortexStepPlannerResponse } from 'antigravity-client/dist/src/gen/exa/cortex_pb/cortex_pb.js';
 import type { ConnectError } from '@connectrpc/connect';
 import { McpHub } from './mcp-hub.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { writeFile, mkdir, readFile, rm } from 'node:fs/promises';
+import { writeFile, mkdir, rm } from 'node:fs/promises';
 import { extractSystemPrompt } from './converters/request.js';
-import type { ClaudeMessage, ClaudeContentBlock, ClaudeToolResultBlock, ClaudeToolDefinition, BridgeMessage } from './types.js';
+import {
+  extractCurrentUserPayload,
+  groupTurns,
+  type ExtractedTurn,
+} from './converters/history-builder.js';
+import type { ClaudeMessage, ClaudeContentBlock, ClaudeToolDefinition, BridgeMessage } from './types.js';
+import { createHash } from 'node:crypto';
 
 export class GeminiApiError extends Error {
   constructor(
@@ -47,9 +70,68 @@ export class GeminiApiError extends Error {
   }
 }
 
+/**
+ * Deterministically serialize a Claude message's `content` to a
+ * string. Used for hashing pastTurns in `#computeSessionId`. The
+ * output is canonical: same content → same string, regardless of
+ * object identity or property order in source-block content arrays.
+ */
+function serializeMessageContent(content: string | ClaudeContentBlock[]): string {
+  if (typeof content === 'string') return content;
+  const parts: string[] = [];
+  for (const b of content) {
+    if (!b || typeof b !== 'object') continue;
+    parts.push(JSON.stringify(b));
+  }
+  return parts.join('|');
+}
+
+function serializeTurn(turn: ExtractedTurn): string {
+  const userPart = `${turn.userMessage.role}:${serializeMessageContent(turn.userMessage.content)}`;
+  const assistantParts = turn.assistantMessages
+    .map((m) => `${m.role}:${serializeMessageContent(m.content)}`);
+  return [userPart, ...assistantParts].join('|');
+}
+
 export class AntigravityBackend {
   private client: (AntigravityClient & { launcher?: Launcher }) | null = null;
-  private cascades = new Map<string, Cascade>(); // sessionId -> Cascade
+  /** In-flight Cascade per requestId (used by cancelSession). */
+  private inflightCascades = new Map<string, Cascade>();
+  /**
+   * Session store: maps a `cascadeId` to the metadata of the Cascade
+   * that owns the conversation's trajectory on the LS side.
+   *
+   * The metadata includes the `pastTurns` (everything in `messages`
+   * except the final user message) that was current when the Cascade
+   * was last used. We use this to identify the parent Cascade for a
+   * new request via **prefix matching**: for each incoming request,
+   * find the stored Cascade whose `pastTurns` is a prefix of the new
+   * request's `pastTurns` with the longest match. The longest-prefix
+   * Cascade is the most recent turn of the same Claude Code session.
+   *
+   * The `sessionId` (SHA-256 of `pastTurns`) is included in the
+   * metadata for logging and is exposed in DEBUG_TRAJECTORY output.
+   *
+   * Capped at MAX_SESSIONS to prevent unbounded memory growth. LRU
+   * eviction: the entry with the oldest `lastUsed` timestamp is
+   * removed and its Cascade trajectory is deleted on the LS side.
+   */
+  private sessionStore = new Map<string, {
+    cascade: Cascade;
+    pastTurns: ExtractedTurn[];
+    sessionId: string;
+    lastUsed: number;
+  }>();
+  private static readonly MAX_SESSIONS = 32;
+  /**
+   * Temp directory under /tmp that serves as the LS's workspace and
+   * the proxy's intermediate file store (extracted documents, scratch
+   * files, `.mcp.json`). Using /tmp keeps Claude Code from auto-
+   * discovering the proxy as an MCP server, and sandboxes the LS
+   * away from the user's project tree. Project files are reached
+   * via MCP tools (read_file, Bash, etc.) routed back to Claude
+   * Code, not via the LS's workspace API.
+   */
   private workspaceDir: string | null = null;
   /** Singleton: all tools disabled */
   private static disabledToolConfig: CascadeToolConfig | null = null;
@@ -75,8 +157,10 @@ export class AntigravityBackend {
       await mkdir(this.workspaceDir, { recursive: true });
     }
 
-    // Write .mcp.json to workspace root BEFORE LS launches so it
-    // discovers the proxy on startup (avoids LS internal caching issues)
+    // Write .mcp.json to the LS's workspaceDir (under /tmp) BEFORE
+    // LS launches so the LS discovers the proxy on startup. The file
+    // lives under /tmp and is therefore not auto-discovered by
+    // Claude Code, which only scans the user's project cwd.
     await this.#writeMcpConfigToWorkspace();
 
     console.log('[Backend] Launching Antigravity Language Server...');
@@ -96,29 +180,34 @@ export class AntigravityBackend {
   }
 
   /**
-   * Write .mcp.json to the workspace root BEFORE LS starts, so the LS
-   * discovers the proxy on initialization. Also writes to gemini_dir
-   * after LS is up as a fallback.
+   * Write .mcp.json to the LS's workspaceDir (under /tmp) BEFORE LS
+   * starts so the LS discovers the proxy on initialization. Because
+   * workspaceDir is under /tmp, Claude Code (which only scans the
+   * user's project cwd) does not auto-discover the proxy. After LS
+   * is up, we also write to gemini_dir and call refreshMcpServers
+   * (see #refreshMcpProxyOnLS).
    */
   async #writeMcpConfigToWorkspace(): Promise<void> {
-    try {
-      const workspaceMcpPath = join(this.workspaceDir!, '.mcp.json');
-      const mcpConfig = {
-        mcpServers: {
-          'claude2gemini-mcp-proxy': {
-            command: process.execPath,
-            args: [
-              new URL('./mcp-proxy.mjs', import.meta.url).pathname,
-              '--hub-port',
-              String(this.mcpHub.port),
-            ],
-          }
+    const mcpConfig = {
+      mcpServers: {
+        'claude2gemini-mcp-proxy': {
+          command: process.execPath,
+          args: [
+            new URL('./mcp-proxy.mjs', import.meta.url).pathname,
+            '--hub-port',
+            String(this.mcpHub.port),
+          ],
         }
-      };
-      await writeFile(workspaceMcpPath, JSON.stringify(mcpConfig, null, 2), 'utf-8');
-      console.log(`[Backend] MCP spec written to ${workspaceMcpPath}`);
+      }
+    };
+    const serialized = JSON.stringify(mcpConfig, null, 2);
+
+    try {
+      const mcpPath = join(this.workspaceDir!, '.mcp.json');
+      await writeFile(mcpPath, serialized, 'utf-8');
+      console.log(`[Backend] MCP spec written to ${mcpPath}`);
     } catch (error) {
-      console.warn('[Backend] Failed to write workspace .mcp.json:', error);
+      console.warn('[Backend] Failed to write .mcp.json:', error);
     }
   }
 
@@ -182,6 +271,15 @@ export class AntigravityBackend {
       generateImage: new GenerateImageToolConfig({ forceDisable: true }),
       trajectorySearch: new TrajectorySearchToolConfig({ forceDisable: true }),
       suggestedResponse: new SuggestedResponseConfig({ forceDisable: true }),
+      // Note: Several LS built-in tools (code, intent, grep, viewFile,
+      // listDir, viewCodeItem, knowledgeBaseSearch, commandStatus,
+      // codeSearch, internalSearch, notifyUser, finish) lack a
+      // `forceDisable` field in their *ToolConfig messages — they
+      // expose only fine-grained tunables (e.g. `disableExtensions` on
+      // CodeToolConfig). The LS will fall back to internal defaults for
+      // these, so they remain reachable. The pragmatic mitigation is to
+      // keep MCP registered with high-quality tool descriptions that make
+      // the LLM prefer the MCP variant over the built-in one.
       // Tools controlled via enabled/readOnly
       antigravityBrowser: new AntigravityBrowserToolConfig({ enabled: false }),
       browserSubagent:    new BrowserSubagentToolConfig({ disableScreenshot: true }),
@@ -205,7 +303,7 @@ export class AntigravityBackend {
     modelName: string,
     apiKey: string,
     images: { base64Data: string; mimeType: string }[] = [],
-    documents: { data: string; mediaType: string; index: number }[] = [],
+    documents: { absolutePath: string; mediaType: string }[] = [],
   ): Promise<void> {
     const toolConfig = AntigravityBackend.createToolConfig();
 
@@ -225,33 +323,23 @@ export class AntigravityBackend {
       }),
     ];
 
-    // Handle documents by writing them to the workspace and adding as file scope items
+    // Reference documents via PathScopeItem (files are already written by
+    // extractCurrentUserPayload to deterministic paths in workspaceDir).
     for (const doc of documents) {
-      try {
-        const ext = doc.mediaType.split('/')[1] || 'binary';
-        const fileName = `input_doc_${doc.index}_${Date.now()}.${ext}`;
-        const filePath = join(this.workspaceDir!, fileName);
-        const buffer = Buffer.from(doc.data, 'base64');
-        await writeFile(filePath, buffer);
-
-        items.push(new TextOrScopeItem({
-          chunk: {
-            case: 'item',
-            value: new ContextScopeItem({
-              scopeItem: {
-                case: 'file',
-                value: new PathScopeItem({
-                  absolutePathMigrateMeToUri: filePath,
-                  absoluteUri: `file://${filePath}`,
-                }),
-              },
-            }),
-          },
-        }));
-        console.log(`[Backend] Document attached: ${filePath} (${doc.mediaType})`);
-      } catch (err) {
-        console.warn(`[Backend] Failed to attach document ${doc.index}:`, err);
-      }
+      items.push(new TextOrScopeItem({
+        chunk: {
+          case: 'item',
+          value: new ContextScopeItem({
+            scopeItem: {
+              case: 'file',
+              value: new PathScopeItem({
+                absolutePathMigrateMeToUri: doc.absolutePath,
+                absoluteUri: `file://${doc.absolutePath}`,
+              }),
+            },
+          }),
+        },
+      }));
     }
 
     const req = new SendUserCascadeMessageRequest({
@@ -281,6 +369,367 @@ export class AntigravityBackend {
     });
 
     await this.client!.lsClient.sendUserCascadeMessage(req);
+  }
+
+  /**
+   * Start a fresh Cascade on the LS. The Cascade is OWNED by the LS —
+   * the trajectory state is kept server-side and we re-attach on
+   * subsequent requests in the same session via `lsClient.getCascade`
+   * + `sendUserCascadeMessage`.
+   *
+   * The proxy does NOT inject history (the production LS does not
+   * honor `baseTrajectoryIdentifier.trajectory` with a single
+   * `CortexStepUserInput` per past turn — observed symptom: the
+   * trajectory is discarded and `total_steps` remains at 1, producing
+   * an empty planner response).
+   *
+   * Throws on LS errors (no fallback) — the caller's catch yields an
+   * error BridgeMessage to the Claude client.
+   */
+  async #startCascade(): Promise<Cascade> {
+    if (!this.client) throw new Error('Antigravity client not initialized');
+
+    const apiKey = process.env.ANTIGRAVITY_API_KEY || readAuthStatus()?.apiKey || '';
+    const metadata = new Metadata({
+      apiKey,
+      ideName: 'vscode',
+      ideVersion: '1.107.0',
+      extensionName: 'antigravity',
+      extensionVersion: '0.2.0',
+    });
+
+    // The LS was launched in workspaceDir (a /tmp directory; see
+    // initialize()), so it knows about this workspace. We do NOT
+    // pass workspaceUris to startCascade — the client library's
+    // own startCascade doesn't either, and the LS rejects unknown
+    // workspace URIs with "workspace infos is nil". The Cascade
+    // inherits the LS's workspace (its launch dir).
+    const { cascadeId } = await this.client.lsClient.startCascade({
+      metadata,
+      source: CortexTrajectorySource.CASCADE_CLIENT,
+    });
+    return this.#wrapCascade(cascadeId, apiKey);
+  }
+
+  #wrapCascade(cascadeId: string, apiKey: string): Cascade {
+    const cascade = new Cascade(
+      cascadeId,
+      this.client!.lsClient,
+      apiKey,
+      (n: string | number) => this.client!.resolveModelId(n),
+    );
+    cascade.listen();
+    this.#wireCascadeEvents(cascade);
+    return cascade;
+  }
+
+  /**
+   * Derive a session identifier from the request's `pastTurns`
+   * (everything in `messages` except the final user message). The
+   * input string is therefore the entire conversation history up
+   * to the current turn — a "longer" input than just the first
+   * user message, which makes collisions across sessions
+   * astronomically unlikely.
+   *
+   * The sessionId is a fingerprint of the conversation state and
+   * changes every turn (because pastTurns grows each turn). It is
+   * used for logging and is exposed in the per-request
+   * `Sending message` log line; cascade lookup uses
+   * `#findParentCascadeByPrefix` (prefix matching on pastTurns) so
+   * we can still re-attach to the most recent Cascade of the same
+   * session despite the sessionId changing.
+   *
+   * SHA-256 yields 64 hex characters. The serialization is a
+   * deterministic JSON-like string of role + content for each
+   * pastTurn message.
+   */
+  #computeSessionId(pastTurns: ExtractedTurn[]): string {
+    const serialized = pastTurns.map(serializeTurn).join('\n---\n');
+    if (!serialized) {
+      // Empty pastTurns (first turn) — still derive a stable per-
+      // request value so we can include it in logs.
+      return createHash('sha256').update('empty', 'utf8').digest('hex');
+    }
+    return createHash('sha256').update(serialized, 'utf8').digest('hex');
+  }
+
+  /**
+   * Deep-compare two ExtractedTurns. Used by prefix matching to
+   * determine whether a stored Cascade's pastTurns is a prefix of
+   * the new request's pastTurns.
+   *
+   * Comparison covers: the user message of each turn, and ALL
+   * assistant messages (text + tool calls) of each turn. Any
+   * divergence — even in tool-call IDs or arguments — invalidates
+   * the prefix match.
+   */
+  #turnsEqual(a: ExtractedTurn, b: ExtractedTurn): boolean {
+    if (!this.#messagesEqual(a.userMessage, b.userMessage)) return false;
+    if (a.assistantMessages.length !== b.assistantMessages.length) return false;
+    for (let i = 0; i < a.assistantMessages.length; i++) {
+      if (!this.#messagesEqual(a.assistantMessages[i]!, b.assistantMessages[i]!)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  #messagesEqual(a: ClaudeMessage, b: ClaudeMessage): boolean {
+    if (a.role !== b.role) return false;
+    if (typeof a.content !== typeof b.content) return false;
+    if (typeof a.content === 'string' && typeof b.content === 'string') {
+      return a.content === b.content;
+    }
+    if (Array.isArray(a.content) && Array.isArray(b.content)) {
+      if (a.content.length !== b.content.length) return false;
+      for (let i = 0; i < a.content.length; i++) {
+        const ai = a.content[i] as { type: string };
+        const bi = b.content[i] as { type: string };
+        if (ai.type !== bi.type) return false;
+        // For text/image/document blocks we compare the relevant
+        // fields. tool_use / tool_result blocks include IDs and
+        // JSON payloads that should also match exactly across
+        // re-sent requests.
+        const aj = JSON.stringify(ai);
+        const bj = JSON.stringify(bi);
+        if (aj !== bj) return false;
+      }
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Find the Cascade in the session store whose `pastTurns` is a
+   * prefix of the new request's `pastTurns` with the longest match.
+   *
+   * The longest-prefix Cascade is the most recent turn of the same
+   * Claude Code session — re-attaching to it lets the new turn
+   * continue the trajectory on the LS side without any history
+   * injection.
+   *
+   * Returns `{ cascade, entry }` on a hit, or `null` on a miss. The
+   * `entry` is the stored metadata so the caller can update
+   * `lastUsed` and re-store the new pastTurns after a successful
+   * turn.
+   */
+  async #findParentCascadeByPrefix(pastTurns: ExtractedTurn[]): Promise<{
+    cascade: Cascade;
+    cascadeId: string;
+    entry: { pastTurns: ExtractedTurn[]; sessionId: string; lastUsed: number };
+  } | null> {
+    // Guard: a request with empty pastTurns is always the FIRST
+    // turn of a new (or unrelated) session. We must NOT re-attach
+    // to an existing cascade in this case — otherwise unrelated
+    // sessions that happen to start with no past history (e.g. the
+    // Claude Code SessionStart hook followed by a real session,
+    // or two completely separate requests with single user
+    // messages) would collide and share a Cascade. The Cascade
+    // would then receive a follow-up message with a different
+    // system prompt / model and produce incoherent output. Real
+    // multi-turn conversation still re-attaches correctly: by the
+    // 2nd turn, pastTurns has 1+ turns, so this guard does not
+    // apply.
+    if (pastTurns.length === 0) return null;
+    let best: {
+      cascade: Cascade;
+      cascadeId: string;
+      entry: { pastTurns: ExtractedTurn[]; sessionId: string; lastUsed: number };
+    } | null = null;
+
+    for (const [cascadeId, entry] of this.sessionStore.entries()) {
+      if (entry.pastTurns.length > pastTurns.length) continue;
+      let isPrefix = true;
+      for (let i = 0; i < entry.pastTurns.length; i++) {
+        if (!this.#turnsEqual(entry.pastTurns[i]!, pastTurns[i]!)) {
+          isPrefix = false;
+          break;
+        }
+      }
+      if (!isPrefix) continue;
+      if (!best || entry.pastTurns.length > best.entry.pastTurns.length) {
+        // REUSE the stored Cascade wrapper. We must NOT call
+        // client.getCascade() here because that would create a new
+        // wrapper and call listen() — listen() opens a
+        // streamAgentStateUpdates subscription with
+        // subscriberId=cascadeId, and the LS rejects a second
+        // subscription with the same ID ("subscription closed by
+        // repeat id"), which would tear down the live subscription
+        // and the cascade would lose all event updates.
+        //
+        // The stored wrapper already has an active listen()
+        // subscription from the previous turn. We just need to
+        // re-verify liveness and re-wire our event handlers.
+        const cascade = entry.cascade;
+
+        // Verify the cascade is still alive on the LS side. Calling
+        // getHistory() loads the trajectory into the local state
+        // and throws if the cascade was deleted/expired (e.g. LS
+        // restart, manual delete, TTL expiry).
+        try {
+          await cascade.getHistory();
+        } catch {
+          // Cascade is gone on the LS side — drop the stale entry
+          // and continue searching for a longer match.
+          this.sessionStore.delete(cascadeId);
+          this.#deleteCascadeTrajectoryBestEffort(cascadeId);
+          continue;
+        }
+        // Re-wire our event handlers. #wireCascadeEvents
+        // internally removes any previous listeners it registered
+        // on this wrapper, so calling it on re-attach is safe and
+        // idempotent.
+        this.#wireCascadeEvents(cascade);
+        best = { cascade, cascadeId, entry };
+      }
+    }
+    return best;
+  }
+
+  #deleteCascadeTrajectoryBestEffort(cascadeId: string): void {
+    if (!this.client) return;
+    try {
+      this.client.lsClient.deleteCascadeTrajectory(
+        new DeleteCascadeTrajectoryRequest({ cascadeId }),
+      ).catch(() => { /* best-effort */ });
+    } catch { /* best-effort */ }
+  }
+
+  /**
+   * Register a freshly-started Cascade in the session store. LRU
+   * eviction: when the store is full, the entry with the oldest
+   * `lastUsed` timestamp is removed and its Cascade trajectory is
+   * deleted on the LS side.
+   */
+  #registerSession(cascade: Cascade, pastTurns: ExtractedTurn[], sessionId: string): void {
+    if (this.sessionStore.size >= AntigravityBackend.MAX_SESSIONS) {
+      let oldestKey: string | undefined;
+      let oldestTime = Infinity;
+      for (const [key, entry] of this.sessionStore.entries()) {
+        if (entry.lastUsed < oldestTime) {
+          oldestTime = entry.lastUsed;
+          oldestKey = key;
+        }
+      }
+      if (oldestKey !== undefined) {
+        const evicted = this.sessionStore.get(oldestKey);
+        this.sessionStore.delete(oldestKey);
+        this.#deleteCascadeTrajectoryBestEffort(oldestKey);
+        // Dispose the evicted wrapper's stream subscription so the LS
+        // is not left with a dangling subscription for the evicted
+        // cascadeId.
+        if (evicted) {
+          try { evicted.cascade.dispose(); }
+          catch { /* best-effort */ }
+        }
+      }
+    }
+    this.sessionStore.set(cascade.cascadeId, { cascade, pastTurns, sessionId, lastUsed: Date.now() });
+  }
+
+  /**
+   * Update the stored pastTurns and lastUsed for a Cascade after a
+   * successful turn. This grows the prefix so the NEXT request
+   * (which extends pastTurns by one more turn) will match this
+   * Cascade.
+   */
+  #updateSessionProgress(cascadeId: string, pastTurns: ExtractedTurn[], sessionId: string): void {
+    const entry = this.sessionStore.get(cascadeId);
+    if (!entry) return;
+    entry.pastTurns = pastTurns;
+    entry.sessionId = sessionId;
+    entry.lastUsed = Date.now();
+  }
+
+  /**
+   * Re-attach a Cascade to the LS event listeners. The LS-side
+   * trajectory is preserved across requests, but the in-process
+   * Cascade wrapper is fresh — we must re-call `cascade.listen()` and
+   * re-wire our event handlers so subsequent turn events flow back to
+   * the client.
+   */
+  #reattachCascadeListeners(cascade: Cascade): void {
+    try {
+      cascade.listen();
+      this.#wireCascadeEvents(cascade);
+    } catch {
+      throw new Error('cascade.listen() failed');
+    }
+  }
+
+  #wireCascadeEvents(cascade: Cascade): void {
+    // Idempotent: remove any previously-wired listeners we attached
+    // to this wrapper before adding fresh ones. This is important
+    // for re-attach across requests — without off(), repeated
+    // re-attaches would accumulate duplicate listeners and fire
+    // each event multiple times.
+    const prev = (cascade as any).__backendWiredListeners as
+      | { interaction?: (...args: any[]) => void; error?: (...args: any[]) => void }
+      | undefined;
+    if (prev?.interaction) cascade.off('interaction', prev.interaction);
+    if (prev?.error) cascade.off('error', prev.error);
+
+    const onInteraction = (event: ApprovalRequest) => {
+      if (event.needsApproval) {
+        console.log(`[Backend] Auto-approving cascade interaction: index=${event.stepIndex}, cmd=${event.commandLine || 'none'}`);
+        event.approve('once').catch((err: unknown) => {
+          console.error('[Backend] Auto-approve failed:', err);
+        });
+      }
+    };
+    const onError = (err: unknown) => {
+      console.error('[Backend] Cascade error event:', err);
+      this.#cascadeError = err instanceof Error ? err : new Error(String(err));
+    };
+    cascade.on('interaction', onInteraction);
+    cascade.on('error', onError);
+    (cascade as any).__backendWiredListeners = { interaction: onInteraction, error: onError };
+  }
+
+  /**
+   * Dispose of a Cascade: cancel any in-flight turn, delete the
+   * trajectory server-side, and stop the cascade's internal listen stream.
+   * Errors during disposal are best-effort and never throw.
+   */
+  async #disposeCascade(cascade: Cascade): Promise<void> {
+    // Attach a no-op error handler FIRST so that if the LS streams a stale
+    // "agent state ... not found" error after we cancel / dispose, the
+    // unhandled 'error' event does not crash the Node process. The real
+    // error listener registered in #wireCascadeEvents is the one that
+    // surfaces errors to the client; once disposal begins, swallowing any
+    // trailing error is the correct behaviour.
+    cascade.on('error', () => { /* swallow post-dispose errors */ });
+
+    try {
+      const status = cascade.state?.status ?? 0;
+      if (status >= 2 /* RUNNING/CANCELING/BUSY */) {
+        try { await cascade.cancelAndWait({ timeoutMs: 5_000 }); }
+        catch (err) {
+          console.warn(`[Backend] cancelAndWait during dispose failed (cascadeId=${cascade.cascadeId}):`, err);
+        }
+      }
+    } catch (e) {
+      console.warn('[Backend] dispose status check failed:', e);
+    }
+
+    // Delete the trajectory server-side so the cascade does not linger.
+    // The LS keeps no cross-request state with this approach.
+    if (this.client) {
+      try {
+        await this.client.lsClient.deleteCascadeTrajectory(
+          new DeleteCascadeTrajectoryRequest({ cascadeId: cascade.cascadeId }),
+        );
+      } catch (err) {
+        console.warn(`[Backend] deleteCascadeTrajectory failed for ${cascade.cascadeId} during dispose (non-fatal):`, err);
+      }
+    }
+
+    // Stop the cascade's internal listen stream and drop its listeners.
+    try {
+      cascade.dispose();
+    } catch (err) {
+      console.warn(`[Backend] cascade.dispose failed for ${cascade.cascadeId} (non-fatal):`, err);
+    }
   }
 
   /**
@@ -443,15 +892,21 @@ export class AntigravityBackend {
   }
 
   /**
-   * Creates an asynchronous stream of bridge messages for a given session.
+   * Creates an asynchronous stream of bridge messages for a given request.
    *
-   * Tools from the request are registered with McpHub so the LS can discover
-   * them via the MCP proxy. Tool calls from the LS are forwarded to the
-   * external client as tool_use bridge messages — execution happens in the
-   * client, and results come back in a subsequent request.
+   * Stateful session continuation: the request's first user message
+   * identifies the Claude Code session. If we have an existing Cascade
+   * for this session, we re-attach to it and call `sendUserCascadeMessage`
+   * to append the new turn. Otherwise we start a fresh Cascade, register
+   * it in the sessionStore, and proceed.
+   *
+   * On success, the Cascade is kept alive in the sessionStore so the
+   * next turn in the same session re-attaches. On error / cascade
+   * failure, the Cascade is removed from the store and its trajectory
+   * deleted on the LS side.
    */
   async *createMessageStream(
-    sessionId: string,
+    requestId: string,
     request: {
       model: string;
       messages: ClaudeMessage[];
@@ -462,393 +917,107 @@ export class AntigravityBackend {
     if (!this.client) await this.initialize();
 
     const { messages, tools } = request;
-    
-    // Find the last user message in the messages chain
-    let lastUserMsgIdx = -1;
-    for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i].role === 'user') {
-        lastUserMsgIdx = i;
-        break;
-      }
+
+    if (messages.length === 0) {
+      throw new Error('No messages provided');
     }
-    const lastUserMessage = lastUserMsgIdx !== -1 ? messages[lastUserMsgIdx] : null;
-    if (!lastUserMessage) {
-      throw new Error('No user message found in request');
-    }
+    const { pastTurns, currentUserMessage } = groupTurns(messages);
 
-    let cascade = this.cascades.get(sessionId);
+    this.mcpHub.clearPendingCalls(`New request ${requestId} — clearing stale calls`);
 
-    if (!cascade) {
-      // Cancel and dispose all existing cascades before creating a new one.
-      // Claude Code doesn't send x-session-id, so each request gets a new
-      // sessionId. Without this cleanup, old cascades remain running and
-      // continue issuing tool calls even after the user moves on.
-      for (const [oldId, oldCascade] of this.cascades.entries()) {
-        console.log(`[Backend] Cleaning up old cascade: ${oldId} (cascadeId=${oldCascade.cascadeId})`);
-        this.mcpHub.clearPendingCalls(`Cleaning up old cascade ${oldId}`);
-        try {
-          const oldStatus = oldCascade.state?.status ?? 0;
-          if (oldStatus >= 2) { // RUNNING, CANCELING, or BUSY
-            await oldCascade.cancelAndWait({ timeoutMs: 5_000 });
-          }
-        } catch (err) {
-          console.warn(`[Backend] Failed to cancel old cascade ${oldId} (non-fatal):`, err);
-        }
-        this.cascades.delete(oldId);
-      }
-
-      cascade = await this.client!.startCascade();
-      this.cascades.set(sessionId, cascade);
-      console.log(`[Backend] New cascade created: ${cascade.cascadeId}`);
-
-      // Auto-approve any interactive prompts from the LS (permissions, commands)
-      cascade.on('interaction', (event: ApprovalRequest) => {
-        if (event.needsApproval) {
-          console.log(`[Backend] Auto-approving cascade interaction: index=${event.stepIndex}, cmd=${event.commandLine || 'none'}`);
-          event.approve('once').catch((err: unknown) => {
-            console.error('[Backend] Auto-approve failed:', err);
-          });
-        }
-      });
-
-      // Capture LS stream errors (quota, shutdown, etc.)
-      cascade.on('error', (err: unknown) => {
-        console.error('[Backend] Cascade error event:', err);
-        this.#cascadeError = err instanceof Error ? err : new Error(String(err));
-      });
-    }
-
-    // Register tools from the request with McpHub (for MCP tools/list)
-    if (tools && tools.length > 0) {
-      this.mcpHub.setTools(tools);
-      const toolsHash = JSON.stringify(tools);
-      if (this.lastRegisteredToolsHash !== toolsHash) {
-        this.lastRegisteredToolsHash = toolsHash;
-        // Refresh MCP servers so LS re-reads the tool list and writes JSON definitions
-        await this.#refreshMcpProxyOnLS();
-      }
-    }
-
-    // Resolve API key for Metadata
-    const apiKey = process.env.ANTIGRAVITY_API_KEY || readAuthStatus()?.apiKey || '';
-
-      // Early detection: is the current message a tool result?
-      // This must be checked BEFORE history matching (steps 1-5), because
-      // tool result requests are continuations of the previous turn, not new
-      // conversation turns. Running history matching on them causes false
-      // mismatches (cascadeUserTurns.length > clientTurns.length) which
-      // destroys the cascade and loses the user's original instruction.
-      const isToolResult =
-        lastUserMessage.role === 'user' &&
-        Array.isArray(lastUserMessage.content) &&
-        lastUserMessage.content.some((b: ClaudeContentBlock) => b.type === 'tool_result');
-
-      const toolResultBlocks = isToolResult
-        ? (lastUserMessage.content as ClaudeContentBlock[]).filter((b): b is ClaudeToolResultBlock => b.type === 'tool_result')
-        : [];
-
-      const isWaitingForThisTool = toolResultBlocks.some((b) =>
-        this.mcpHub.getPendingCalls().some((c) => c.callId === b.tool_use_id)
-      );
-
-      // ── Tool result continuation (skip history matching entirely) ──────
-      if (isToolResult && isWaitingForThisTool) {
-        for (const block of toolResultBlocks) {
-          const { tool_use_id, content, is_error } = block;
-          const mcpResult = {
-            content: [{
-              type: 'text',
-              text: typeof content === 'string' ? content : JSON.stringify(content),
-            }],
-            isError: !!is_error,
-          };
-          try {
-            await this.mcpHub.resolveCall(tool_use_id, mcpResult);
-          } catch {
-            // callId not in hub — first message in a new cascade, proceed
-          }
-        }
-
-        // Wait for the cascade to generate the next response (tool result processed).
-        const turnStartCount = cascade.state?.trajectory?.steps?.length ?? 0;
-        const turn = await this.waitForTurnOrToolCall(cascade);
-
-        // Check for cascade error (quota, shutdown, etc.)
-        if (this.#cascadeError) {
-          const err = this.#cascadeError;
-          this.#cascadeError = null;
-          const status = this.#classifyConnectErrorCode(err);
-          yield { type: 'error', sessionId, message: `Antigravity LS error: ${err.message}`, status };
-          return;
-        }
-
-        if (turn === 'tool_call') {
-          const allowedToolNames = request.tools?.map((t) => t.name) || [];
-          for (const call of this.mcpHub.getPendingCalls()) {
-            if (allowedToolNames.length > 0 && !allowedToolNames.includes(call.name)) {
-              console.log(`[Backend] Rejecting disallowed tool call: ${call.name} (${call.callId})`);
-              this.mcpHub.resolveCall(call.callId, {
-                content: [{ type: 'text', text: `Error: Tool ${call.name} is not allowed or available in this context.` }],
-                isError: true,
-              }).catch(() => {});
-              continue;
-            }
-            yield { type: 'tool_call', sessionId, callId: call.callId, name: call.name, args: call.args };
-          }
-          const usage1 = await this.#fetchUsage(cascade);
-          yield { type: 'turn_end', sessionId, stopReason: 'tool_use', usage: usage1 };
-          return;
-        }
-
-        // idle — collect text from new steps only
-        const collected = this.collectTextFromSteps(cascade, turnStartCount);
-
-        // Check for errorMessage steps in new trajectory steps
-        const errorMsg = this.#findErrorStep(cascade, turnStartCount);
-        if (errorMsg) {
-          yield { type: 'error', sessionId, message: errorMsg, status: 500 };
-          return;
-        }
-
-        if (collected) {
-          yield { type: 'stream_event', sessionId, event: { type: 'content', value: collected } };
-        }
-        const usage1 = await this.#fetchUsage(cascade);
-        yield { type: 'turn_end', sessionId, stopReason: 'end_turn', usage: usage1 };
-        return;
-      }
-
+    let cascade: Cascade | null = null;
+    let sessionId: string | null = null;
+    let matchedCascadeId: string | null = null;
+    let createdNewCascade = false;
+    let keepAliveOnSuccess = false;
     try {
-      // 1. Build client turns (excluding the current last message and tool results messages)
-      interface ClientTurn {
-        userText: string;
-        assistantText: string;
-      }
-      const clientTurns: ClientTurn[] = [];
-      let currentUserText = '';
-      let currentAssistantText = '';
-
-      for (let i = 0; i < messages.length - 1; i++) {
-        const msg = messages[i];
-        if (msg.role === 'user') {
-          const content = msg.content;
-          const hasToolResult = Array.isArray(content) && content.some((b: ClaudeContentBlock) => b.type === 'tool_result');
-          if (!hasToolResult) {
-            if (currentUserText && currentAssistantText) {
-              clientTurns.push({
-                userText: currentUserText,
-                assistantText: currentAssistantText,
-              });
-              currentUserText = '';
-              currentAssistantText = '';
-            }
-            currentUserText = typeof content === 'string'
-              ? content
-              : content.map((b: ClaudeContentBlock) => (b.type === 'text' ? b.text : '') || '').filter(Boolean).join('\n');
-          }
-        } else if (msg.role === 'assistant') {
-          const content = msg.content;
-          const hasToolUse = Array.isArray(content) && content.some((b: ClaudeContentBlock) => b.type === 'tool_use');
-          if (!hasToolUse && currentUserText) {
-            currentAssistantText = typeof content === 'string'
-              ? content
-              : content.map((b: ClaudeContentBlock) => (b.type === 'text' ? b.text : '') || '').filter(Boolean).join('\n');
-          }
-        }
-      }
-      if (currentUserText && currentAssistantText) {
-        clientTurns.push({
-          userText: currentUserText,
-          assistantText: currentAssistantText,
-        });
-      }
-
-      // Helper function to extract user input text from step
-      const getUserInputText = (step: Step): string => {
-        if (step?.step?.case === 'userInput') {
-          const value = step.step.value;
-          if (value.userResponse) return value.userResponse;
-          if (Array.isArray(value.items)) {
-            return value.items
-              .map((item: TextOrScopeItem) => item.chunk?.case === 'text' ? item.chunk.value : '')
-              .filter(Boolean)
-              .join('\n');
-          }
-        }
-        return '';
-      };
-
-      // 2. Build cascade user turns
-      const cascadeUserTurns: { stepIndex: number; text: string }[] = [];
-      const steps = cascade.state?.trajectory?.steps ?? [];
-      for (let i = 0; i < steps.length; i++) {
-        const step = steps[i];
-        if (step?.step?.case === 'userInput') {
-          const text = getUserInputText(step);
-          cascadeUserTurns.push({ stepIndex: i, text });
+      if (tools && tools.length > 0) {
+        this.mcpHub.setTools(tools);
+        const toolsHash = JSON.stringify(tools);
+        if (this.lastRegisteredToolsHash !== toolsHash) {
+          this.lastRegisteredToolsHash = toolsHash;
+          await this.#refreshMcpProxyOnLS();
         }
       }
 
-      // 3. Detect first mismatch index
-      let mismatchIdx = -1;
-      const compareLen = Math.min(cascadeUserTurns.length, clientTurns.length);
-      for (let i = 0; i < compareLen; i++) {
-        const cascadeText = cascadeUserTurns[i].text;
-        const clientText = clientTurns[i].userText;
-        const normalizedCascade = cascadeText.replace(/\s+/g, '');
-        const normalizedClient = clientText.replace(/\s+/g, '');
-        if (!normalizedCascade.includes(normalizedClient) && !normalizedClient.includes(normalizedCascade)) {
-          mismatchIdx = i;
-          break;
-        }
-      }
-      if (mismatchIdx === -1 && cascadeUserTurns.length > clientTurns.length) {
-        mismatchIdx = clientTurns.length;
-      }
-
-      // 4. Revert or re-create cascade if mismatch is detected
-      if (mismatchIdx !== -1) {
-        const metadata = new Metadata({
-          apiKey,
-          ideName: 'vscode',
-          ideVersion: '1.107.0',
-          extensionName: 'antigravity',
-          extensionVersion: '0.2.0',
-        });
-
-        if (mismatchIdx === 0) {
-          console.log(`[Backend] History mismatch at turn 0. Re-creating cascade.`);
-          this.cascades.delete(sessionId);
-          cascade = await this.client!.startCascade();
-          this.cascades.set(sessionId, cascade);
-          cascade.on('interaction', (event: ApprovalRequest) => {
-            if (event.needsApproval) {
-              console.log(`[Backend] Auto-approving cascade interaction: index=${event.stepIndex}, cmd=${event.commandLine || 'none'}`);
-              event.approve('once').catch((err: unknown) => {
-                console.error('[Backend] Auto-approve failed:', err);
-              });
-            }
-          });
-          cascadeUserTurns.splice(0);
-        } else {
-          const revertStepIndex = cascadeUserTurns[mismatchIdx].stepIndex - 1;
-          console.log(`[Backend] History mismatch at turn ${mismatchIdx}. Reverting cascade to step ${revertStepIndex}.`);
-          const req = new RevertToCascadeStepRequest({
-            cascadeId: cascade.cascadeId,
-            stepIndex: revertStepIndex,
-            metadata,
-          });
-          await this.client!.lsClient.revertToCascadeStep(req);
-          cascadeUserTurns.splice(mismatchIdx);
-        }
-
-        // Clear any pending MCP tool calls as they are no longer valid after a rewind
-        this.mcpHub.clearPendingCalls('Cascade history mismatch (rewind) cancelled this tool call');
-      }
-
-      // 5. Construct conversation history prefix for missing turns
-      let historyPrefix = '';
-      const startFeedIdx = mismatchIdx !== -1 ? mismatchIdx : cascadeUserTurns.length;
-      if (startFeedIdx < clientTurns.length) {
-        historyPrefix += '=== CONVERSATION HISTORY ===\n';
-        for (let i = startFeedIdx; i < clientTurns.length; i++) {
-          historyPrefix += `User: ${clientTurns[i].userText}\n\nAssistant: ${clientTurns[i].assistantText}\n\n`;
-        }
-        historyPrefix += '============================\n\n';
-      }
-
+      // Extract text + multimodal payloads from the current user message
+      // BEFORE starting a cascade — cheap CPU work first, LS I/O second.
+      const { text: userText, images, documents } = await extractCurrentUserPayload(
+        currentUserMessage, this.workspaceDir!,
+      );
+      const apiKey = process.env.ANTIGRAVITY_API_KEY || readAuthStatus()?.apiKey || '';
       const systemPrompt = extractSystemPrompt(request.system);
-
-      // Cancel in-flight cascade turn and clear stale pending tool calls
-      // when a fresh user instruction arrives.
-      // This handles the case where the user hit Esc mid-tool-execution:
-      // the LS may still be running (waiting for MCP results, or reacting to
-      // tool errors by issuing new calls). We must cancel the cascade and
-      // bring it back to idle before sending a new message.
-      // CascadeRunStatus: UNSPECIFIED=0, IDLE=1, RUNNING=2, CANCELING=3, BUSY=4
-      {
-        const status = cascade.state?.status ?? 0;
-        const cascadeIsRunning = status >= 2; // RUNNING, CANCELING, or BUSY
-        if (this.mcpHub.hasPendingCalls() || cascadeIsRunning) {
-          console.log(`[Backend] Fresh user instruction while cascade is active (status=${status}, pendingCalls=${this.mcpHub.getPendingCalls().length}). Cancelling cascade.`);
-          this.mcpHub.clearPendingCalls('New user instruction received, clearing stale calls');
-          try {
-            await cascade.cancelAndWait({ timeoutMs: 10_000 });
-          } catch (err) {
-            console.warn('[Backend] cancelAndWait failed (non-fatal):', err);
-          }
-        }
-        // Final sweep: clear any calls that arrived during cancel
-        this.mcpHub.clearPendingCalls('Post-cancel cleanup');
-      }
-
-      // ── New message (user text, possibly with tools or tool fallback) ──────────
-      const images: { base64Data: string; mimeType: string }[] = [];
-      const documents: { data: string; mediaType: string; index: number }[] = [];
-
-      /** Helper to extract text and collect multimodal blocks */
-      const extractContent = (content: string | ClaudeContentBlock[]): string => {
-        if (typeof content === 'string') return content;
-        return content.map((b) => {
-          if (b.type === 'text') return b.text || '';
-          if (b.type === 'image' && b.source?.data) {
-            images.push({ base64Data: b.source.data, mimeType: b.source.media_type });
-          } else if (b.type === 'document' && b.source?.data) {
-            documents.push({ data: b.source.data, mediaType: b.source.media_type, index: documents.length });
-          }
-          return '';
-        }).filter(Boolean).join('\n');
-      };
-
-      let userText = '';
-      if (isToolResult && !isWaitingForThisTool && toolResultBlocks.length > 0) {
-        // Fallback: tool result received but cascade is not waiting for it
-        userText = toolResultBlocks.map(b => {
-          const { tool_use_id, content, is_error } = b;
-          const contentText = typeof content === 'string' ? content : JSON.stringify(content);
-          return `=== TOOL RESULT ===\nTool Use ID: ${tool_use_id}\nIs Error: ${!!is_error}\nResult:\n${contentText}\n===================`;
-        }).join('\n\n');
-      } else {
-        userText = extractContent(lastUserMessage.content);
-      }
-
-      // Append any subsequent system or non-assistant messages as context
-      const extraContexts: string[] = [];
-      for (let i = lastUserMsgIdx + 1; i < messages.length; i++) {
-        const msg = messages[i];
-        if ((msg.role as string) === 'system' || msg.role === 'user') {
-          const contentText = extractContent(msg.content);
-          if (contentText) {
-            extraContexts.push(contentText);
-          }
-        }
-      }
-
       let text = '';
       if (systemPrompt) {
         text += `=== SYSTEM PROMPT ===\n${systemPrompt}\n=====================\n\n`;
       }
-      if (historyPrefix) {
-        text += historyPrefix;
-      }
-      if (extraContexts.length > 0) {
-        text += `=== SYSTEM CONTEXT ===\n${extraContexts.join('\n')}\n======================\n\n`;
-      }
       text += `=== USER INSTRUCTION ===\n${userText}`;
 
-      console.log(`[Backend] Sending message (MCP proxy enabled), text_length=${text.length}, model=${request.model}`);
+      // Compute the sessionId (fingerprint) from the entire pastTurns.
+      // The sessionId is per-turn unique (pastTurns grows each turn) and
+      // is used only for logging. Cascade lookup uses prefix matching on
+      // the pastTurns via #findParentCascadeByPrefix — we re-attach to
+      // the Cascade with the longest pastTurns prefix, which is the most
+      // recent turn of the same Claude Code session.
+      sessionId = this.#computeSessionId(pastTurns);
+      const parent = await this.#findParentCascadeByPrefix(pastTurns);
+      if (parent) {
+        cascade = parent.cascade;
+        matchedCascadeId = parent.cascadeId;
+      } else {
+        cascade = await this.#startCascade();
+        this.#registerSession(cascade, pastTurns, sessionId);
+        matchedCascadeId = cascade.cascadeId;
+        createdNewCascade = true;
+      }
+      this.inflightCascades.set(requestId, cascade);
 
-      const startStepCount = cascade.state?.trajectory?.steps?.length ?? 0;
+      await this.sendMessage(
+        cascade,
+        text,
+        request.model,
+        apiKey,
+        images,
+        documents.map(d => ({ absolutePath: d.absolutePath, mediaType: d.mediaType })),
+      );
 
-      await this.sendMessage(cascade, text, request.model, apiKey, images, documents);
+      console.log(`[Backend] Sending message (requestId=${requestId}, sessionId=${sessionId.slice(0, 8)}…, session_new=${createdNewCascade}, past_turns=${pastTurns.length}, text_length=${text.length}, model=${request.model})`);
+
       const turn = await this.waitForTurnOrToolCall(cascade);
 
-      // Check for cascade error (quota, shutdown, etc.)
+      // DEBUG: dump trajectory state for diagnosing empty responses.
+      // Gated on DEBUG_TRAJECTORY so production logs stay clean.
+      if (process.env.DEBUG_TRAJECTORY === 'true') {
+        const dbgSteps = cascade.state?.trajectory?.steps ?? [];
+        console.log(`[Backend] DEBUG cascade state: cascadeId=${cascade.cascadeId}, status=${cascade.state?.status}, total_steps=${dbgSteps.length}`);
+        for (let i = 0; i < dbgSteps.length; i++) {
+          const s = dbgSteps[i];
+          const typeName = s?.type ?? 'NONE';
+          const statusName = s?.status ?? 'NONE';
+          const stepCase = s?.step?.case ?? 'NONE';
+          let extra = '';
+          if (s?.step?.case === 'plannerResponse') {
+            const p: any = s.step.value;
+            extra = ` response_len=${(p?.response || '').length}, tool_calls=${(p?.toolCalls || []).length}, sig="${(p?.signature || '').slice(0, 20)}"`;
+          } else if (s?.step?.case === 'userInput') {
+            const u: any = s.step.value;
+            extra = ` query_len=${(u?.query || '').length}, items=${(u?.items || []).length}`;
+          } else if (s?.step?.case === 'mcpTool') {
+            const m: any = s.step.value;
+            extra = ` name=${m?.toolCall?.name || 'NONE'}, hasResult=${!!m?.result?.value}`;
+          } else if (s?.step?.case === 'errorMessage') {
+            const e: any = s.step.value;
+            extra = ` error="${(e?.error?.shortError || e?.error?.userErrorMessage || '').slice(0, 200)}"`;
+          }
+          console.log(`[Backend] DEBUG step[${i}]: type=${typeName}, status=${statusName}, case=${stepCase}${extra}`);
+        }
+      }
+
       if (this.#cascadeError) {
         const err = this.#cascadeError;
         this.#cascadeError = null;
         const status = this.#classifyConnectErrorCode(err);
-        yield { type: 'error', sessionId, message: `Antigravity LS error: ${err.message}`, status };
+        yield { type: 'error', sessionId: requestId, message: `Antigravity LS error: ${err.message}`, status };
         return;
       }
 
@@ -863,61 +1032,127 @@ export class AntigravityBackend {
             }).catch(() => {});
             continue;
           }
-          yield { type: 'tool_call', sessionId, callId: call.callId, name: call.name, args: call.args };
+          yield { type: 'tool_call', sessionId: requestId, callId: call.callId, name: call.name, args: call.args };
         }
-        const usage2 = await this.#fetchUsage(cascade);
-        yield { type: 'turn_end', sessionId, stopReason: 'tool_use', usage: usage2 };
+        const usage1 = await this.#fetchUsage(cascade);
+        // Tool calls signal a successful end-of-turn — keep the
+        // cascade alive in the session store so the tool_result
+        // turn can re-attach. Advance the stored pastTurns so the
+        // NEXT request (which appends the tool_result + new
+        // assistant response) finds this cascade via prefix match.
+        //
+        // IMPORTANT: This MUST run BEFORE yielding turn_end. The
+        // stream consumer (stream.ts) breaks out of the for-await
+        // loop on turn_end, so any code after that yield never
+        // runs. The finally block then handles keep/dispose based
+        // on keepAliveOnSuccess — if we never set the flag, the
+        // cascade gets disposed and the next turn starts from
+        // scratch, losing the trajectory and forcing the model to
+        // re-run the same diagnostic tools.
+        this.#updateSessionProgress(matchedCascadeId!, pastTurns, sessionId!);
+        keepAliveOnSuccess = true;
+        yield { type: 'turn_end', sessionId: requestId, stopReason: 'tool_use', usage: usage1 };
         return;
       }
 
-      // idle — collect text
-      const collected = this.collectTextFromSteps(cascade, startStepCount);
+      // The Cascade is a single trajectory over the whole session.
+      // We always start collecting from index 0 (the LS has the
+      // full history; we just want the most recent planner response).
+      const collected = this.collectTextFromSteps(cascade, 0);
 
-      // Check for errorMessage steps in new trajectory steps
-      const errorMsg = this.#findErrorStep(cascade, startStepCount);
+      const errorMsg = this.#findErrorStep(cascade, 0);
       if (errorMsg) {
-        yield { type: 'error', sessionId, message: errorMsg, status: 500 };
+        yield { type: 'error', sessionId: requestId, message: errorMsg, status: 500 };
         return;
       }
 
       if (collected) {
-        yield { type: 'stream_event', sessionId, event: { type: 'content', value: collected } };
+        yield { type: 'stream_event', sessionId: requestId, event: { type: 'content', value: collected } };
       }
-      const usage2 = await this.#fetchUsage(cascade);
-      yield { type: 'turn_end', sessionId, stopReason: 'end_turn', usage: usage2 };
+      const usage1 = await this.#fetchUsage(cascade);
+      // IMPORTANT: Advance the stored pastTurns and set
+      // keepAliveOnSuccess BEFORE yielding turn_end. The stream
+      // consumer (stream.ts) breaks out of the for-await loop on
+      // turn_end, so any code after this yield never runs. The
+      // finally block then handles keep/dispose based on
+      // keepAliveOnSuccess.
+      this.#updateSessionProgress(matchedCascadeId!, pastTurns, sessionId!);
+      keepAliveOnSuccess = true;
+      yield { type: 'turn_end', sessionId: requestId, stopReason: 'end_turn', usage: usage1 };
     } catch (error) {
       console.error('[Backend] Stream error:', error);
 
-      // Detect timeout and cancel the cascade
-      const errorMsg = String(error);
+      const errorMsg = error instanceof Error ? error.message : String(error);
       if (errorMsg.includes('timeout')) {
         yield {
           type: 'error',
-          sessionId,
+          sessionId: requestId,
           message: `Antigravity LS did not respond within the timeout period.`,
           status: 504,
         };
         return;
       }
 
-      yield { type: 'error', sessionId, message: errorMsg };
+      const status = this.#classifyConnectErrorCode(error);
+      yield { type: 'error', sessionId: requestId, message: errorMsg, status };
+    } finally {
+      // On success, keep the Cascade alive in the session store so the
+      // next turn in the same session re-attaches. On error (or when
+      // we returned early without setting keepAliveOnSuccess), drop
+      // the Cascade from the store and delete its trajectory.
+      if (cascade && matchedCascadeId) {
+        const stillMapped = this.sessionStore.has(matchedCascadeId);
+        if (keepAliveOnSuccess && stillMapped) {
+          // Keep the cascade alive — no disposal.
+        } else {
+          if (stillMapped) this.sessionStore.delete(matchedCascadeId);
+          await this.#disposeCascade(cascade).catch((e) =>
+            console.warn(`[Backend] dispose failed for requestId=${requestId}:`, e),
+          );
+        }
+      }
+      this.inflightCascades.delete(requestId);
+      this.mcpHub.clearPendingCalls(`Request ${requestId} completed`);
     }
   }
 
-  async cancelSession(sessionId: string): Promise<void> {
-    const cascade = this.cascades.get(sessionId);
+  async cancelSession(requestId: string): Promise<void> {
+    const cascade = this.inflightCascades.get(requestId);
     if (cascade) {
-      console.log(`[Backend] Cancelling cascade for session ${sessionId} (cascadeId=${cascade.cascadeId})`);
+      console.log(`[Backend] Cancelling cascade for request ${requestId} (cascadeId=${cascade.cascadeId})`);
       try {
         await cascade.cancel();
       } catch (err) {
-        console.warn(`[Backend] Failed to cancel cascade for session ${sessionId}:`, err);
+        console.warn(`[Backend] Failed to cancel cascade for request ${requestId}:`, err);
       }
     }
     this.mcpHub.clearPendingCalls('Session cancelled');
   }
 
   async shutdown(): Promise<void> {
+    // Cancel any in-flight cascades
+    for (const [requestId, cascade] of this.inflightCascades.entries()) {
+      try { await cascade.cancel(); }
+      catch (err) { console.warn(`[Backend] Failed to cancel inflight cascade ${requestId} during shutdown:`, err); }
+    }
+    this.inflightCascades.clear();
+
+    // Delete all session-store cascades' trajectories. We don't need
+    // to cancelAndWait — the LS process is about to die, so deleting
+    // the trajectories is best-effort cleanup.
+    if (this.client) {
+      for (const [cascadeId, entry] of this.sessionStore.entries()) {
+        try {
+          await this.client.lsClient.deleteCascadeTrajectory(
+            new DeleteCascadeTrajectoryRequest({ cascadeId }),
+          );
+        } catch (err) {
+          console.warn(`[Backend] Failed to delete cascade ${cascadeId} for session ${entry.sessionId} during shutdown:`, err);
+        }
+      }
+    }
+    this.sessionStore.clear();
+
     try {
       await this.mcpHub.stop();
     } catch (e) {

@@ -18,8 +18,8 @@ describe('mapModelName', () => {
   });
 
   it('maps claude-haiku aliases', () => {
-    expect(mapModelName('claude-haiku')).toBe('Gemini_3.1_Flash_Lite');
-    expect(mapModelName('claude-3-5-haiku-20241022')).toBe('Gemini_3.1_Flash_Lite');
+    expect(mapModelName('claude-haiku')).toBe('Gemini_3.5_Flash_Low');
+    expect(mapModelName('claude-3-5-haiku-20241022')).toBe('Gemini_3.5_Flash_Low');
   });
 
   it('maps gemini aliases', () => {
@@ -27,13 +27,13 @@ describe('mapModelName', () => {
     expect(mapModelName('gemini-pro-low')).toBe('Gemini_3.1_Pro_Low');
     expect(mapModelName('gemini-flash')).toBe('Gemini_3.5_Flash_High');
     expect(mapModelName('gemini-flash-medium')).toBe('Gemini_3.5_Flash_Medium');
-    expect(mapModelName('gemini-flash-lite')).toBe('Gemini_3.1_Flash_Lite');
+    expect(mapModelName('gemini-flash-lite')).toBe('Gemini_3.5_Flash_Low');
   });
 
   it('handles aliases without gemini prefix', () => {
     expect(mapModelName('pro')).toBe('Gemini_3.1_Pro_High');
     expect(mapModelName('flash')).toBe('Gemini_3.5_Flash_High');
-    expect(mapModelName('flash-lite')).toBe('Gemini_3.1_Flash_Lite');
+    expect(mapModelName('flash-lite')).toBe('Gemini_3.5_Flash_Low');
   });
 
   it('falls back to default for unknown models', () => {

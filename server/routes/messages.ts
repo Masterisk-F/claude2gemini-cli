@@ -1,7 +1,6 @@
 import { Router } from 'express';
 import { randomUUID } from 'node:crypto';
 import type { Request, Response } from 'express';
-import { sessionStore } from '../session-store.js';
 import { streamGeminiToClaudeSSE, setupSSEHeaders } from '../converters/stream.js';
 import { mapModelName } from '../converters/request.js';
 import { antigravityBackend, GeminiApiError } from '../gemini-backend.js';
@@ -117,10 +116,6 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
   console.log(`[API] Received messages request. Model: ${body.model}, Stream: ${body.stream}`);
   if (body.messages && Array.isArray(body.messages)) {
     console.log(`[API] Messages chain:`, body.messages.map((m: any, idx: number) => `[${idx}] ${m.role} (len=${typeof m.content === 'string' ? m.content.length : JSON.stringify(m.content).length})`));
-    const lastMsg = body.messages[body.messages.length - 1];
-    if (lastMsg) {
-      console.log(`[API] Last message content snippet:`, typeof lastMsg.content === 'string' ? lastMsg.content.slice(0, 200) : JSON.stringify(lastMsg.content).slice(0, 200));
-    }
   }
 
   try {
@@ -133,28 +128,13 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
       return;
     }
 
-    let sessionId = req.headers['x-session-id'] as string;
-    if (!sessionId) {
-      // Scan backward to find a user message with tool_result for session
-      // resolution. Claude Code sometimes appends system messages at the
-      // end of the messages array, so we can't rely on just the last message.
-      for (let i = body.messages.length - 1; i >= 0 && !sessionId; i--) {
-        const msg = body.messages[i];
-        if (msg.role === 'user' && Array.isArray(msg.content)) {
-          const toolResult = msg.content.find((b: any) => b.type === 'tool_result');
-          if (toolResult) {
-            sessionId = sessionStore.resolveToolCall(toolResult.tool_use_id) || '';
-          }
-        }
-      }
-    }
-
-    if (!sessionId) {
-      sessionId = `session_${Date.now()}_${randomUUID().slice(0, 6)}`;
-    }
+    // Stateless: every request gets a fresh requestId. The backend tears
+    // down its cascade in the request's finally block, so no client-supplied
+    // x-session-id is honored and no tool_call → session mapping is needed.
+    const requestId = `req_${Date.now()}_${randomUUID().slice(0, 6)}`;
 
     const resolvedModel = mapModelName(body.model);
-    const stream = antigravityBackend.createMessageStream(sessionId, {
+    const stream = antigravityBackend.createMessageStream(requestId, {
       model: resolvedModel,
       messages: body.messages,
       system: body.system,
@@ -167,9 +147,9 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
     let isFinished = false;
     const cleanupOnClose = () => {
       if (!isFinished && !res.writableEnded) {
-        console.log(`[API] Client disconnected. Cancelling session: ${sessionId}`);
-        antigravityBackend.cancelSession(sessionId).catch((err) => {
-          console.error(`[API] Error cancelling session ${sessionId}:`, err);
+        console.log(`[API] Client disconnected. Cancelling request: ${requestId}`);
+        antigravityBackend.cancelSession(requestId).catch((err) => {
+          console.error(`[API] Error cancelling request ${requestId}:`, err);
         });
         if (stream && typeof stream.return === 'function') {
           stream.return(undefined).catch(() => {});
@@ -181,7 +161,7 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
     try {
       if (body.stream) {
         setupSSEHeaders(res);
-        await streamGeminiToClaudeSSE(stream, res, body.model, sessionId, sessionStore, allowedToolNames);
+        await streamGeminiToClaudeSSE(stream, res, body.model, requestId, allowedToolNames);
       } else {
         const contentBlocks: any[] = [];
         let currentText = '';
@@ -202,7 +182,6 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
           } else if (msg.type === 'tool_call') {
             if (allowedToolNames.includes(msg.name)) {
               flushText();
-              sessionStore.addPendingToolCall(sessionId, msg.callId);
               contentBlocks.push({
                 type: 'tool_use',
                 id: msg.callId,
