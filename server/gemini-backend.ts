@@ -719,6 +719,46 @@ export class AntigravityBackend {
   }
 
   /**
+   * Decide whether to allow or deny a cascade interaction request.
+   *
+   * The proxy runs ONLY MCP tools (routed through the mcp-proxy back
+   * to Claude Code). Any built-in tool attempt — `run_command`,
+   * `file_permission`, `open_browser_url`, `browser_action`,
+   * `send_command_input`, or `other` (unknown) — is denied. This
+   * is the second layer of defense on top of `CascadeToolConfig`:
+   * it catches tools that lack a config handle (e.g. `code`,
+   * `intent`, `grep`, `viewFile`, `notifyUser`, `taskBoundary`) and
+   * any future tool the LS might add.
+   *
+   * Two signals identify an MCP tool call (see
+   * `antigravity-client/src/cascade.ts` `buildApprovalRequest`):
+   *   1. `event.type === 'mcp'` and `description === 'MCP Tool
+   *      Interaction'` — when the LS dispatches via the dedicated
+   *      `mcp` interactionCase.
+   *   2. `event.type === 'other'` and `description` starts with
+   *      `"Permission Needed: mcp on "` — when the LS dispatches
+   *      via the generic `permission` interactionCase with action
+   *      `mcp` and target `<serverName>/<toolName>`. This is the
+   *      common path for our mcp-proxy /Bash, /Read, /Edit, etc.
+   *
+   * Returns `'allow'` only when one of those signals matches.
+   * Returns `'deny'` for everything else, including unknown types
+   * — fail-closed.
+   *
+   * Exposed as a static method so it can be unit-tested without
+   * needing to mock the full Cascade event lifecycle.
+   */
+  static decideInteraction(
+    event: { type: string; description?: string },
+  ): 'allow' | 'deny' {
+    if (event.type === 'mcp') return 'allow';
+    const desc = event.description ?? '';
+    if (desc === 'MCP Tool Interaction') return 'allow';
+    if (desc.startsWith('Permission Needed: mcp on ')) return 'allow';
+    return 'deny';
+  }
+
+  /**
    * Dump the selected Cascade's current trajectory (the LS-side
    * conversation history) for debugging. Output format depends on
    * `mode`:
@@ -829,10 +869,26 @@ export class AntigravityBackend {
     if (prev?.error) cascade.off('error', prev.error);
 
     const onInteraction = (event: ApprovalRequest) => {
-      if (event.needsApproval) {
-        console.log(`[Backend] Auto-approving cascade interaction: index=${event.stepIndex}, cmd=${event.commandLine || 'none'}`);
+      if (!event.needsApproval) return;
+      const decision = AntigravityBackend.decideInteraction(event);
+      if (decision === 'allow') {
+        console.log(`[Backend] Auto-approving MCP interaction: index=${event.stepIndex}, desc="${event.description}"`);
         event.approve('once').catch((err: unknown) => {
           console.error('[Backend] Auto-approve failed:', err);
+        });
+      } else {
+        // Built-in tool attempts (run_command, file_permission,
+        // open_browser_url, browser_action, send_command_input, or
+        // unknown/other) are denied. The LS must NOT execute them —
+        // only MCP tools (routed back to Claude Code) are allowed.
+        // This is a second layer of defense on top of
+        // CascadeToolConfig: even tools that lack a config handle
+        // (code, intent, grep, viewFile, notifyUser, taskBoundary)
+        // are blocked here, and any future tool the LS adds will
+        // also be denied by default (fail-closed).
+        console.log(`[Backend] Denying non-MCP interaction: index=${event.stepIndex}, type=${event.type}, desc="${event.description}"`);
+        event.deny().catch((err: unknown) => {
+          console.error('[Backend] Deny failed:', err);
         });
       }
     };

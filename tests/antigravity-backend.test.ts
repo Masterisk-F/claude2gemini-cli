@@ -755,3 +755,70 @@ describe('AntigravityBackend', () => {
     await firstNext.catch(() => { /* ignore */ });
   });
 });
+
+describe('AntigravityBackend.decideInteraction', () => {
+  it('allows MCP-type interactions (the only allowed type)', () => {
+    expect(
+      AntigravityBackend.decideInteraction({
+        type: 'mcp',
+        description: 'MCP Tool Interaction',
+      }),
+    ).toBe('allow');
+  });
+
+  it.each([
+    ['Permission Needed: mcp on claude2gemini-mcp-proxy/Bash'],
+    ['Permission Needed: mcp on claude2gemini-mcp-proxy/Read'],
+    ['Permission Needed: mcp on claude2gemini-mcp-proxy/Edit'],
+    ['Permission Needed: mcp on claude2gemini-mcp-proxy/Write'],
+    ['Permission Needed: mcp on claude2gemini-mcp-proxy/Glob'],
+    ['Permission Needed: mcp on claude2gemini-mcp-proxy/Grep'],
+  ])(
+    'allows MCP permission requests via description pattern: %s',
+    (description) => {
+      // The LS dispatches MCP tool calls through the generic
+      // `permission` interactionCase, so type is "other" — the
+      // description is the only reliable signal.
+      expect(
+        AntigravityBackend.decideInteraction({ type: 'other', description }),
+      ).toBe('allow');
+    },
+  );
+
+  it.each<[string, string]>([
+    ['run_command', 'Run Command: bash -c "echo hi"'],
+    ['file_permission', 'File Access: /tmp/foo'],
+    ['file_permission', 'Permission Needed: read_file on /tmp/foo'],
+    ['open_browser_url', 'Open Browser: https://example.com'],
+    ['browser_action', 'Browser Action: clickBrowserPixel'],
+    ['send_command_input', 'Send Command Input'],
+    ['other', 'Unknown Interaction: someFutureType'],
+    // Built-in permission (NOT MCP) routed through 'other':
+    ['other', 'Permission Needed: read_file on /tmp/foo'],
+  ])('denies non-MCP interaction type=%s', (type, description) => {
+    expect(AntigravityBackend.decideInteraction({ type, description })).toBe('deny');
+  });
+
+  it('denies when description is missing or empty (fail-closed)', () => {
+    expect(AntigravityBackend.decideInteraction({ type: 'mcp' })).toBe('allow');
+    // type 'mcp' alone is enough, but anything else without
+    // description must be denied.
+    expect(AntigravityBackend.decideInteraction({ type: 'other' })).toBe('deny');
+    expect(AntigravityBackend.decideInteraction({ type: 'other', description: '' })).toBe('deny');
+  });
+
+  it('denies unknown / future interaction types (fail-closed)', () => {
+    expect(
+      AntigravityBackend.decideInteraction({ type: 'some_future_tool' }),
+    ).toBe('deny');
+    expect(
+      AntigravityBackend.decideInteraction({ type: '' }),
+    ).toBe('deny');
+    // Type system guards this, but ensure runtime safety regardless.
+    expect(
+      AntigravityBackend.decideInteraction({
+        type: undefined as unknown as string,
+      }),
+    ).toBe('deny');
+  });
+});
