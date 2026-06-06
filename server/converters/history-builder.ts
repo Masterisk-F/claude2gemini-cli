@@ -107,6 +107,48 @@ function extractTextFromContent(content: string | ClaudeContentBlock[]): string 
 }
 
 /**
+ * Render a `tool_result` block's content as plain text. Anthropic
+ * allows `content` to be either a string (the common case for
+ * short tool outputs) or an array of content blocks (used when the
+ * tool result is large or multi-modal). We flatten to plain text
+ * here so it can be embedded in the user instruction string.
+ */
+function extractToolResultContent(content: string | ClaudeContentBlock[]): string {
+  if (typeof content === 'string') return content;
+  const parts: string[] = [];
+  for (const b of content) {
+    if (isTextBlock(b) && b.text) {
+      parts.push(b.text);
+    } else {
+      parts.push(JSON.stringify(b));
+    }
+  }
+  return parts.join('\n');
+}
+
+/**
+ * Build a lookup map of `tool_use_id` → tool name from an assistant
+ * message's `tool_use` blocks. Used by `extractCurrentUserPayload`
+ * to render a user-following `tool_result` block with a human-
+ * readable tool name like `[Tool 'Bash' returned]: …`. If the
+ * caller has no prior assistant message (e.g. the very first user
+ * turn), an empty map is returned and tool_result rendering falls
+ * back to the generic label `tool`.
+ */
+export function buildToolNameLookup(
+  prevAssistant: ClaudeMessage | undefined,
+): Map<string, string> {
+  const map = new Map<string, string>();
+  if (!prevAssistant || typeof prevAssistant.content === 'string') return map;
+  for (const b of prevAssistant.content) {
+    if (isToolUseBlock(b)) {
+      map.set(b.id, b.name);
+    }
+  }
+  return map;
+}
+
+/**
  * Compute a deterministic, content-addressed path for a base64 document.
  * Same (data, mediaType) always yields the same path, so writes are idempotent
  * and the file may be referenced across requests without re-uploading.
@@ -290,10 +332,25 @@ export function buildHistorySteps(pastTurns: ExtractedTurn[], workspaceDir: stri
  * Documents are written to deterministic paths in the workspace (idempotent)
  * and their paths are surfaced as `[User attached file: ...]` markers in
  * the text — the LS can then read them via the workspace.
+ *
+ * `tool_result` blocks (the user's reply to a tool call from the
+ * previous assistant turn) are rendered as
+ *   `[Tool '<name>' returned]:\n<result text>`
+ * (or `[Tool '<name>' returned error]:\n<result text>` when
+ * `is_error` is true). The `<name>` is resolved from
+ * `toolNameById`, which the caller is expected to populate from the
+ * previous assistant message's `tool_use` blocks. Without the map we
+ * fall back to the generic label `tool` so the result is never
+ * silently dropped.
+ *
+ * Without this handling, a turn whose payload is only a tool result
+ * would be sent to the LS as an essentially-empty user message,
+ * producing very short or incoherent model responses.
  */
 export async function extractCurrentUserPayload(
   currentMessage: ClaudeMessage,
   workspaceDir: string,
+  toolNameById: Map<string, string> = new Map(),
 ): Promise<CurrentUserPayload> {
   const images: { base64Data: string; mimeType: string }[] = [];
   const documents: { data: string; mediaType: string; index: number; absolutePath: string }[] = [];
@@ -319,6 +376,13 @@ export async function extractCurrentUserPayload(
         documents.push({ data: b.source.data, mediaType: b.source.media_type, index: docIdx++, absolutePath: absPath });
         textParts.push(`[User attached file: ${absPath}]`);
       }
+    } else if (isToolResultBlock(b)) {
+      const toolName = toolNameById.get(b.tool_use_id) ?? 'tool';
+      const resultText = extractToolResultContent(b.content);
+      const header = b.is_error
+        ? `[Tool '${toolName}' returned error]:\n`
+        : `[Tool '${toolName}' returned]:\n`;
+      textParts.push(header + resultText);
     }
   }
 

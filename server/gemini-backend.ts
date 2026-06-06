@@ -35,6 +35,13 @@ import {
   AntigravityBrowserToolConfig, BrowserSubagentToolConfig, InvokeSubagentToolConfig,
   NotebookEditToolConfig, AskQuestionToolConfig, ReadKnowledgeBaseItemToolConfig,
   WorkspaceAPIToolConfig, SuggestedResponseConfig,
+  // Phase 1: tools that have `forceDisable` / `enabled` fields but were
+  // not yet wired into the disabled config.
+  ListDirToolConfig, KnowledgeBaseSearchToolConfig,
+  // Phase 2: tools that lack `forceDisable` / `enabled` and can only
+  // be restricted via numeric / string limits (set to 0 or '' below).
+  ViewCodeItemToolConfig, CommandStatusToolConfig, InternalSearchToolConfig,
+  CodeSearchToolConfig, FinishToolConfig,
   CortexStepPlannerResponse, CortexTrajectorySource,
 } from 'antigravity-client/dist/src/gen/exa/cortex_pb/cortex_pb.js';
 import {
@@ -55,6 +62,7 @@ import { extractSystemPrompt } from './converters/request.js';
 import {
   extractCurrentUserPayload,
   groupTurns,
+  buildToolNameLookup,
   type ExtractedTurn,
 } from './converters/history-builder.js';
 import type { ClaudeMessage, ClaudeContentBlock, ClaudeToolDefinition, BridgeMessage } from './types.js';
@@ -91,6 +99,17 @@ function serializeTurn(turn: ExtractedTurn): string {
   const assistantParts = turn.assistantMessages
     .map((m) => `${m.role}:${serializeMessageContent(m.content)}`);
   return [userPart, ...assistantParts].join('|');
+}
+
+/**
+ * Truncate a string for debug logging. Replaces newlines with `\n`
+ * and caps length, appending `...[truncated N chars]` when cut.
+ */
+function truncateForLog(s: string, maxLen: number): string {
+  const oneLine = s.replace(/\r?\n/g, '\\n');
+  if (oneLine.length <= maxLen) return oneLine;
+  const omitted = oneLine.length - maxLen;
+  return `${oneLine.slice(0, maxLen)}...[truncated ${omitted} chars]`;
 }
 
 export class AntigravityBackend {
@@ -260,35 +279,55 @@ export class AntigravityBackend {
       return AntigravityBackend.disabledToolConfig;
     }
     AntigravityBackend.disabledToolConfig = new CascadeToolConfig({
-      // Tools with forceDisable
-      runCommand:  new RunCommandToolConfig({ forceDisable: true }),
-      searchWeb:   new SearchWebToolConfig({ forceDisable: true }),
-      memory:      new MemoryToolConfig({ forceDisable: true }),
-      // MCP is ENABLED for our proxy-based tool delegation
-      mcp:         new McpToolConfig({ forceDisable: false, maxOutputBytes: 1_000_000 }),
-      mquery:      new MqueryToolConfig({ forceDisable: true }),
-      find:        new FindToolConfig({ forceDisable: true }),
-      generateImage: new GenerateImageToolConfig({ forceDisable: true }),
-      trajectorySearch: new TrajectorySearchToolConfig({ forceDisable: true }),
-      suggestedResponse: new SuggestedResponseConfig({ forceDisable: true }),
-      // Note: Several LS built-in tools (code, intent, grep, viewFile,
-      // listDir, viewCodeItem, knowledgeBaseSearch, commandStatus,
-      // codeSearch, internalSearch, notifyUser, finish) lack a
-      // `forceDisable` field in their *ToolConfig messages — they
-      // expose only fine-grained tunables (e.g. `disableExtensions` on
-      // CodeToolConfig). The LS will fall back to internal defaults for
-      // these, so they remain reachable. The pragmatic mitigation is to
-      // keep MCP registered with high-quality tool descriptions that make
-      // the LLM prefer the MCP variant over the built-in one.
-      // Tools controlled via enabled/readOnly
-      antigravityBrowser: new AntigravityBrowserToolConfig({ enabled: false }),
-      browserSubagent:    new BrowserSubagentToolConfig({ disableScreenshot: true }),
-      invokeSubagent:     new InvokeSubagentToolConfig({ enabled: false }),
-      notebookEdit:       new NotebookEditToolConfig({ enabled: false }),
-      askQuestion:        new AskQuestionToolConfig({ enabled: false }),
+      // ── Phase 1: tools with `forceDisable` (fully off via flag) ──
+      runCommand:          new RunCommandToolConfig({ forceDisable: true }),
+      searchWeb:           new SearchWebToolConfig({ forceDisable: true }),
+      memory:              new MemoryToolConfig({ forceDisable: true }),
+      mquery:              new MqueryToolConfig({ forceDisable: true }),
+      find:                new FindToolConfig({ forceDisable: true }),
+      generateImage:       new GenerateImageToolConfig({ forceDisable: true }),
+      trajectorySearch:    new TrajectorySearchToolConfig({ forceDisable: true }),
+      suggestedResponse:   new SuggestedResponseConfig({ forceDisable: true }),
+      // Phase 1: built-in list_dir is now disabled (MCP Read/Glob/Bash
+      // provide the same capability, routed through Claude Code).
+      listDir:             new ListDirToolConfig({ forceDisable: true }),
+
+      // ── Phase 1: tools with `enabled` flag ──
+      // MCP is ENABLED for our proxy-based tool delegation.
+      mcp:                 new McpToolConfig({ forceDisable: false, maxOutputBytes: 1_000_000 }),
+      antigravityBrowser:  new AntigravityBrowserToolConfig({ enabled: false }),
+      invokeSubagent:      new InvokeSubagentToolConfig({ enabled: false }),
+      notebookEdit:        new NotebookEditToolConfig({ enabled: false }),
+      askQuestion:         new AskQuestionToolConfig({ enabled: false }),
       readKnowledgeBaseItem: new ReadKnowledgeBaseItemToolConfig({ enabled: false }),
-      workspaceApi:       new WorkspaceAPIToolConfig({ readOnly: true }),
-      // Global flag for simple research tools
+
+      // ── Partial / scoped disables ──
+      browserSubagent:     new BrowserSubagentToolConfig({ disableScreenshot: true }),
+      workspaceApi:        new WorkspaceAPIToolConfig({ readOnly: true }),
+
+      // ── Phase 2: tools that lack `forceDisable` / `enabled` and
+      //    can only be restricted via numeric / string limits. We set
+      //    the result caps to 0 (or the path to '') so they effectively
+      //    no-op without breaking the cascade:
+      //      viewCodeItem:        maxNumItems=0, maxBytesPerItem=0
+      //      internalSearch:      maxResults=0, maxContentLength=0
+      //      codeSearch:          csPath='' (no path to search)
+      //      finish:              resultJsonSchemaString=''
+      //      commandStatus:       enableInputDetection=false
+      //      knowledgeBaseSearch: maxTokensPerKnowledgeBaseSearch=0,
+      //                          promptFraction=0
+      //
+      //    Tools with no configuration handle at all (residual risk,
+      //    mitigated by good MCP tool descriptions):
+      //      code, intent, grep, viewFile, notifyUser, taskBoundary
+      viewCodeItem:          new ViewCodeItemToolConfig({ maxNumItems: 0, maxBytesPerItem: 0 }),
+      internalSearch:        new InternalSearchToolConfig({ maxResults: 0, maxContentLength: 0 }),
+      codeSearch:            new CodeSearchToolConfig({ csPath: '', useEvalTag: false }),
+      finish:                new FinishToolConfig({ resultJsonSchemaString: '' }),
+      commandStatus:         new CommandStatusToolConfig({ enableInputDetection: false }),
+      knowledgeBaseSearch:   new KnowledgeBaseSearchToolConfig({ maxTokensPerKnowledgeBaseSearch: 0, promptFraction: 0 }),
+
+      // ── Global flag for simple research tools ──
       disableSimpleResearchTools: true,
     });
     return AntigravityBackend.disabledToolConfig;
@@ -657,6 +696,126 @@ export class AntigravityBackend {
     }
   }
 
+  /**
+   * Read the DEBUG_HISTORY env var to decide whether (and how) to
+   * log the cascade's trajectory and the new turn's text payload on
+   * every request.
+   *
+   * Modes:
+   *   undefined / '' / 'summary' → emit summary (DEFAULT)
+   *   'full'                     → emit full text + per-step bodies
+   *   'off' / 'false' / '0'      → suppress entirely (escape hatch)
+   *   anything else              → treat as summary, log a one-time warning
+   */
+  private static getDebugHistoryMode(): 'off' | 'summary' | 'full' {
+    const raw = process.env.DEBUG_HISTORY;
+    if (raw === undefined) return 'summary';
+    const v = raw.trim().toLowerCase();
+    if (v === '' || v === 'summary') return 'summary';
+    if (v === 'full') return 'full';
+    if (v === 'off' || v === 'false' || v === '0') return 'off';
+    console.warn(`[Backend] Unknown DEBUG_HISTORY="${raw}", treating as "summary"`);
+    return 'summary';
+  }
+
+  /**
+   * Dump the selected Cascade's current trajectory (the LS-side
+   * conversation history) for debugging. Output format depends on
+   * `mode`:
+   *   - 'summary': one line per step with type/case and small counters
+   *   - 'full':    summary plus per-step text bodies (truncated)
+   */
+  #dumpCascadeHistory(
+    cascade: Cascade,
+    label: string,
+    mode: 'summary' | 'full',
+  ): void {
+    const steps = cascade.state?.trajectory?.steps ?? [];
+    console.log(`[Backend] ${label}`);
+    console.log(`[Backend]   total_steps=${steps.length}`);
+    const PREVIEW_LEN = 200;
+    for (let i = 0; i < steps.length; i++) {
+      const s = steps[i] as any;
+      const stepCase = s?.step?.case ?? 'NONE';
+      let extra = '';
+      if (stepCase === 'plannerResponse') {
+        const p = s.step.value ?? {};
+        extra = ` response_len=${(p.response || '').length}, tool_calls=${(p.toolCalls || []).length}`;
+        if (mode === 'full' && p.response) {
+          extra += ` response="${truncateForLog(p.response, 1000)}"`;
+        }
+      } else if (stepCase === 'userInput') {
+        const u = s.step.value ?? {};
+        extra = ` query_len=${(u.query || '').length}, items=${(u.items || []).length}`;
+        if (mode === 'full' && u.query) {
+          extra += ` query="${truncateForLog(u.query, 1000)}"`;
+        }
+      } else if (stepCase === 'mcpTool') {
+        const m = s.step.value ?? {};
+        const name = m?.toolCall?.name || 'NONE';
+        const resultLen = m?.result?.value
+          ? (typeof m.result.value === 'string' ? m.result.value.length : JSON.stringify(m.result.value).length)
+          : 0;
+        extra = ` name=${name}, hasResult=${!!m?.result?.value}, result_len=${resultLen}`;
+        if (mode === 'full') {
+          const argsStr = m?.toolCall?.arguments
+            ? (typeof m.toolCall.arguments === 'string' ? m.toolCall.arguments : JSON.stringify(m.toolCall.arguments))
+            : '';
+          if (argsStr) extra += ` args="${truncateForLog(argsStr, 500)}"`;
+        }
+      } else if (stepCase === 'errorMessage') {
+        const e = s.step.value?.error ?? {};
+        extra = ` error="${truncateForLog(e.shortError || e.userErrorMessage || '', 200)}"`;
+      } else if (stepCase === 'finish') {
+        const f = s.step.value ?? {};
+        extra = ` reason=${f.reason ?? 'NONE'}`;
+      }
+      console.log(`[Backend]   step[${i}]: case=${stepCase}${extra}`);
+    }
+    if (mode === 'full') {
+      // also dump the first PREVIEW_LEN chars of the userInput that
+      // initiated the conversation, for context
+      const firstUserInput = steps.find((s: any) => s?.step?.case === 'userInput');
+      if (firstUserInput) {
+        const q = ((firstUserInput as any).step.value?.query || '') as string;
+        if (q) console.log(`[Backend]   first_user_query_preview="${truncateForLog(q, PREVIEW_LEN)}"`);
+      }
+    }
+  }
+
+  /**
+   * Dump the new turn's text + image/document counts for debugging.
+   * In 'summary' mode only counts and a short preview; in 'full'
+   * mode the full text body (truncated to a sane cap).
+   */
+  #dumpNewTurn(
+    text: string,
+    images: { base64Data: string; mimeType: string }[],
+    documents: { absolutePath: string; mediaType: string }[],
+    label: string,
+    mode: 'summary' | 'full',
+  ): void {
+    console.log(`[Backend] ${label}`);
+    console.log(`[Backend]   text_length=${text.length}`);
+    if (mode === 'full') {
+      console.log(`[Backend]   text (full, capped at 5000 chars):`);
+      console.log(`[Backend]   >>>`);
+      console.log(truncateForLog(text, 5000));
+      console.log(`[Backend]   <<<`);
+    } else {
+      console.log(`[Backend]   text_preview (first 200 chars): "${truncateForLog(text, 200)}"`);
+    }
+    console.log(`[Backend]   images=${images.length}, documents=${documents.length}`);
+    if (mode === 'full') {
+      for (let i = 0; i < images.length; i++) {
+        console.log(`[Backend]   image[${i}]: mimeType=${images[i].mimeType}, base64_len=${images[i].base64Data.length}`);
+      }
+      for (let i = 0; i < documents.length; i++) {
+        console.log(`[Backend]   document[${i}]: path=${documents[i].absolutePath}, mimeType=${documents[i].mediaType}`);
+      }
+    }
+  }
+
   #wireCascadeEvents(cascade: Cascade): void {
     // Idempotent: remove any previously-wired listeners we attached
     // to this wrapper before adding fresh ones. This is important
@@ -940,25 +1099,30 @@ export class AntigravityBackend {
         }
       }
 
-      // Extract text + multimodal payloads from the current user message
-      // BEFORE starting a cascade — cheap CPU work first, LS I/O second.
+      // Extract user payload first (cheap, no LS I/O). We also
+      // build a tool_use_id → tool name map from the previous
+      // assistant message so that tool_result blocks in the current
+      // user message can be rendered as
+      // `[Tool '<name>' returned]: <result>` instead of being
+      // silently dropped (which would otherwise produce an empty
+      // user message on turns whose payload is only a tool result).
+      const lastPastTurn = pastTurns[pastTurns.length - 1];
+      const prevAssistantMsg = lastPastTurn?.assistantMessages.length
+        ? lastPastTurn.assistantMessages[lastPastTurn.assistantMessages.length - 1]
+        : undefined;
+      const toolNameById = buildToolNameLookup(prevAssistantMsg);
       const { text: userText, images, documents } = await extractCurrentUserPayload(
-        currentUserMessage, this.workspaceDir!,
+        currentUserMessage, this.workspaceDir!, toolNameById,
       );
       const apiKey = process.env.ANTIGRAVITY_API_KEY || readAuthStatus()?.apiKey || '';
-      const systemPrompt = extractSystemPrompt(request.system);
-      let text = '';
-      if (systemPrompt) {
-        text += `=== SYSTEM PROMPT ===\n${systemPrompt}\n=====================\n\n`;
-      }
-      text += `=== USER INSTRUCTION ===\n${userText}`;
 
-      // Compute the sessionId (fingerprint) from the entire pastTurns.
-      // The sessionId is per-turn unique (pastTurns grows each turn) and
-      // is used only for logging. Cascade lookup uses prefix matching on
-      // the pastTurns via #findParentCascadeByPrefix — we re-attach to
-      // the Cascade with the longest pastTurns prefix, which is the most
-      // recent turn of the same Claude Code session.
+      // Cascade lookup must run BEFORE we build the new-turn text, because
+      // we only want to prepend the system prompt on the FIRST turn of a
+      // new cascade. On re-attach (prefix match hit), the model already has
+      // the system prompt in its context window (it was embedded in turn 1's
+      // userInput step, which lives in the LS-side trajectory), so re-sending
+      // it is redundant. Embedding it again would also inflate the per-turn
+      // text length (~8K → ~0.3K chars) and clutter the debug logs.
       sessionId = this.#computeSessionId(pastTurns);
       const parent = await this.#findParentCascadeByPrefix(pastTurns);
       if (parent) {
@@ -972,6 +1136,42 @@ export class AntigravityBackend {
       }
       this.inflightCascades.set(requestId, cascade);
 
+      // Build the new-turn text. The system prompt header is only emitted
+      // on the first turn of a fresh cascade (`createdNewCascade`).
+      const systemPrompt = createdNewCascade ? extractSystemPrompt(request.system) : undefined;
+      let text = '';
+      if (systemPrompt) {
+        text += `=== SYSTEM PROMPT ===\n${systemPrompt}\n=====================\n\n`;
+      }
+      text += `=== USER INSTRUCTION ===\n${userText}`;
+
+      // Snapshot the cascade's step count BEFORE we send this turn's
+      // message. The LS will push new steps (userInput, plannerResponse,
+      // mcpTool, checkpoint) onto `cascade.state.trajectory.steps`
+      // asynchronously via `streamAgentStateUpdates`; by the time
+      // `waitForTurnOrToolCall` resolves, the new steps are present.
+      // We use the snapshot as the lower bound for `collectTextFromSteps`
+      // so we only return the plannerResponse(s) produced by THIS turn,
+      // not by all previous turns of the same cascade. Collecting from
+      // step 0 would concatenate every prior response and the user
+      // would see the entire conversation history echoed at the start
+      // of every new reply.
+      const stepCountBefore = cascade.state?.trajectory?.steps?.length ?? 0;
+
+      // DEBUG (default ON, set DEBUG_HISTORY=off to disable): log the
+      // cascade's current LS-side trajectory (what the model "sees"
+      // for this re-attach), and the new turn's text + payload we are
+      // about to send. Critical for diagnosing re-attach, prefix
+      // matching, and tool-call loop issues.
+      const debugMode = AntigravityBackend.getDebugHistoryMode();
+      if (debugMode !== 'off') {
+        this.#dumpCascadeHistory(
+          cascade,
+          `=== CASCADE HISTORY (requestId=${requestId}, cascadeId=${matchedCascadeId}, session_new=${createdNewCascade}, past_turns=${pastTurns.length}) ===`,
+          debugMode,
+        );
+      }
+
       await this.sendMessage(
         cascade,
         text,
@@ -980,6 +1180,16 @@ export class AntigravityBackend {
         images,
         documents.map(d => ({ absolutePath: d.absolutePath, mediaType: d.mediaType })),
       );
+
+      if (debugMode !== 'off') {
+        this.#dumpNewTurn(
+          text,
+          images,
+          documents.map(d => ({ absolutePath: d.absolutePath, mediaType: d.mediaType })),
+          `=== NEW TURN (requestId=${requestId}, cascadeId=${matchedCascadeId}, model=${request.model}) ===`,
+          debugMode,
+        );
+      }
 
       console.log(`[Backend] Sending message (requestId=${requestId}, sessionId=${sessionId.slice(0, 8)}…, session_new=${createdNewCascade}, past_turns=${pastTurns.length}, text_length=${text.length}, model=${request.model})`);
 
@@ -1055,12 +1265,17 @@ export class AntigravityBackend {
         return;
       }
 
-      // The Cascade is a single trajectory over the whole session.
-      // We always start collecting from index 0 (the LS has the
-      // full history; we just want the most recent planner response).
-      const collected = this.collectTextFromSteps(cascade, 0);
+      // The Cascade is a single trajectory over the whole session, so
+      // we MUST collect only the steps added by THIS turn (recorded
+      // in `stepCountBefore` before sendMessage). Collecting from 0
+      // would concatenate every previous plannerResponse in the
+      // trajectory, causing the user to see the entire prior
+      // conversation echoed at the start of every new reply.
+      const collected = this.collectTextFromSteps(cascade, stepCountBefore);
 
-      const errorMsg = this.#findErrorStep(cascade, 0);
+      // Same logic for error detection: only flag errors that arose
+      // from THIS turn's processing, not from any prior turn.
+      const errorMsg = this.#findErrorStep(cascade, stepCountBefore);
       if (errorMsg) {
         yield { type: 'error', sessionId: requestId, message: errorMsg, status: 500 };
         return;

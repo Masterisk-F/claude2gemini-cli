@@ -9,6 +9,7 @@ import {
   extractCurrentUserPayload,
   deterministicDocPath,
   serializeTurn,
+  buildToolNameLookup,
 } from '../server/converters/history-builder.js';
 import { CortexStepType, CortexStepStatus } from 'antigravity-client/dist/src/gen/exa/cortex_pb/cortex_pb.js';
 import type { ClaudeMessage } from '../server/types.js';
@@ -328,5 +329,98 @@ describe('history-builder: extractCurrentUserPayload', () => {
     expect(out.text).toContain(out.documents[0].absolutePath);
 
     await rm(workspaceDir, { recursive: true, force: true });
+  });
+
+  it('renders tool_result blocks as [Tool <name> returned]: <result>', async () => {
+    // Caller supplies a lookup from the previous assistant message so
+    // the tool name can be resolved. Without it, the rendering falls
+    // back to the generic label "tool" (covered in the next test).
+    const toolNameById = new Map([['call_abc', 'Bash']]);
+    const out = await extractCurrentUserPayload({
+      role: 'user',
+      content: [
+        { type: 'tool_result', tool_use_id: 'call_abc', content: 'total 4\nREADME.md\n' },
+      ],
+    }, workspaceDir, toolNameById);
+    expect(out.text).toBe(
+      "[Tool 'Bash' returned]:\ntotal 4\nREADME.md\n",
+    );
+  });
+
+  it('renders tool_result with is_error=true using the error header', async () => {
+    const toolNameById = new Map([['call_err', 'Read']]);
+    const out = await extractCurrentUserPayload({
+      role: 'user',
+      content: [
+        { type: 'tool_result', tool_use_id: 'call_err', content: 'EACCES: permission denied', is_error: true },
+      ],
+    }, workspaceDir, toolNameById);
+    expect(out.text).toBe(
+      "[Tool 'Read' returned error]:\nEACCES: permission denied",
+    );
+  });
+
+  it('falls back to label "tool" when tool_use_id is not in the lookup', async () => {
+    // An orphan tool_result (no matching tool_use in the previous
+    // assistant message) is still rendered, but with a generic label
+    // so the result text is never silently dropped.
+    const out = await extractCurrentUserPayload({
+      role: 'user',
+      content: [
+        { type: 'tool_result', tool_use_id: 'unknown_id', content: 'orphan result' },
+      ],
+    }, workspaceDir);
+    expect(out.text).toBe(
+      "[Tool 'tool' returned]:\norphan result",
+    );
+  });
+
+  it('renders tool_result whose content is an array of blocks', async () => {
+    // Anthropic allows tool_result.content to be an array of content
+    // blocks. Flatten the text blocks; non-text blocks are
+    // JSON-stringified so we never lose information.
+    const toolNameById = new Map([['call_arr', 'Bash']]);
+    const out = await extractCurrentUserPayload({
+      role: 'user',
+      content: [
+        {
+          type: 'tool_result',
+          tool_use_id: 'call_arr',
+          content: [
+            { type: 'text', text: 'line 1' },
+            { type: 'text', text: 'line 2' },
+          ],
+        },
+      ],
+    }, workspaceDir, toolNameById);
+    expect(out.text).toBe(
+      "[Tool 'Bash' returned]:\nline 1\nline 2",
+    );
+  });
+});
+
+describe('history-builder: buildToolNameLookup', () => {
+  it('returns an empty map for an undefined assistant message', () => {
+    const map = buildToolNameLookup(undefined);
+    expect(map.size).toBe(0);
+  });
+
+  it('returns an empty map for a string-content assistant message', () => {
+    const map = buildToolNameLookup({ role: 'assistant', content: 'plain' });
+    expect(map.size).toBe(0);
+  });
+
+  it('collects every tool_use id → name pair', () => {
+    const map = buildToolNameLookup({
+      role: 'assistant',
+      content: [
+        { type: 'text', text: 'ok' },
+        { type: 'tool_use', id: 'call_1', name: 'Bash', input: { command: 'ls' } },
+        { type: 'tool_use', id: 'call_2', name: 'Read', input: { file_path: '/x' } },
+      ],
+    });
+    expect(map.size).toBe(2);
+    expect(map.get('call_1')).toBe('Bash');
+    expect(map.get('call_2')).toBe('Read');
   });
 });

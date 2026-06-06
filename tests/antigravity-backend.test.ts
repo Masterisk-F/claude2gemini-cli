@@ -235,6 +235,65 @@ describe('AntigravityBackend', () => {
     expect((backend as any).sessionStore.size).toBe(1);
   });
 
+  it('should include system prompt header on the first turn of a fresh cascade', async () => {
+    const backend = new AntigravityBackend();
+    await backend.initialize();
+
+    const sendSpy = vi.spyOn((backend as any).client.lsClient, 'sendUserCascadeMessage');
+
+    for await (const _ of backend.createMessageStream('req-first-sys', {
+      model: 'Gemini_3.5_Flash_High',
+      messages: [{ role: 'user', content: 'Hello' }],
+      system: 'You are a test assistant.',
+    })) { /* drain */ }
+
+    const firstCall = sendSpy.mock.calls[0]?.[0] as any;
+    const firstText = firstCall?.items?.[0]?.chunk?.value ?? '';
+    expect(firstText).toContain('=== SYSTEM PROMPT ===');
+    expect(firstText).toContain('You are a test assistant.');
+    expect(firstText).toContain('=== USER INSTRUCTION ===');
+  });
+
+  it('should OMIT system prompt header on re-attach (turn 2+)', async () => {
+    const backend = new AntigravityBackend();
+    await backend.initialize();
+
+    const sendSpy = vi.spyOn((backend as any).client.lsClient, 'sendUserCascadeMessage');
+
+    const messages1 = [
+      { role: 'user', content: 'Hi' },
+      { role: 'assistant', content: 'Hello!' },
+      { role: 'user', content: 'Tell me a joke.' },
+    ];
+    // First turn: system prompt IS included.
+    for await (const _ of backend.createMessageStream('req-turn1-sys', {
+      model: 'Gemini_3.5_Flash_High',
+      messages: messages1,
+      system: 'You are a test assistant.',
+    })) { /* drain */ }
+    const firstText = (sendSpy.mock.calls[0]?.[0] as any)?.items?.[0]?.chunk?.value ?? '';
+    expect(firstText).toContain('=== SYSTEM PROMPT ===');
+
+    // Second turn in the same session: re-attach. System prompt is
+    // suppressed — the model already has it from turn 1's userInput
+    // step, which lives in the LS-side trajectory.
+    const messages2 = [
+      ...messages1,
+      { role: 'assistant', content: 'Why did the chicken cross the road?' },
+      { role: 'user', content: 'Another one.' },
+    ];
+    for await (const _ of backend.createMessageStream('req-turn2-sys', {
+      model: 'Gemini_3.5_Flash_High',
+      messages: messages2,
+      system: 'You are a test assistant.',
+    })) { /* drain */ }
+    const secondText = (sendSpy.mock.calls[1]?.[0] as any)?.items?.[0]?.chunk?.value ?? '';
+    expect(secondText).not.toContain('=== SYSTEM PROMPT ===');
+    expect(secondText).not.toContain('You are a test assistant.');
+    expect(secondText).toContain('=== USER INSTRUCTION ===');
+    expect(secondText).toContain('Another one.');
+  });
+
   it('should re-attach to the same Cascade on a subsequent request in the same session', async () => {
     const backend = new AntigravityBackend();
     await backend.initialize();
@@ -347,6 +406,53 @@ describe('AntigravityBackend', () => {
     expect(errEvent.message).toContain('startCascade rejected');
     // No session was registered because the startCascade call failed.
     expect((backend as any).sessionStore.size).toBe(0);
+  });
+
+  it('should return only the current turn\'s plannerResponse text (no bleed from prior turns)', async () => {
+    // Regression: previously collectTextFromSteps(cascade, 0) was used,
+    // which concatenated EVERY plannerResponse in the trajectory.
+    // Result: from turn 2 onward, the user saw the entire prior
+    // conversation echoed at the start of every new reply.
+    const backend = new AntigravityBackend();
+    await backend.initialize();
+
+    // The mock's sendUserCascadeMessage appends a plannerResponse step
+    // with the hard-coded text "Hello! I am an AI assistant." (27 chars).
+    // After 2 turns the trajectory contains 2 such steps, so a buggy
+    // implementation would return a 54-char concatenated string, while
+    // the fix returns exactly 27 chars each turn.
+    const MOCK_RESPONSE = 'Hello! I am an AI assistant.';
+
+    const messages1 = [
+      { role: 'user', content: 'first question' },
+      { role: 'assistant', content: 'first reply' },
+      { role: 'user', content: 'second question' },
+    ];
+    const events1: any[] = [];
+    for await (const ev of backend.createMessageStream('req-bleed-1', {
+      model: 'Gemini_3.5_Flash_High',
+      messages: messages1,
+    })) events1.push(ev);
+    const streamEvent1 = events1.find((e: any) => e.type === 'stream_event');
+    expect(streamEvent1).toBeDefined();
+    expect(streamEvent1.event.value).toBe(MOCK_RESPONSE);
+
+    const messages2 = [
+      ...messages1,
+      { role: 'assistant', content: 'second reply' },
+      { role: 'user', content: 'third question' },
+    ];
+    const events2: any[] = [];
+    for await (const ev of backend.createMessageStream('req-bleed-2', {
+      model: 'Gemini_3.5_Flash_High',
+      messages: messages2,
+    })) events2.push(ev);
+    const streamEvent2 = events2.find((e: any) => e.type === 'stream_event');
+    expect(streamEvent2).toBeDefined();
+    // The critical assertion: turn 2's stream_event is NOT the
+    // concatenation of turn 1 + turn 2 responses.
+    expect(streamEvent2.event.value).toBe(MOCK_RESPONSE);
+    expect(streamEvent2.event.value.length).toBe(MOCK_RESPONSE.length);
   });
 
   it('should drop a stale session (getHistory throws) and start a fresh Cascade', async () => {
