@@ -294,6 +294,84 @@ describe('AntigravityBackend', () => {
     expect(secondText).toContain('Another one.');
   });
 
+  it('should inject BUILT-IN TOOLS disclaimer on the first turn of a fresh cascade', async () => {
+    const backend = new AntigravityBackend();
+    await backend.initialize();
+
+    const sendSpy = vi.spyOn((backend as any).client.lsClient, 'sendUserCascadeMessage');
+
+    for await (const _ of backend.createMessageStream('req-builtin-1', {
+      model: 'Gemini_3.5_Flash_High',
+      messages: [{ role: 'user', content: 'Hello' }],
+      system: 'You are a test assistant.',
+    })) { /* drain */ }
+
+    const firstText = (sendSpy.mock.calls[0]?.[0] as any)?.items?.[0]?.chunk?.value ?? '';
+    // Disclaimer present
+    expect(firstText).toContain('=== BUILT-IN TOOLS (DISABLED) ===');
+    expect(firstText).toContain('=================================');
+    // Sample tool names from each layer are all listed
+    expect(firstText).toContain('runCommand');
+    expect(firstText).toContain('searchWeb');
+    expect(firstText).toContain('antigravityBrowser');
+    expect(firstText).toContain('viewCodeItem');
+    expect(firstText).toContain('code');
+    expect(firstText).toContain('intent');
+    expect(firstText).toContain('grep');
+    expect(firstText).toContain('viewFile');
+    expect(firstText).toContain('notifyUser');
+    expect(firstText).toContain('taskBoundary');
+    // MCP directive present
+    expect(firstText).toContain('mcp__claude2gemini-mcp-proxy');
+    expect(firstText).toContain('_Bash');
+    expect(firstText).toContain('_Read');
+    // Ordering: SYSTEM PROMPT < BUILT-IN TOOLS < USER INSTRUCTION
+    const sysIdx = firstText.indexOf('=== SYSTEM PROMPT ===');
+    const builtinIdx = firstText.indexOf('=== BUILT-IN TOOLS (DISABLED) ===');
+    const userIdx = firstText.indexOf('=== USER INSTRUCTION ===');
+    expect(sysIdx).toBeGreaterThanOrEqual(0);
+    expect(builtinIdx).toBeGreaterThan(sysIdx);
+    expect(userIdx).toBeGreaterThan(builtinIdx);
+  });
+
+  it('should OMIT BUILT-IN TOOLS disclaimer on re-attach (turn 2+)', async () => {
+    const backend = new AntigravityBackend();
+    await backend.initialize();
+
+    const sendSpy = vi.spyOn((backend as any).client.lsClient, 'sendUserCascadeMessage');
+
+    const messages1 = [
+      { role: 'user', content: 'Hi' },
+      { role: 'assistant', content: 'Hello!' },
+      { role: 'user', content: 'Tell me a joke.' },
+    ];
+    for await (const _ of backend.createMessageStream('req-bt-1', {
+      model: 'Gemini_3.5_Flash_High',
+      messages: messages1,
+      system: 'You are a test assistant.',
+    })) { /* drain */ }
+    const firstText = (sendSpy.mock.calls[0]?.[0] as any)?.items?.[0]?.chunk?.value ?? '';
+    expect(firstText).toContain('=== BUILT-IN TOOLS (DISABLED) ===');
+
+    // Second turn: re-attach → disclaimer omitted
+    const messages2 = [
+      ...messages1,
+      { role: 'assistant', content: 'Why did the chicken cross the road?' },
+      { role: 'user', content: 'Another one.' },
+    ];
+    for await (const _ of backend.createMessageStream('req-bt-2', {
+      model: 'Gemini_3.5_Flash_High',
+      messages: messages2,
+      system: 'You are a test assistant.',
+    })) { /* drain */ }
+    const secondText = (sendSpy.mock.calls[1]?.[0] as any)?.items?.[0]?.chunk?.value ?? '';
+    expect(secondText).not.toContain('=== BUILT-IN TOOLS (DISABLED) ===');
+    expect(secondText).not.toContain('runCommand');
+    // USER INSTRUCTION still present
+    expect(secondText).toContain('=== USER INSTRUCTION ===');
+    expect(secondText).toContain('Another one.');
+  });
+
   it('should re-attach to the same Cascade on a subsequent request in the same session', async () => {
     const backend = new AntigravityBackend();
     await backend.initialize();
@@ -753,6 +831,97 @@ describe('AntigravityBackend', () => {
     // Unblock the hanging send so the body can run the finally block.
     resolveSend();
     await firstNext.catch(() => { /* ignore */ });
+  });
+
+  it('should yield text from plannerResponse BEFORE tool_call when turn is "tool_call" (text + tool calls in same turn)', async () => {
+    const backend = new AntigravityBackend();
+    await backend.initialize();
+
+    // Simulate the LS pushing a response that contains BOTH text
+    // ("Let me check the file.") AND a tool call (Read). The
+    // trajectory ends with a pending mcpTool — the plannerResponse
+    // is NOT the last step. McpHub has a pending call so
+    // waitForTurnOrToolCall returns 'tool_call'. We must still
+    // yield the text BEFORE the tool_use events so Claude Code
+    // sees both in the same assistant message.
+    (backend as any).client.lsClient.sendUserCascadeMessage = vi.fn().mockImplementation(async () => {
+      mockState.sharedState.trajectory.steps.push(
+        {
+          status: 3, // DONE
+          step: { case: 'userInput', value: { userResponse: '' } },
+          requestedInteraction: null,
+        },
+        {
+          status: 3, // DONE
+          step: {
+            case: 'plannerResponse',
+            value: {
+              response: 'Let me check the file.',
+              toolCalls: [{ name: 'Read', arguments: '{}' }],
+            },
+          },
+          requestedInteraction: null,
+        },
+        {
+          status: 0, // PENDING (no result yet)
+          step: {
+            case: 'mcpTool',
+            value: {
+              toolCall: { name: 'Read' },
+              result: { value: '' },
+            },
+          },
+          requestedInteraction: null,
+        },
+      );
+    });
+
+    // Prevent clearPendingCalls from clearing our pre-populated test call.
+    vi.spyOn(backend.mcpHub, 'clearPendingCalls').mockImplementation(() => {});
+
+    // Pre-populate mcpHub with a pending call matching the tool call.
+    (backend.mcpHub as any).pending.set('test-call-text-and-tool', {
+      callId: 'test-call-text-and-tool',
+      name: 'Read',
+      args: { file_path: '/tmp/test' },
+      resolve: vi.fn(),
+      reject: vi.fn(),
+      timer: setTimeout(() => {}, 1000),
+    });
+
+    const events: any[] = [];
+    for await (const event of backend.createMessageStream('req-text-and-tool', {
+      model: 'Gemini_3.5_Flash_High',
+      messages: [{ role: 'user', content: 'Hello' }],
+    })) {
+      events.push(event);
+    }
+
+    // The text from the plannerResponse should be yielded as a stream_event
+    const textEvent = events.find(
+      (e) => e.type === 'stream_event' && e.event?.type === 'content',
+    );
+    expect(textEvent).toBeDefined();
+    expect(textEvent.event.value).toContain('Let me check the file.');
+
+    // The tool_call should also be yielded
+    const toolCallEvent = events.find((e) => e.type === 'tool_call');
+    expect(toolCallEvent).toBeDefined();
+    expect(toolCallEvent.name).toBe('Read');
+
+    // CRITICAL: text must come BEFORE tool_call in the event stream
+    // so Claude Code shows them in the correct order in the same
+    // assistant message.
+    const textIdx = events.indexOf(textEvent);
+    const toolIdx = events.indexOf(toolCallEvent);
+    expect(textIdx).toBeGreaterThanOrEqual(0);
+    expect(toolIdx).toBeGreaterThanOrEqual(0);
+    expect(textIdx).toBeLessThan(toolIdx);
+
+    // And the message ends with tool_use stop reason
+    const turnEnd = events.find((e) => e.type === 'turn_end');
+    expect(turnEnd).toBeDefined();
+    expect(turnEnd.stopReason).toBe('tool_use');
   });
 });
 

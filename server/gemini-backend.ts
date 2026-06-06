@@ -759,6 +759,62 @@ export class AntigravityBackend {
   }
 
   /**
+   * Static disclaimer block describing the built-in Antigravity tools
+   * that the LS will deny. Injected into the user text on the FIRST
+   * turn of a fresh cascade so the model does not waste turns
+   * attempting tools that will be rejected at the approval layer.
+   *
+   * Re-attach turns (turn 2+) skip this block — the model already has
+   * it from turn 1's userInput step, which lives in the LS-side
+   * trajectory.
+   *
+   * Keep this list in sync with `createToolConfig()` below. Tools
+   * here MUST also be denied (or no-op'd) at the runtime layer:
+   *  - `forceDisable` / `enabled:false` / partial fields: denied via
+   *    `CascadeToolConfig` flags.
+   *  - Numeric/string zero fields: effectively no-op via result-cap
+   *    zero / empty path.
+   *  - Residual tools with no config handle: denied at the approval
+   *    layer (see `decideInteraction`).
+   */
+  private static getBuiltInToolsDisclaimer(): string {
+    return `=== BUILT-IN TOOLS (DISABLED) ===
+The Antigravity language server has these built-in tools disabled. Calling any of them will be DENIED at the approval layer (no-op) — wasting a turn. Use the MCP-prefixed tools routed through \`claude2gemini-mcp-proxy\` instead.
+
+  runCommand
+  searchWeb
+  memory
+  mquery
+  find
+  generateImage
+  trajectorySearch
+  suggestedResponse
+  listDir
+  antigravityBrowser
+  invokeSubagent
+  notebookEdit
+  askQuestion
+  readKnowledgeBaseItem
+  browserSubagent
+  workspaceApi
+  viewCodeItem
+  internalSearch
+  codeSearch
+  finish
+  commandStatus
+  knowledgeBaseSearch
+  code
+  intent
+  grep
+  viewFile
+  notifyUser
+  taskBoundary
+
+NOTE: \`mcp\` is the only ENABLED built-in. Tool calls of the form \`mcp__claude2gemini-mcp-proxy__<ToolName>\` (e.g. _Bash, _Read, _Edit, _Write, _Glob, _Grep) are the only path that will execute.
+=================================`;
+  }
+
+  /**
    * Dump the selected Cascade's current trajectory (the LS-side
    * conversation history) for debugging. Output format depends on
    * `mode`:
@@ -1199,6 +1255,14 @@ export class AntigravityBackend {
       if (systemPrompt) {
         text += `=== SYSTEM PROMPT ===\n${systemPrompt}\n=====================\n\n`;
       }
+      // On first turn of a fresh cascade, also inject the disabled-
+      // tool list so the model does not waste turns attempting
+      // built-in tools that the approval layer will deny. Re-attach
+      // turns skip this — the model already has the list from turn
+      // 1's userInput step, which lives in the LS-side trajectory.
+      if (createdNewCascade) {
+        text += AntigravityBackend.getBuiltInToolsDisclaimer() + '\n';
+      }
       text += `=== USER INSTRUCTION ===\n${userText}`;
 
       // Snapshot the cascade's step count BEFORE we send this turn's
@@ -1288,6 +1352,25 @@ export class AntigravityBackend {
       }
 
       if (turn === 'tool_call') {
+        // The LS sometimes produces a plannerResponse that contains
+        // BOTH text and tool calls. In that case the trajectory's
+        // last step is the pending mcpTool (not the plannerResponse),
+        // and `waitForTurnOrToolCall` returns 'tool_call' because
+        // McpHub has a pending call. We must STILL collect the text
+        // from the plannerResponse and yield it BEFORE the tool_use
+        // events so Claude Code sees the text + tool calls in the
+        // correct order in the same assistant message. Without this,
+        // the user would only see the tool_use events (no text) when
+        // the model produces a response like "Let me check the file"
+        // followed by a Read call.
+        const textFromThisTurn = this.collectTextFromSteps(cascade, stepCountBefore);
+        if (textFromThisTurn) {
+          yield {
+            type: 'stream_event',
+            sessionId: requestId,
+            event: { type: 'content', value: textFromThisTurn },
+          };
+        }
         const allowedToolNames = request.tools?.map((t) => t.name) || [];
         for (const call of this.mcpHub.getPendingCalls()) {
           if (allowedToolNames.length > 0 && !allowedToolNames.includes(call.name)) {
