@@ -7,9 +7,6 @@
     "dev": "tsx server/index.ts",
     "build": "tsc && cp server/mcp-proxy.mjs dist/server/mcp-proxy.mjs",
     "start": "node dist/server/index.js",
-    "account:add": "tsx cli/manage-accounts.ts add",
-    "account:list": "tsx cli/manage-accounts.ts list",
-    "account:remove": "tsx cli/manage-accounts.ts remove",
     "test": "vitest run --config ./vitest.config.ts"
   },
   "dependencies": {
