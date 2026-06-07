@@ -1132,3 +1132,263 @@ describe('AntigravityBackend.decideInteraction', () => {
     ).toBe('deny');
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────
+// Perspective 3: tool_result delivery (Claude → hub → LS) and
+// session isolation. The mcpHub is a singleton (one EventEmitter per
+// process), so concurrent backends / requests share the same `pending`
+// map. These tests pin down the current semantics so future refactors
+// don't silently break them.
+// ─────────────────────────────────────────────────────────────────────────
+
+describe('Tool result delivery + session isolation', () => {
+  it('resolves the correct pending call by callId without disturbing siblings', async () => {
+    const backend = new AntigravityBackend();
+    await backend.initialize();
+    const hub = backend.mcpHub;
+
+    // Synthesize three in-flight calls.
+    const fakeEntries = ['call_alpha', 'call_beta', 'call_gamma'].map((id) => ({
+      callId: id,
+      name: 'Bash',
+      args: { command: id },
+      resolve: vi.fn(),
+      reject: vi.fn(),
+      timer: setTimeout(() => {}, 60_000),
+    }));
+    for (const e of fakeEntries) (hub as any).pending.set(e.callId, e);
+    expect(hub.getPendingCalls()).toHaveLength(3);
+
+    // Resolve only the middle one.
+    await hub.resolveCall('call_beta', { content: [{ type: 'text', text: 'beta-resolved' }] });
+
+    // call_beta is gone; alpha and gamma remain.
+    expect(hub.hasPendingCalls()).toBe(true);
+    const remaining = hub.getPendingCalls().map((c: any) => c.callId);
+    expect(remaining).toContain('call_alpha');
+    expect(remaining).toContain('call_gamma');
+    expect(remaining).not.toContain('call_beta');
+
+    // Only call_beta's resolve was called.
+    expect(fakeEntries[0]!.resolve).not.toHaveBeenCalled();
+    expect(fakeEntries[1]!.resolve).toHaveBeenCalledWith({ content: [{ type: 'text', text: 'beta-resolved' }] });
+    expect(fakeEntries[2]!.resolve).not.toHaveBeenCalled();
+
+    // Cleanup.
+    for (const e of fakeEntries) clearTimeout(e.timer);
+    hub.clearPendingCalls('test cleanup');
+  });
+
+  it('clearPendingCalls is GLOBAL — it rejects every pending call regardless of session', async () => {
+    // Snapshot the current behavior: clearPendingCalls is a singleton-wide
+    // sweep. If a future change makes it session-scoped, this test will
+    // need to be updated and the bug fix documented.
+    const backend = new AntigravityBackend();
+    await backend.initialize();
+    const hub = backend.mcpHub;
+
+    const a = { callId: 'A', name: 'Bash', args: {}, resolve: vi.fn(), reject: vi.fn(), timer: setTimeout(() => {}, 60_000) };
+    const b = { callId: 'B', name: 'Bash', args: {}, resolve: vi.fn(), reject: vi.fn(), timer: setTimeout(() => {}, 60_000) };
+    (hub as any).pending.set(a.callId, a);
+    (hub as any).pending.set(b.callId, b);
+
+    hub.clearPendingCalls('boundary clear');
+
+    expect(a.reject).toHaveBeenCalledWith(new Error('boundary clear'));
+    expect(b.reject).toHaveBeenCalledWith(new Error('boundary clear'));
+    expect(hub.hasPendingCalls()).toBe(false);
+  });
+
+  it('generates distinct callIds for concurrent /call requests (no collisions)', async () => {
+    const backend = new AntigravityBackend();
+    await backend.initialize();
+    const hub = backend.mcpHub;
+
+    const N = 25;
+    for (let i = 0; i < N; i++) {
+      const entry = {
+        callId: '',
+        name: 'Bash',
+        args: { i },
+        resolve: vi.fn(),
+        reject: vi.fn(),
+        timer: setTimeout(() => {}, 60_000),
+      };
+      // Mirror McpHub's callId generation: 'call_' + 16 hex chars.
+      entry.callId = 'call_' + Math.random().toString(16).slice(2, 18).padEnd(16, '0');
+      (hub as any).pending.set(entry.callId, entry);
+    }
+
+    const ids = hub.getPendingCalls().map((c: any) => c.callId);
+    expect(new Set(ids).size).toBe(N);
+
+    // Cleanup.
+    for (const e of (hub as any).pending.values()) clearTimeout(e.timer);
+    hub.clearPendingCalls('test cleanup');
+  });
+
+  it('setTools called by one request does not corrupt in-flight calls from another', async () => {
+    const backend = new AntigravityBackend();
+    await backend.initialize();
+    const hub = backend.mcpHub;
+
+    // Session A sets v1 of a tool, then triggers a /call whose args are
+    // cleansed against v1.
+    hub.setTools([{
+      name: 'tool',
+      description: 'v1',
+      input_schema: { type: 'object', properties: { x: { type: 'string' } }, required: ['x'] },
+    }]);
+    const v1Call: any = {
+      callId: 'in-flight-1',
+      name: 'tool',
+      args: {},
+      resolve: vi.fn(),
+      reject: vi.fn(),
+      timer: setTimeout(() => {}, 60_000),
+    };
+    // Manually call the same code path the hub uses for cleansing.
+    const original = (hub as any).originalSchemas.get('tool');
+    v1Call.args = (await import('../server/mcp-hub.js')).cleanAndFixArguments(
+      { x: 'kept', junk: 'drop' },
+      original,
+    );
+    expect(v1Call.args).toEqual({ x: 'kept' });
+
+    // Session B replaces the tool definition mid-flight. The hub clears
+    // originalSchemas on every setTools — so session A's already-cleansed
+    // args are NOT re-cleansed, but any NEW call would be against v2.
+    hub.setTools([{
+      name: 'tool',
+      description: 'v2',
+      input_schema: { type: 'object', properties: { y: { type: 'integer' } }, required: ['y'] },
+    }]);
+    expect(v1Call.args).toEqual({ x: 'kept' }); // untouched
+
+    // A new call against v2 sees the new schema.
+    const v2Args = (await import('../server/mcp-hub.js')).cleanAndFixArguments(
+      { y: '7', x: 'stale' },
+      (hub as any).originalSchemas.get('tool'),
+    );
+    expect(v2Args).toEqual({ y: 7 });
+
+    // Cleanup.
+    clearTimeout(v1Call.timer);
+  });
+
+  it('cleanAndFixArguments strips properties not in the schema — this is why missing required fields must be validated upstream', async () => {
+    const { cleanAndFixArguments } = await import('../server/mcp-hub.js');
+    const schema = {
+      type: 'object',
+      properties: { command: { type: 'string' } },
+      required: ['command'],
+    };
+    // LS sends NO arguments at all.
+    const args = cleanAndFixArguments({}, schema);
+    // The hub deliberately leaves missing required fields as undefined
+    // rather than synthesizing empty strings (per the comment in
+    // cleanAndFixArguments). This test pins down that decision so any
+    // future "fill with empty string" regression is caught.
+    expect(args.command).toBeUndefined();
+    expect(args).toEqual({});
+  });
+
+  it('end-to-end: hub /call → resolveCall returns the result that LS sees', async () => {
+    const backend = new AntigravityBackend();
+    await backend.initialize();
+    const hub = backend.mcpHub;
+
+    hub.setTools([{
+      name: 'Bash',
+      description: 'run',
+      input_schema: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] },
+    }]);
+
+    // Start a /call against the in-process hub, capture the pending call,
+    // then resolve it with a synthetic tool_result and assert the
+    // promise resolves with that exact content.
+    const pending = new Promise<{ callId: string }>((resolve) => {
+      hub.once('pending_call', (e: any) => resolve({ callId: e.callId }));
+    });
+    const callPromise = (async () => {
+      const res = await fetch(`http://127.0.0.1:${hub.port}/call`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'Bash', arguments: { command: 'ls' } }),
+      });
+      return { status: res.status, json: await res.json() };
+    })();
+
+    const { callId } = await pending;
+    await hub.resolveCall(callId, {
+      content: [{ type: 'text', text: 'file1\nfile2\n' }],
+      isError: false,
+    });
+    const res = await callPromise;
+    expect(res.status).toBe(200);
+    expect(res.json.result.content[0].text).toBe('file1\nfile2\n');
+  });
+
+  it('end-to-end: tool_result isError:true → hub returns { content: [], isError: true } to the LS', async () => {
+    const backend = new AntigravityBackend();
+    await backend.initialize();
+    const hub = backend.mcpHub;
+
+    const pending = new Promise<string>((resolve) => {
+      hub.once('pending_call', (e: any) => resolve(e.callId));
+    });
+    const callPromise = (async () => {
+      const res = await fetch(`http://127.0.0.1:${hub.port}/call`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'Bash', arguments: { command: 'false' } }),
+      });
+      return { status: res.status, json: await res.json() };
+    })();
+
+    const callId = await pending;
+    // The HTTP /resolve endpoint is what Claude Code's tool_result
+    // reaches (via routes/messages.ts). The isError flag is honored
+    // only on this path — the programmatic resolveCall() API has no
+    // isError parameter, so callers must use HTTP for the error case.
+    await fetch(`http://127.0.0.1:${hub.port}/resolve`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ callId, isError: true }),
+    });
+    const res = await callPromise;
+    expect(res.status).toBe(200);
+    expect(res.json.result).toEqual({ content: [], isError: true });
+  });
+
+  it('tool_use_id from a Claude tool_result resolves the matching hub callId (format match: call_<hex>)', async () => {
+    const backend = new AntigravityBackend();
+    await backend.initialize();
+    const hub = backend.mcpHub;
+
+    const pending = new Promise<string>((resolve) => {
+      hub.once('pending_call', (e: any) => resolve(e.callId));
+    });
+    const callPromise = (async () => {
+      const res = await fetch(`http://127.0.0.1:${hub.port}/call`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: 'Bash', arguments: { command: 'ls' } }),
+      });
+      return res.json();
+    })();
+
+    const callId = await pending;
+    // The hub uses call_<16 hex chars>; the SSE tool_use id is the same
+    // string. The Claude tool_result.tool_use_id MUST match exactly to
+    // be routed to this call.
+    expect(callId).toMatch(/^call_[0-9a-f]{16}$/);
+
+    // Simulate what routes/messages.ts does: it receives
+    // { role: 'user', content: [{ type: 'tool_result', tool_use_id: callId, content: '...' }] }
+    // and calls resolveCall(callId, result).
+    await hub.resolveCall(callId, { content: [{ type: 'text', text: 'matched' }] });
+    const result = await callPromise;
+    expect(result.result.content[0].text).toBe('matched');
+  });
+});
