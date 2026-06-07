@@ -85,34 +85,24 @@ export class McpHub extends EventEmitter {
    * Register tools from a Claude API request (ClaudeToolDefinition format).
    * Converts `input_schema` → `inputSchema` for MCP compatibility.
    *
-   * By default the original schema is forwarded as-is to the LS so
-   * anyOf/oneOf/allOf, descriptions, enums, defaults, and $ref are
-   * preserved. The MCP spec requires clients (LS) to support JSON
-   * Schema 2020-12, so flattening these keywords loses information
-   * the model would otherwise use to generate correct tool calls
-   * (notably: `oneOf` collapses to "all branches required", which
-   * causes the model to invent parameters the schema never asked
-   * for).
-   *
-   * If `MCP_HUB_LEGACY_SCHEMA=1`, the old `simplifySchema` path is
-   * used. This is kept as an opt-in escape hatch for environments
-   * where the LS is known to misbehave on raw 2020-12 schemas.
+   * The original schema is forwarded as-is to the LS so anyOf/oneOf/allOf,
+   * descriptions, enums, defaults, and $ref are preserved. The MCP spec
+   * requires clients (LS) to support JSON Schema 2020-12, so flattening
+   * these keywords loses information the model would otherwise use to
+   * generate correct tool calls (notably: `oneOf` collapses to "all
+   * branches required", which causes the model to invent parameters
+   * the schema never asked for).
    */
   setTools(defs: { name: string; description?: string; input_schema?: any }[]): void {
     this.originalSchemas.clear();
-    const useLegacy = process.env.MCP_HUB_LEGACY_SCHEMA === '1';
     this.tools = defs.map((d) => {
       const name = d.name;
       const originalSchema = d.input_schema ?? {};
       this.originalSchemas.set(name, originalSchema);
-      const inputSchema = useLegacy ? simplifySchema(originalSchema) : originalSchema;
-      if (useLegacy) {
-        process.stderr.write(`[McpHub] LEGACY_SCHEMA: ${name} run through simplifySchema (anyOf/oneOf/allOf merged)\n`);
-      }
       return {
         name,
         description: d.description ?? '',
-        inputSchema,
+        inputSchema: originalSchema,
       };
     });
   }
@@ -311,151 +301,6 @@ export class McpHub extends EventEmitter {
       req.on('error', reject);
     });
   }
-}
-
-/**
- * Simplifies a JSON Schema to a cleaner subset that the Gemini/Antigravity LS
- * model planner can easily understand.
- */
-export function simplifySchema(schema: any): any {
-  if (!schema || typeof schema !== 'object') {
-    return schema;
-  }
-
-  // 1. Resolve anyOf or oneOf by merging properties and required from ALL
-  // branches so the model knows about every possible parameter. Only the
-  // first non-null branch determines the primary type.
-  if (schema.anyOf && Array.isArray(schema.anyOf)) {
-    const nonNullBranches = schema.anyOf.filter((s: any) => s && s.type !== 'null');
-    const branchesToMerge = nonNullBranches.length > 0 ? nonNullBranches : schema.anyOf;
-
-    const merged: any = { ...schema, anyOf: undefined };
-    // Remove parent type so branches can define it
-    delete merged.type;
-    // Only include properties/required if the parent actually has them
-    if (schema.properties) {
-      merged.properties = { ...schema.properties };
-    }
-    const requiredArr = schema.required;
-    if (Array.isArray(requiredArr)) {
-      merged.required = [...requiredArr];
-    }
-
-    for (const branch of branchesToMerge) {
-      const simplified = simplifySchema(branch);
-      if (simplified.properties) {
-        merged.properties = { ...(merged.properties || {}), ...simplified.properties };
-      }
-      if (Array.isArray(simplified.required)) {
-        merged.required = Array.from(new Set([...(merged.required || []), ...simplified.required]));
-      }
-      if (simplified.type && !merged.type) {
-        merged.type = simplified.type;
-      }
-    }
-
-    // Clean up empty properties/required so step 4 doesn't falsely match
-    if (merged.properties && Object.keys(merged.properties).length === 0) {
-      delete merged.properties;
-    }
-    if (merged.required && merged.required.length === 0) {
-      delete merged.required;
-    }
-
-    return simplifySchema(merged);
-  }
-  if (schema.oneOf && Array.isArray(schema.oneOf)) {
-    const merged: any = { ...schema, oneOf: undefined };
-    delete merged.type;
-    if (schema.properties) {
-      merged.properties = { ...schema.properties };
-    }
-    const requiredArr = schema.required;
-    if (Array.isArray(requiredArr)) {
-      merged.required = [...requiredArr];
-    }
-
-    for (const branch of schema.oneOf) {
-      const simplified = simplifySchema(branch);
-      if (simplified.properties) {
-        merged.properties = { ...(merged.properties || {}), ...simplified.properties };
-      }
-      if (Array.isArray(simplified.required)) {
-        merged.required = Array.from(new Set([...(merged.required || []), ...simplified.required]));
-      }
-      if (simplified.type && !merged.type) {
-        merged.type = simplified.type;
-      }
-    }
-
-    if (merged.properties && Object.keys(merged.properties).length === 0) {
-      delete merged.properties;
-    }
-    if (merged.required && merged.required.length === 0) {
-      delete merged.required;
-    }
-
-    return simplifySchema(merged);
-  }
-
-  // 2. Resolve allOf by merging all nested properties and required arrays
-  if (schema.allOf && Array.isArray(schema.allOf)) {
-    const merged: any = {
-      ...schema,
-      type: schema.type || 'object',
-      properties: { ...schema.properties },
-      required: [...(schema.required || [])]
-    };
-    for (const sub of schema.allOf) {
-      const simplifiedSub = simplifySchema(sub);
-      if (simplifiedSub.properties) {
-        merged.properties = { ...merged.properties, ...simplifiedSub.properties };
-      }
-      if (Array.isArray(simplifiedSub.required)) {
-        merged.required = Array.from(new Set([...merged.required, ...simplifiedSub.required]));
-      }
-      if (simplifiedSub.type && simplifiedSub.type !== 'object') {
-        merged.type = simplifiedSub.type;
-      }
-    }
-    delete merged.allOf;
-    return simplifySchema(merged);
-  }
-
-  // 3. Handle arrays
-  if (schema.type === 'array' || schema.items) {
-    const newSchema = { ...schema };
-    if (schema.items) {
-      newSchema.items = simplifySchema(schema.items);
-    }
-    return newSchema;
-  }
-
-  // 4. Handle objects
-  if (schema.type === 'object' || schema.properties) {
-    const newSchema = { ...schema, type: 'object' };
-    if (schema.properties) {
-      const newProps: any = {};
-      for (const [key, prop] of Object.entries(schema.properties)) {
-        newProps[key] = simplifySchema(prop);
-      }
-      newSchema.properties = newProps;
-    }
-    if ('additionalProperties' in newSchema) {
-      delete newSchema.additionalProperties;
-    }
-    return newSchema;
-  }
-
-  // 5. Handle multi-type array declarations like type: ['string', 'null']
-  if (Array.isArray(schema.type)) {
-    const newSchema = { ...schema };
-    const mainType = schema.type.find((t: string) => t !== 'null') || schema.type[0];
-    newSchema.type = mainType;
-    return newSchema;
-  }
-
-  return schema;
 }
 
 /**

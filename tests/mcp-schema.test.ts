@@ -1,118 +1,16 @@
 /**
- * Unit tests for the `simplifySchema()`, `cleanAndFixArguments()`, and
- * `unpackMetaCall()` helpers exported from server/mcp-hub.ts.
+ * Unit tests for the `cleanAndFixArguments()` and `unpackMetaCall()`
+ * helpers exported from server/mcp-hub.ts. These are applied to tool
+ * call arguments received over the /call HTTP endpoint.
  *
- * `simplifySchema` is the LEGACY flattener used only when
- * `MCP_HUB_LEGACY_SCHEMA=1` is set. The default behavior of McpHub is
- * to forward the original input_schema as-is (see mcp-hub.test.ts
- * "Default behavior (passthrough)"). The tests in this file lock
- * down the legacy path so that, if it is needed for a specific
- * environment, we know exactly what it does.
- *
- * `cleanAndFixArguments` and `unpackMetaCall` are still used in
- * /call regardless of the schema passthrough setting.
+ * Tool schema handling itself is covered in mcp-hub.test.ts
+ * ("Default behavior (passthrough)" block) — the hub now forwards the
+ * original input_schema to the LS verbatim, so there is no schema
+ * flattener to unit-test.
  */
 
 import { describe, it, expect } from 'vitest';
-import { simplifySchema, cleanAndFixArguments, unpackMetaCall } from '../server/mcp-hub.js';
-
-describe('Schema Simplification (LEGACY_SCHEMA mode)', () => {
-  it('should merge all anyOf/oneOf branches properties and required', () => {
-    const complexSchema = {
-      type: 'object',
-      properties: {
-        command: {
-          anyOf: [
-            { type: 'string', description: 'The bash command to run' },
-            { type: 'null' }
-          ]
-        },
-        timeout: {
-          oneOf: [
-            { type: 'integer' },
-            { type: 'string' }
-          ]
-        }
-      }
-    };
-
-    const simplified = simplifySchema(complexSchema);
-    // anyOf: string branch kept, null branch discarded (type-level)
-    expect(simplified.properties.command.type).toBe('string');
-    expect(simplified.properties.command.anyOf).toBeUndefined();
-    // oneOf: merged from both branches — both types visible
-    expect(simplified.properties.timeout).toBeDefined();
-    expect(simplified.properties.timeout.oneOf).toBeUndefined();
-  });
-
-  it('should merge anyOf branches at the top level', () => {
-    // Simulates a tool schema with two possible object shapes
-    const schema = {
-      anyOf: [
-        {
-          type: 'object',
-          properties: { id: { type: 'string' } },
-          required: ['id']
-        },
-        {
-          type: 'object',
-          properties: { name: { type: 'string' } },
-          required: ['name']
-        }
-      ]
-    };
-
-    const simplified = simplifySchema(schema);
-    expect(simplified.anyOf).toBeUndefined();
-    // Both properties from both branches should be present
-    expect(simplified.properties.id).toBeDefined();
-    expect(simplified.properties.name).toBeDefined();
-    // Required from both branches merged
-    expect(simplified.required).toContain('id');
-    expect(simplified.required).toContain('name');
-  });
-
-  it('should merge allOf schemas into a flat object', () => {
-    const schema = {
-      type: 'object',
-      allOf: [
-        {
-          properties: {
-            path: { type: 'string' }
-          },
-          required: ['path']
-        },
-        {
-          properties: {
-            content: { type: 'string' }
-          },
-          required: ['content']
-        }
-      ]
-    };
-
-    const simplified = simplifySchema(schema);
-    expect(simplified.properties.path).toBeDefined();
-    expect(simplified.properties.content).toBeDefined();
-    expect(simplified.required).toContain('path');
-    expect(simplified.required).toContain('content');
-    expect(simplified.allOf).toBeUndefined();
-  });
-
-  it('should remove additionalProperties and handle multi-type arrays', () => {
-    const schema = {
-      type: 'object',
-      properties: {
-        tag: { type: ['string', 'null'] }
-      },
-      additionalProperties: false
-    };
-
-    const simplified = simplifySchema(schema);
-    expect(simplified.properties.tag.type).toBe('string');
-    expect(simplified.additionalProperties).toBeUndefined();
-  });
-});
+import { cleanAndFixArguments, unpackMetaCall } from '../server/mcp-hub.js';
 
 describe('Arguments Cleansing and Fixing', () => {
   const testSchema = {
@@ -245,126 +143,6 @@ describe('MCP Hub Request Parsing Mock', () => {
 
     expect(getArgs(rawData1)).toEqual({ command: 'ls' });
     expect(getArgs(rawData2)).toEqual({ command: 'ls' });
-  });
-});
-
-// ─────────────────────────────────────────────────────────────────────────
-// Additional Schema Simplification edge cases
-// ─────────────────────────────────────────────────────────────────────────
-
-describe('Schema Simplification: edge cases', () => {
-  it('handles 3-level deep nested anyOf while keeping required at every level', () => {
-    const schema = {
-      type: 'object',
-      properties: {
-        outer: {
-          type: 'object',
-          properties: {
-            middle: {
-              anyOf: [
-                {
-                  type: 'object',
-                  properties: {
-                    inner: { type: 'string', description: 'deepest' },
-                  },
-                  required: ['inner'],
-                },
-                { type: 'null' },
-              ],
-            },
-          },
-          required: ['middle'],
-        },
-      },
-      required: ['outer'],
-    };
-    const simplified = simplifySchema(schema);
-    expect(simplified.required).toEqual(['outer']);
-    expect(simplified.properties.outer.required).toEqual(['middle']);
-    // The null branch is dropped, the string-typed middle is kept.
-    expect(simplified.properties.outer.properties.middle.type).toBe('object');
-    expect(simplified.properties.outer.properties.middle.properties.inner.type).toBe('string');
-    expect(simplified.properties.outer.properties.middle.required).toEqual(['inner']);
-  });
-
-  it('preserves description on the root schema and on top-level properties', () => {
-    const schema = {
-      type: 'object',
-      description: 'top-level description',
-      properties: {
-        foo: { type: 'string', description: 'a foo parameter' },
-      },
-    };
-    const simplified = simplifySchema(schema);
-    expect(simplified.description).toBe('top-level description');
-    expect(simplified.properties.foo.description).toBe('a foo parameter');
-  });
-
-  it('strips additionalProperties (LS planner does not handle it)', () => {
-    const schema = {
-      type: 'object',
-      properties: { a: { type: 'string' } },
-      additionalProperties: false,
-    };
-    const simplified = simplifySchema(schema);
-    expect(simplified.additionalProperties).toBeUndefined();
-  });
-
-  it('does not crash on empty / null schema (returns the input as-is)', () => {
-    expect(simplifySchema(null)).toBeNull();
-    expect(simplifySchema(undefined)).toBeUndefined();
-    expect(simplifySchema({})).toEqual({});
-  });
-
-  it('handles array items with nested anyOf (items is simplified recursively)', () => {
-    const schema = {
-      type: 'array',
-      items: {
-        anyOf: [
-          { type: 'string', description: 'item string' },
-          { type: 'null' },
-        ],
-      },
-    };
-    const simplified = simplifySchema(schema);
-    expect(simplified.type).toBe('array');
-    expect(simplified.items.type).toBe('string');
-  });
-
-  it('handles multi-type array declarations like ["string", "null"]', () => {
-    const schema = { type: ['string', 'null'] as any };
-    const simplified = simplifySchema(schema);
-    expect(simplified.type).toBe('string');
-  });
-
-  it('merges oneOf with multiple non-null branches and keeps all properties/required', () => {
-    const schema = {
-      type: 'object',
-      oneOf: [
-        { type: 'object', properties: { a: { type: 'string' } }, required: ['a'] },
-        { type: 'object', properties: { b: { type: 'integer' } }, required: ['b'] },
-      ],
-    };
-    const simplified = simplifySchema(schema);
-    expect(simplified.oneOf).toBeUndefined();
-    expect(simplified.properties.a).toBeDefined();
-    expect(simplified.properties.b).toBeDefined();
-    expect(simplified.required.sort()).toEqual(['a', 'b']);
-  });
-
-  it('flattens allOf at the top level (no parent type, no parent properties)', () => {
-    const schema = {
-      allOf: [
-        { type: 'object', properties: { x: { type: 'string' } }, required: ['x'] },
-        { type: 'object', properties: { y: { type: 'integer' } }, required: ['y'] },
-      ],
-    };
-    const simplified = simplifySchema(schema);
-    expect(simplified.allOf).toBeUndefined();
-    expect(simplified.properties.x).toBeDefined();
-    expect(simplified.properties.y).toBeDefined();
-    expect(simplified.required.sort()).toEqual(['x', 'y']);
-    expect(simplified.type).toBe('object');
   });
 });
 
@@ -546,12 +324,9 @@ describe('Unpack Meta Tool Call: edge cases', () => {
   });
 
   it('falls back to toolName (camelCase) when ToolName is absent', () => {
-    const out = unpackMetaCall('call_mcp_tool', {
-      toolName: 'Read',
-      arguments: { path: '/tmp/x' },
-    });
-    expect(out.name).toBe('Read');
-    expect(out.args).toEqual({ path: '/tmp/x' });
+    const { name, args } = unpackMetaCall('call_mcp_tool', { toolName: 'Bash', Arguments: { command: 'ls' } });
+    expect(name).toBe('Bash');
+    expect(args).toEqual({ command: 'ls' });
   });
 
   it('prefers Arguments (PascalCase) over arguments (camelCase)', () => {
@@ -600,61 +375,6 @@ describe('Unpack Meta Tool Call: edge cases', () => {
     const out = unpackMetaCall('call_mcp_tool', raw);
     expect(out.name).toBe('Edit');
     expect(out.args).toEqual({ path: 'a.txt', content: 'x' });
-  });
-});
-
-// ─────────────────────────────────────────────────────────────────────────
-// Integration: setTools → simplifySchema → cleanAndFixArguments
-// (mirrors the production flow in McpHub.#handleToolsCall)
-// ─────────────────────────────────────────────────────────────────────────
-
-describe('setTools + cleanAndFixArguments integration (mirrors McpHub #handleToolsCall)', () => {
-  it('applies the ORIGINAL (pre-simplification) schema to cleanse LS-sent args', () => {
-    // Real-world Claude tool definition: a Read tool whose `path` is required.
-    const defs = [
-      {
-        name: 'Read',
-        description: 'Read a file',
-        input_schema: {
-          type: 'object',
-          properties: {
-            path: { type: 'string', description: 'absolute file path' },
-            limit: { type: 'integer', default: 100 },
-          },
-          required: ['path'],
-        },
-      },
-    ];
-    // The hub keeps both the simplified schema (for LS) and the original
-    // (for cleansing). We mimic the second half of the flow.
-    const original = defs[0]!.input_schema;
-    const argsFromLS = { path: '/etc/hosts', limit: '5', extra: 'noise' };
-
-    const cleaned = cleanAndFixArguments(argsFromLS, original);
-    expect(cleaned).toEqual({ path: '/etc/hosts', limit: 5 });
-    expect((cleaned as any).extra).toBeUndefined();
-  });
-
-  it('handles allOf at the top level: cleanses against the MERGED original schema', () => {
-    const original = {
-      allOf: [
-        { type: 'object', properties: { a: { type: 'string' } }, required: ['a'] },
-        { type: 'object', properties: { b: { type: 'integer' } }, required: ['b'] },
-      ],
-    };
-    const out = cleanAndFixArguments({ a: 'x', b: '7', c: 'drop' }, original);
-    expect(out).toEqual({ a: 'x', b: 7 });
-  });
-
-  it('handles anyOf at the top level: picks the best-matching branch for cleansing', () => {
-    const original = {
-      anyOf: [
-        { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] },
-        { type: 'object', properties: { content: { type: 'string' } }, required: ['content'] },
-      ],
-    };
-    const out = cleanAndFixArguments({ content: 'hello' }, original);
-    expect(out).toEqual({ content: 'hello' });
   });
 });
 

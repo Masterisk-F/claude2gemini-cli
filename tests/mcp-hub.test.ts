@@ -3,18 +3,18 @@
  *
  * Coverage:
  *  - Lifecycle (start / stop / idempotent start)
- *  - GET /tools (registration, format, simplification roundtrip)
+ *  - GET /tools (registration, format, raw schema passthrough)
  *  - POST /call (blocking, JSON validation, name validation,
  *               call_mcp_tool unpacking, cleanAndFixArguments application,
  *               pending_call events, shutdown rejection)
  *  - POST /resolve (normal, isError, unknown callId, missing callId)
  *  - clearPendingCalls (mass rejection, custom reason)
  *  - Tool definition roundtrip: setTools → /tools preserves names,
- *    descriptions, required fields, and nested schemas through
- *    simplifySchema.
+ *    descriptions, required fields, and anyOf/oneOf/allOf/nested schemas
+ *    verbatim.
  */
 
-import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { McpHub } from '../server/mcp-hub.js';
 
 let hub: McpHub;
@@ -150,8 +150,7 @@ describe('GET /tools', () => {
     ]);
     const res = await fetchJson('/tools');
     // Default behavior: the original schema is forwarded as-is so the LS
-    // sees anyOf/oneOf/allOf/enum/default/description verbatim. The
-    // simplify path is opt-in via MCP_HUB_LEGACY_SCHEMA=1.
+    // sees anyOf/oneOf/allOf/enum/default/description verbatim.
     const valueSchema = res.json.tools[0].inputSchema.properties.value;
     expect(valueSchema.anyOf).toBeDefined();
     expect(valueSchema.anyOf).toEqual([{ type: 'string' }, { type: 'null' }]);
@@ -730,11 +729,9 @@ describe('CORS headers', () => {
 // ─────────────────────────────────────────────────────────────────────────
 // Default behavior (passthrough)
 //
-// As of the schema-compatibility investigation, setTools() forwards the
-// original input_schema as-is. anyOf/oneOf/allOf, descriptions, enums,
-// defaults, additionalProperties, and $ref are all preserved verbatim
-// so the LS sees the schema the tool author wrote. The legacy
-// simplifySchema path is opt-in via MCP_HUB_LEGACY_SCHEMA=1.
+// setTools() forwards the original input_schema as-is. anyOf/oneOf/allOf,
+// descriptions, enums, defaults, additionalProperties, and $ref are all
+// preserved verbatim so the LS sees the schema the tool author wrote.
 // ─────────────────────────────────────────────────────────────────────────
 
 describe('Default behavior (passthrough — no env var)', () => {
@@ -981,147 +978,5 @@ describe('Default behavior (passthrough — no env var)', () => {
 
     expect(schema.properties.foo.$ref).toBe('#/$defs/Bar');
     expect(schema.$defs.Bar.description).toBe('bar def');
-  });
-});
-
-// ─────────────────────────────────────────────────────────────────────────
-// LEGACY_SCHEMA mode (MCP_HUB_LEGACY_SCHEMA=1)
-//
-// Opt-in escape hatch. With this env var set, setTools() routes the
-// input_schema through the legacy `simplifySchema()` flattener that
-// collapses anyOf/oneOf/allOf into a single object and drops
-// additionalProperties. Used in environments where the LS is known
-// to misbehave on raw JSON Schema 2020-12 input.
-// ─────────────────────────────────────────────────────────────────────────
-
-describe('LEGACY_SCHEMA mode (MCP_HUB_LEGACY_SCHEMA=1)', () => {
-  let originalEnv: string | undefined;
-
-  beforeAll(() => {
-    originalEnv = process.env.MCP_HUB_LEGACY_SCHEMA;
-    process.env.MCP_HUB_LEGACY_SCHEMA = '1';
-  });
-
-  afterAll(() => {
-    if (originalEnv === undefined) {
-      delete process.env.MCP_HUB_LEGACY_SCHEMA;
-    } else {
-      process.env.MCP_HUB_LEGACY_SCHEMA = originalEnv;
-    }
-  });
-
-  beforeEach(setupHub);
-  afterEach(teardownHub);
-
-  it('flattens anyOf ([string, null] → string)', async () => {
-    hub.setTools([
-      {
-        name: 'simplifyany',
-        description: 'simplify anyOf',
-        input_schema: {
-          type: 'object',
-          properties: {
-            value: { anyOf: [{ type: 'string' }, { type: 'null' }] },
-          },
-        },
-      },
-    ]);
-    const res = await fetchJson('/tools');
-    const prop = res.json.tools[0].inputSchema.properties.value;
-    expect(prop.type).toBe('string');
-    expect(prop.anyOf).toBeUndefined();
-  });
-
-  it('flattens oneOf by merging branches (preserves required/properties of all branches)', async () => {
-    hub.setTools([
-      {
-        name: 'simplifyone',
-        description: 'simplify oneOf',
-        input_schema: {
-          oneOf: [
-            {
-              type: 'object',
-              properties: { a: { type: 'string', description: 'branch a' } },
-              required: ['a'],
-            },
-            {
-              type: 'object',
-              properties: { b: { type: 'integer', description: 'branch b' } },
-              required: ['b'],
-            },
-          ],
-        },
-      },
-    ]);
-    const res = await fetchJson('/tools');
-    const schema = res.json.tools[0].inputSchema;
-    expect(schema.oneOf).toBeUndefined();
-    expect(schema.type).toBe('object');
-    expect(schema.properties.a.description).toBe('branch a');
-    expect(schema.properties.b.description).toBe('branch b');
-    expect(schema.required.sort()).toEqual(['a', 'b']);
-  });
-
-  it('flattens allOf by merging branches', async () => {
-    hub.setTools([
-      {
-        name: 'simplifyall',
-        description: 'simplify allOf',
-        input_schema: {
-          allOf: [
-            {
-              type: 'object',
-              properties: { a: { type: 'string', description: 'a' } },
-              required: ['a'],
-            },
-            {
-              type: 'object',
-              properties: { b: { type: 'integer', description: 'b' } },
-              required: ['b'],
-            },
-          ],
-        },
-      },
-    ]);
-    const res = await fetchJson('/tools');
-    const schema = res.json.tools[0].inputSchema;
-    expect(schema.allOf).toBeUndefined();
-    expect(schema.type).toBe('object');
-    expect(schema.properties.a.description).toBe('a');
-    expect(schema.properties.b.description).toBe('b');
-    expect(schema.required.sort()).toEqual(['a', 'b']);
-  });
-
-  it('removes additionalProperties in legacy mode', async () => {
-    hub.setTools([
-      {
-        name: 'addl',
-        description: 'with addl',
-        input_schema: {
-          type: 'object',
-          properties: { x: { type: 'string' } },
-          additionalProperties: false,
-        },
-      },
-    ]);
-    const res = await fetchJson('/tools');
-    expect(res.json.tools[0].inputSchema.additionalProperties).toBeUndefined();
-  });
-
-  it('shrinks multi-type array ["integer", "null"] to "integer"', async () => {
-    hub.setTools([
-      {
-        name: 'multi',
-        description: 'multi type',
-        input_schema: {
-          type: 'object',
-          properties: {
-            x: { type: ['integer', 'null'] },
-          },
-        },
-      },
-    ]);
-    const res = await fetchJson('/tools');
-    expect(res.json.tools[0].inputSchema.properties.x.type).toBe('integer');
   });
 });
