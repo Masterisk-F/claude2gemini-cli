@@ -16,25 +16,29 @@ app.get('/health', (_req, res) => {
   res.json({ status: 'ok' });
 });
 
-const server = app.listen(PORT);
-server.on('listening', async () => {
-  console.log(`Claude2Gemini proxy (Antigravity mode) listening on port ${PORT}`);
+async function startServer() {
   try {
     await antigravityBackend.initialize();
   } catch (err) {
     console.error(`[Error] Failed to initialize Antigravity backend:`, err);
     process.exit(1);
   }
-});
 
-server.on('error', (err: NodeJS.ErrnoException) => {
-  if (err.code === 'EADDRINUSE') {
-    console.error(`[Error] Port ${PORT} is already in use. Is another proxy instance running?`);
-  } else {
-    console.error(`[Error] Failed to start proxy:`, err.message);
-  }
-  process.exit(1);
-});
+  const server = app.listen(PORT, () => {
+    console.log(`Claude2Gemini proxy (Antigravity mode) listening on port ${PORT}`);
+  });
+
+  server.on('error', (err: NodeJS.ErrnoException) => {
+    if (err.code === 'EADDRINUSE') {
+      console.error(`[Error] Port ${PORT} is already in use. Is another proxy instance running?`);
+    } else {
+      console.error(`[Error] Failed to start proxy:`, err.message);
+    }
+    process.exit(1);
+  });
+}
+
+startServer();
 
 // 終了シグナルハンドラ
 process.on('SIGINT', async () => {

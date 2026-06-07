@@ -159,9 +159,30 @@ export class AntigravityBackend {
   private lastRegisteredToolsHash = '';
   /** Error captured from cascade's 'error' event (if any) */
   #cascadeError: Error | null = null;
+  /** Interval for purging inactive sessions from the store */
+  private sessionPurgeInterval?: NodeJS.Timeout;
 
   async initialize(): Promise<void> {
     if (this.client) return;
+
+    if (!this.sessionPurgeInterval) {
+      this.sessionPurgeInterval = setInterval(() => {
+        const now = Date.now();
+        for (const [key, entry] of this.sessionStore.entries()) {
+          if (now - entry.lastUsed > 60 * 60 * 1000) { // 1 hour
+            console.log(`[Backend] Purging inactive session: cascadeId=${key}, sessionId=${entry.sessionId}`);
+            this.sessionStore.delete(key);
+            this.#deleteCascadeTrajectoryBestEffort(key);
+            try {
+              entry.cascade.dispose();
+            } catch (err) {
+              console.warn(`[Backend] Failed to dispose cascade ${key} during purge:`, err);
+            }
+          }
+        }
+      }, 5 * 60 * 1000); // 5 minutes
+      this.sessionPurgeInterval.unref?.();
+    }
 
     // Start the MCP Hub first so we know the port before LS starts
     try {
@@ -1527,6 +1548,11 @@ NOTE: \`mcp\` is the only ENABLED built-in. Tool calls of the form \`mcp__claude
   }
 
   async shutdown(): Promise<void> {
+    if (this.sessionPurgeInterval) {
+      clearInterval(this.sessionPurgeInterval);
+      this.sessionPurgeInterval = undefined;
+    }
+
     // Cancel any in-flight cascades
     for (const [requestId, cascade] of this.inflightCascades.entries()) {
       try { await cascade.cancel(); }
