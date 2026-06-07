@@ -262,7 +262,7 @@ describe('AntigravityBackend', () => {
 
     const messages1 = [
       { role: 'user', content: 'Hi' },
-      { role: 'assistant', content: 'Hello!' },
+      { role: 'assistant', content: [{ type: 'text', text: 'Hello!' }] },
       { role: 'user', content: 'Tell me a joke.' },
     ];
     // First turn: system prompt IS included.
@@ -279,7 +279,7 @@ describe('AntigravityBackend', () => {
     // step, which lives in the LS-side trajectory.
     const messages2 = [
       ...messages1,
-      { role: 'assistant', content: 'Why did the chicken cross the road?' },
+      { role: 'assistant', content: [{ type: 'text', text: 'Why did the chicken cross the road?' }] },
       { role: 'user', content: 'Another one.' },
     ];
     for await (const _ of backend.createMessageStream('req-turn2-sys', {
@@ -342,7 +342,7 @@ describe('AntigravityBackend', () => {
 
     const messages1 = [
       { role: 'user', content: 'Hi' },
-      { role: 'assistant', content: 'Hello!' },
+      { role: 'assistant', content: [{ type: 'text', text: 'Hello!' }] },
       { role: 'user', content: 'Tell me a joke.' },
     ];
     for await (const _ of backend.createMessageStream('req-bt-1', {
@@ -356,7 +356,7 @@ describe('AntigravityBackend', () => {
     // Second turn: re-attach → disclaimer omitted
     const messages2 = [
       ...messages1,
-      { role: 'assistant', content: 'Why did the chicken cross the road?' },
+      { role: 'assistant', content: [{ type: 'text', text: 'Why did the chicken cross the road?' }] },
       { role: 'user', content: 'Another one.' },
     ];
     for await (const _ of backend.createMessageStream('req-bt-2', {
@@ -382,7 +382,7 @@ describe('AntigravityBackend', () => {
 
     const messages1 = [
       { role: 'user', content: 'What is 1+1?' },
-      { role: 'assistant', content: 'It is 2.' },
+      { role: 'assistant', content: [{ type: 'text', text: 'It is 2.' }] },
       { role: 'user', content: 'And what is 2+2?' },
     ];
     // First turn: starts a new Cascade.
@@ -401,7 +401,7 @@ describe('AntigravityBackend', () => {
     // Second turn in the same session: must re-attach.
     const messages2 = [
       ...messages1,
-      { role: 'assistant', content: 'It is 4.' },
+      { role: 'assistant', content: [{ type: 'text', text: 'It is 4.' }] },
       { role: 'user', content: 'And what is 3+3?' },
     ];
     for await (const _ of backend.createMessageStream('req-turn2', { model: 'Gemini_3.5_Flash_High', messages: messages2 })) { /* drain */ }
@@ -542,7 +542,11 @@ describe('AntigravityBackend', () => {
     // First turn: starts a new Cascade.
     for await (const _ of backend.createMessageStream('req-1', {
       model: 'Gemini_3.5_Flash_High',
-      messages: [{ role: 'user', content: 'Stale session opener' }, { role: 'assistant', content: 'A' }, { role: 'user', content: 'continue' }],
+      messages: [
+        { role: 'user', content: 'Stale session opener' },
+        { role: 'assistant', content: [{ type: 'text', text: 'A' }] },
+        { role: 'user', content: 'continue' },
+      ],
     })) { /* drain */ }
     expect(startSpy).toHaveBeenCalledTimes(1);
 
@@ -557,7 +561,13 @@ describe('AntigravityBackend', () => {
       // Second turn in the same session: re-attach fails, start new.
       for await (const _ of backend.createMessageStream('req-2', {
         model: 'Gemini_3.5_Flash_High',
-        messages: [{ role: 'user', content: 'Stale session opener' }, { role: 'assistant', content: 'A' }, { role: 'user', content: 'continue' }, { role: 'assistant', content: 'B' }, { role: 'user', content: 'new' }],
+        messages: [
+          { role: 'user', content: 'Stale session opener' },
+          { role: 'assistant', content: [{ type: 'text', text: 'A' }] },
+          { role: 'user', content: 'continue' },
+          { role: 'assistant', content: [{ type: 'text', text: 'B' }] },
+          { role: 'user', content: 'new' },
+        ],
       })) { /* drain */ }
     } finally {
       mockState.getHistoryError = null;
@@ -567,7 +577,7 @@ describe('AntigravityBackend', () => {
     expect((backend as any).sessionStore.size).toBe(1);
   });
 
-  it('should grow the stored pastTurns after each successful turn (prefix matching)', async () => {
+  it('should store pastTurns (groupTurns result) after each successful turn', async () => {
     const backend = new AntigravityBackend();
     await backend.initialize();
 
@@ -578,36 +588,38 @@ describe('AntigravityBackend', () => {
       model: 'Gemini_3.5_Flash_High',
       messages: [
         { role: 'user', content: 'A1' },
-        { role: 'assistant', content: 'A1-reply' },
+        { role: 'assistant', content: [{ type: 'text', text: 'A1-reply' }] },
         { role: 'user', content: 'A2' },
       ],
     })) { /* drain */ }
     expect(startSpy).toHaveBeenCalledTimes(1);
     const firstCascadeId = (backend as any).sessionStore.keys().next().value;
-    // After this turn, pastTurns stored should be the prior conversation
-    // history (the messages BEFORE the final user message) — i.e. one
-    // turn: { A1, A1-reply }.
+    // `pastTurns` here is the `groupTurns` result for the 1st
+    // request: one turn (the just-completed A1 → A1-reply).
+    // The currentUserMessage (A2) is stripped by groupTurns and
+    // not yet in the stored pastTurns. Re-attach matching requires
+    // the next request's `pastTurns` to be exactly one turn
+    // longer, which it will be after the 2nd turn.
     const entry1 = (backend as any).sessionStore.get(firstCascadeId);
     expect(entry1.pastTurns.length).toBe(1);
     expect(entry1.pastTurns[0].userMessage.content).toBe('A1');
-    expect(entry1.pastTurns[0].assistantMessages[0].content).toBe('A1-reply');
+    expect(entry1.pastTurns[0].assistantMessages[0].content[0].text).toBe('A1-reply');
 
-    // Second turn: pastTurns now contains the previous conversation
-    // (A1, A1-reply, A2, A2-reply). The first user message changes
-    // only in the FINAL turn — we extend the prefix.
+    // Second turn: pastTurns grows to 2 turns (A1 + A2) and the
+    // new Cascade re-attaches (no second startCascade call).
     for await (const _ of backend.createMessageStream('req-grow-2', {
       model: 'Gemini_3.5_Flash_High',
       messages: [
         { role: 'user', content: 'A1' },
-        { role: 'assistant', content: 'A1-reply' },
+        { role: 'assistant', content: [{ type: 'text', text: 'A1-reply' }] },
         { role: 'user', content: 'A2' },
-        { role: 'assistant', content: 'A2-reply' },
+        { role: 'assistant', content: [{ type: 'text', text: 'A2-reply' }] },
         { role: 'user', content: 'A3' },
       ],
     })) { /* drain */ }
-    // No new Cascade started — the prefix matched.
+    // No new Cascade started — the prefix (length - 1) matched.
     expect(startSpy).toHaveBeenCalledTimes(1);
-    // pastTurns should have grown to 2 turns.
+    // pastTurns grew to 2 turns.
     const entry2 = (backend as any).sessionStore.get(firstCascadeId);
     expect(entry2.pastTurns.length).toBe(2);
     expect(entry2.pastTurns[0].userMessage.content).toBe('A1');
@@ -922,6 +934,135 @@ describe('AntigravityBackend', () => {
     const turnEnd = events.find((e) => e.type === 'turn_end');
     expect(turnEnd).toBeDefined();
     expect(turnEnd.stopReason).toBe('tool_use');
+  });
+
+  // --- Regression: session-isolation on same turn[0] content ---
+  //
+  // Bug: a stale Cascade in the sessionStore whose `pastTurns[0]`
+  // happened to match a new session's first turn was being re-
+  // attached via the "longest prefix" match. Result: two unrelated
+  // sessions shared a Cascade, and the model saw stale tool
+  // definitions / trajectory state from a previous conversation.
+  //
+  // Fix: re-attach requires the stored cascade's `pastTurns` to
+  // EQUAL the new request's `pastTurns` exactly (not just be a
+  // prefix), and on ties the most-recently-used cascade wins.
+
+  it('should store pastTurns (groupTurns result) after a successful 1st turn', async () => {
+    const backend = new AntigravityBackend();
+    await backend.initialize();
+
+    // 1st turn: single user message, no prior history.
+    for await (const _ of backend.createMessageStream('req-grow-1', {
+      model: 'Gemini_3.5_Flash_High',
+      messages: [{ role: 'user', content: 'A1' }],
+    })) { /* drain */ }
+
+    const firstCascadeId = (backend as any).sessionStore.keys().next().value;
+    const entry1 = (backend as any).sessionStore.get(firstCascadeId);
+    // `pastTurns` here is the `groupTurns` result for the 1st
+    // request: empty (the only user message is the live
+    // currentUserMessage, which groupTurns strips).
+    // The next request's `pastTurns` will be longer by one turn,
+    // so #findParentCascadeByPrefix's "length - 1" check matches.
+    expect(entry1.pastTurns.length).toBe(0);
+  });
+
+  it('should not re-attach to a stale Cascade when a new session has the same turn[0] content', async () => {
+    const backend = new AntigravityBackend();
+    await backend.initialize();
+
+    // The mock's sendUserCascadeMessage appends a plannerResponse
+    // step with the hard-coded text "Hello! I am an AI assistant."
+    const MOCK_REPLY = 'Hello! I am an AI assistant.';
+
+    // Inject a stale Cascade directly into the sessionStore. Its
+    // pastTurns[0] is *exactly* the state a freshly-completed 1st
+    // turn would produce (same userMessage content, same assistant
+    // planner text). Its lastUsed is 10s in the past so it loses
+    // the tie-breaker against the brand-new Cascade.
+    const staleCascadeId = 'stale-cascade-injected';
+    const staleCascade = {
+      cascadeId: staleCascadeId,
+      state: { status: 1, trajectory: { steps: [] } },
+      getHistory: vi.fn().mockResolvedValue({}),
+      listen: vi.fn(),
+      on: vi.fn(),
+      off: vi.fn(),
+      emit: vi.fn(),
+      sendMessage: vi.fn(),
+      cancel: vi.fn().mockResolvedValue(undefined),
+      dispose: vi.fn(),
+      cancelAndWait: vi.fn().mockResolvedValue(undefined),
+      removeAllListeners: vi.fn(),
+    };
+    (backend as any).sessionStore.set(staleCascadeId, {
+      cascade: staleCascade,
+      pastTurns: [{
+        userMessage: { role: 'user', content: 'shared first message' },
+        assistantMessages: [{ role: 'assistant', content: [{ type: 'text', text: MOCK_REPLY }] }],
+      }],
+      sessionId: 'stale-session-hash',
+      lastUsed: Date.now() - 10_000,
+    });
+
+    const startSpy = vi.spyOn((backend as any).client.lsClient, 'startCascade');
+    const sendSpy = vi.spyOn((backend as any).client.lsClient, 'sendUserCascadeMessage');
+
+    // 1st turn of the NEW session: starts a brand-new Cascade.
+    for await (const _ of backend.createMessageStream('req-new-1', {
+      model: 'Gemini_3.5_Flash_High',
+      messages: [{ role: 'user', content: 'shared first message' }],
+    })) { /* drain */ }
+
+    // 2nd turn of the NEW session: turn[0] is identical (by content)
+    // to the stale Cascade's pastTurns[0]. With the buggy
+    // longest-prefix logic, the stale Cascade would win because
+    // its stored pastTurns[0] matched the new request's pastTurns[0]
+    // (and was longer than the new Cascade's empty pastTurns).
+    //
+    // With the fix: the new Cascade's entry.pastTurns was grown to
+    // [turn_1] after the 1st turn, so its length matches the new
+    // request's pastTurns length, AND on tie the most-recently-used
+    // (new) Cascade wins.
+    //
+    // Note: assistant content is given as a content-block array
+    // (matching Claude Code's actual wire format AND
+    // #collectAssistantMessages' output) so strict equality in
+    // #messagesEqual succeeds on the assistant turn.
+    for await (const _ of backend.createMessageStream('req-new-2', {
+      model: 'Gemini_3.5_Flash_High',
+      messages: [
+        { role: 'user', content: 'shared first message' },
+        { role: 'assistant', content: [{ type: 'text', text: MOCK_REPLY }] },
+        { role: 'user', content: 'continue' },
+      ],
+    })) { /* drain */ }
+
+    // Only ONE new Cascade was started (the 1st turn). The 2nd
+    // turn re-attached to it; it did NOT spawn a 2nd Cascade.
+    expect(startSpy).toHaveBeenCalledTimes(1);
+    // Two sendUserCascadeMessage calls: one per turn, both to the
+    // new Cascade (not the stale one).
+    expect(sendSpy).toHaveBeenCalledTimes(2);
+
+    // The new Cascade's entry.pastTurns grew to 1 turn (the
+    // groupTurns result of the 2nd request, with the final
+    // currentUserMessage stripped).
+    const newCascadeIds = (backend as any).sessionStore.keys()
+      .filter((k: string) => k !== staleCascadeId)
+      .toArray();
+    expect(newCascadeIds.length).toBe(1);
+    const newCascadeId = newCascadeIds[0];
+    const newEntry = (backend as any).sessionStore.get(newCascadeId);
+    expect(newEntry.pastTurns.length).toBe(1);
+    expect(newEntry.pastTurns[0].userMessage.content).toBe('shared first message');
+
+    // The stale Cascade's entry is untouched (still 1 turn, still
+    // 10s in the past). It was NOT re-attached.
+    const staleEntry = (backend as any).sessionStore.get(staleCascadeId);
+    expect(staleEntry.pastTurns.length).toBe(1);
+    expect(staleEntry.lastUsed).toBeLessThan(Date.now() - 5_000);
   });
 });
 

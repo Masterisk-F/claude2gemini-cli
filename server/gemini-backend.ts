@@ -539,18 +539,34 @@ export class AntigravityBackend {
   }
 
   /**
-   * Find the Cascade in the session store whose `pastTurns` is a
-   * prefix of the new request's `pastTurns` with the longest match.
+   * Find the Cascade in the session store that this request should
+   * re-attach to.
    *
-   * The longest-prefix Cascade is the most recent turn of the same
-   * Claude Code session — re-attaching to it lets the new turn
-   * continue the trajectory on the LS side without any history
-   * injection.
+   * A stored Cascade's `pastTurns` is exactly one turn shorter than
+   * the new request's `pastTurns` — `pastTurns` is the
+   * `groupTurns` result (everything except the final, in-flight
+   * user message), and the request's `pastTurns` contains one more
+   * completed turn than the previously-stored one. So we look for a
+   * Cascade whose `pastTurns` is a *prefix* of the new request's
+   * `pastTurns` with length exactly one less.
    *
-   * Returns `{ cascade, entry }` on a hit, or `null` on a miss. The
-   * `entry` is the stored metadata so the caller can update
-   * `lastUsed` and re-store the new pastTurns after a successful
-   * turn.
+   * "Exactly one less" is what prevents the stale-Cascade
+   * collision bug: two unrelated sessions that share the same
+   * first turn would both have `pastTurns.length === 1` after
+   * their 1st turn, and a plain prefix match would let the older
+   * Cascade win (it has a longer matching prefix than the new
+   * session's empty prefix). By requiring the length to be
+   * `pastTurns.length - 1`, the only Cascade that can match is
+   * the one whose history *exactly* leads into the new request.
+   *
+   * On ties (multiple matching Cascades from misbehaving callers),
+   * the most-recently-used Cascade wins — `#advanceSession` bumps
+   * `lastUsed` on every successful turn, so the active session's
+   * Cascade is always the freshest.
+   *
+   * Returns `{ cascade, cascadeId, entry }` on a hit, or `null` on
+   * a miss. The `entry` is the stored metadata so the caller can
+   * update it after a successful turn.
    */
   async #findParentCascadeByPrefix(pastTurns: ExtractedTurn[]): Promise<{
     cascade: Cascade;
@@ -577,7 +593,10 @@ export class AntigravityBackend {
     } | null = null;
 
     for (const [cascadeId, entry] of this.sessionStore.entries()) {
-      if (entry.pastTurns.length > pastTurns.length) continue;
+      // The stored Cascade's history must be exactly one turn
+      // shorter than the new request's history. This is what
+      // prevents the stale-Cascade collision bug.
+      if (entry.pastTurns.length !== pastTurns.length - 1) continue;
       let isPrefix = true;
       for (let i = 0; i < entry.pastTurns.length; i++) {
         if (!this.#turnsEqual(entry.pastTurns[i]!, pastTurns[i]!)) {
@@ -586,39 +605,45 @@ export class AntigravityBackend {
         }
       }
       if (!isPrefix) continue;
-      if (!best || entry.pastTurns.length > best.entry.pastTurns.length) {
-        // REUSE the stored Cascade wrapper. We must NOT call
-        // client.getCascade() here because that would create a new
-        // wrapper and call listen() — listen() opens a
-        // streamAgentStateUpdates subscription with
-        // subscriberId=cascadeId, and the LS rejects a second
-        // subscription with the same ID ("subscription closed by
-        // repeat id"), which would tear down the live subscription
-        // and the cascade would lose all event updates.
-        //
-        // The stored wrapper already has an active listen()
-        // subscription from the previous turn. We just need to
-        // re-verify liveness and re-wire our event handlers.
-        const cascade = entry.cascade;
 
-        // Verify the cascade is still alive on the LS side. Calling
-        // getHistory() loads the trajectory into the local state
-        // and throws if the cascade was deleted/expired (e.g. LS
-        // restart, manual delete, TTL expiry).
-        try {
-          await cascade.getHistory();
-        } catch {
-          // Cascade is gone on the LS side — drop the stale entry
-          // and continue searching for a longer match.
-          this.sessionStore.delete(cascadeId);
-          this.#deleteCascadeTrajectoryBestEffort(cascadeId);
-          continue;
-        }
-        // Re-wire our event handlers. #wireCascadeEvents
-        // internally removes any previous listeners it registered
-        // on this wrapper, so calling it on re-attach is safe and
-        // idempotent.
-        this.#wireCascadeEvents(cascade);
+      // REUSE the stored Cascade wrapper. We must NOT call
+      // client.getCascade() here because that would create a new
+      // wrapper and call listen() — listen() opens a
+      // streamAgentStateUpdates subscription with
+      // subscriberId=cascadeId, and the LS rejects a second
+      // subscription with the same ID ("subscription closed by
+      // repeat id"), which would tear down the live subscription
+      // and the cascade would lose all event updates.
+      //
+      // The stored wrapper already has an active listen()
+      // subscription from the previous turn. We just need to
+      // re-verify liveness and re-wire our event handlers.
+      const cascade = entry.cascade;
+
+      // Verify the cascade is still alive on the LS side. Calling
+      // getHistory() loads the trajectory into the local state
+      // and throws if the cascade was deleted/expired (e.g. LS
+      // restart, manual delete, TTL expiry).
+      try {
+        await cascade.getHistory();
+      } catch {
+        // Cascade is gone on the LS side — drop the stale entry
+        // and continue searching.
+        this.sessionStore.delete(cascadeId);
+        this.#deleteCascadeTrajectoryBestEffort(cascadeId);
+        continue;
+      }
+      // Re-wire our event handlers. #wireCascadeEvents
+      // internally removes any previous listeners it registered
+      // on this wrapper, so calling it on re-attach is safe and
+      // idempotent.
+      this.#wireCascadeEvents(cascade);
+
+      // Tie-breaker: prefer the most-recently-used Cascade. The
+      // active session's Cascade was just bumped by
+      // #advanceSession, so it always wins over any stale
+      // same-content Cascade.
+      if (!best || entry.lastUsed > best.entry.lastUsed) {
         best = { cascade, cascadeId, entry };
       }
     }
@@ -667,16 +692,33 @@ export class AntigravityBackend {
   }
 
   /**
-   * Update the stored pastTurns and lastUsed for a Cascade after a
-   * successful turn. This grows the prefix so the NEXT request
-   * (which extends pastTurns by one more turn) will match this
-   * Cascade.
+   * Refresh the stored `pastTurns`, `sessionId`, and `lastUsed` for
+   * a Cascade after a successful turn.
+   *
+   * `pastTurns` is the conversation history the Cascade has already
+   * processed — i.e. the `pastTurns` produced by `groupTurns` for
+   * the request we just completed (everything in `messages`
+   * EXCEPT the final, in-flight user message). It contains the
+   * turn that was just completed.
+   *
+   * Re-attach matching in `#findParentCascadeByPrefix` expects the
+   * stored `pastTurns` to be exactly one turn shorter than the
+   * new request's `pastTurns` (the new request will add one more
+   * completed turn on top), so overwriting with the just-completed
+   * request's `pastTurns` is exactly the right state.
+   *
+   * `groupTurns` already gives us this in the request scope; we
+   * simply persist it.
    */
-  #updateSessionProgress(cascadeId: string, pastTurns: ExtractedTurn[], sessionId: string): void {
+  #advanceSession(
+    cascadeId: string,
+    pastTurns: ExtractedTurn[],
+    newSessionId: string,
+  ): void {
     const entry = this.sessionStore.get(cascadeId);
     if (!entry) return;
     entry.pastTurns = pastTurns;
-    entry.sessionId = sessionId;
+    entry.sessionId = newSessionId;
     entry.lastUsed = Date.now();
   }
 
@@ -1386,9 +1428,10 @@ NOTE: \`mcp\` is the only ENABLED built-in. Tool calls of the form \`mcp__claude
         const usage1 = await this.#fetchUsage(cascade);
         // Tool calls signal a successful end-of-turn — keep the
         // cascade alive in the session store so the tool_result
-        // turn can re-attach. Advance the stored pastTurns so the
-        // NEXT request (which appends the tool_result + new
-        // assistant response) finds this cascade via prefix match.
+        // turn can re-attach. Append the just-completed turn to
+        // entry.pastTurns so the NEXT request (which adds the
+        // tool_result user message + the next assistant response)
+        // finds this cascade via strict-equality re-attach.
         //
         // IMPORTANT: This MUST run BEFORE yielding turn_end. The
         // stream consumer (stream.ts) breaks out of the for-await
@@ -1398,7 +1441,7 @@ NOTE: \`mcp\` is the only ENABLED built-in. Tool calls of the form \`mcp__claude
         // cascade gets disposed and the next turn starts from
         // scratch, losing the trajectory and forcing the model to
         // re-run the same diagnostic tools.
-        this.#updateSessionProgress(matchedCascadeId!, pastTurns, sessionId!);
+        this.#advanceSession(matchedCascadeId!, pastTurns, sessionId!);
         keepAliveOnSuccess = true;
         yield { type: 'turn_end', sessionId: requestId, stopReason: 'tool_use', usage: usage1 };
         return;
@@ -1424,13 +1467,13 @@ NOTE: \`mcp\` is the only ENABLED built-in. Tool calls of the form \`mcp__claude
         yield { type: 'stream_event', sessionId: requestId, event: { type: 'content', value: collected } };
       }
       const usage1 = await this.#fetchUsage(cascade);
-      // IMPORTANT: Advance the stored pastTurns and set
-      // keepAliveOnSuccess BEFORE yielding turn_end. The stream
+      // IMPORTANT: Append the completed turn to entry.pastTurns and
+      // set keepAliveOnSuccess BEFORE yielding turn_end. The stream
       // consumer (stream.ts) breaks out of the for-await loop on
       // turn_end, so any code after this yield never runs. The
       // finally block then handles keep/dispose based on
       // keepAliveOnSuccess.
-      this.#updateSessionProgress(matchedCascadeId!, pastTurns, sessionId!);
+      this.#advanceSession(matchedCascadeId!, pastTurns, sessionId!);
       keepAliveOnSuccess = true;
       yield { type: 'turn_end', sessionId: requestId, stopReason: 'end_turn', usage: usage1 };
     } catch (error) {
