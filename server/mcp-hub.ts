@@ -84,17 +84,35 @@ export class McpHub extends EventEmitter {
   /**
    * Register tools from a Claude API request (ClaudeToolDefinition format).
    * Converts `input_schema` → `inputSchema` for MCP compatibility.
+   *
+   * By default the original schema is forwarded as-is to the LS so
+   * anyOf/oneOf/allOf, descriptions, enums, defaults, and $ref are
+   * preserved. The MCP spec requires clients (LS) to support JSON
+   * Schema 2020-12, so flattening these keywords loses information
+   * the model would otherwise use to generate correct tool calls
+   * (notably: `oneOf` collapses to "all branches required", which
+   * causes the model to invent parameters the schema never asked
+   * for).
+   *
+   * If `MCP_HUB_LEGACY_SCHEMA=1`, the old `simplifySchema` path is
+   * used. This is kept as an opt-in escape hatch for environments
+   * where the LS is known to misbehave on raw 2020-12 schemas.
    */
   setTools(defs: { name: string; description?: string; input_schema?: any }[]): void {
     this.originalSchemas.clear();
+    const useLegacy = process.env.MCP_HUB_LEGACY_SCHEMA === '1';
     this.tools = defs.map((d) => {
       const name = d.name;
       const originalSchema = d.input_schema ?? {};
       this.originalSchemas.set(name, originalSchema);
+      const inputSchema = useLegacy ? simplifySchema(originalSchema) : originalSchema;
+      if (useLegacy) {
+        process.stderr.write(`[McpHub] LEGACY_SCHEMA: ${name} run through simplifySchema (anyOf/oneOf/allOf merged)\n`);
+      }
       return {
         name,
         description: d.description ?? '',
-        inputSchema: simplifySchema(originalSchema),
+        inputSchema,
       };
     });
   }

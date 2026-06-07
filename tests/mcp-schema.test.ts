@@ -1,7 +1,22 @@
+/**
+ * Unit tests for the `simplifySchema()`, `cleanAndFixArguments()`, and
+ * `unpackMetaCall()` helpers exported from server/mcp-hub.ts.
+ *
+ * `simplifySchema` is the LEGACY flattener used only when
+ * `MCP_HUB_LEGACY_SCHEMA=1` is set. The default behavior of McpHub is
+ * to forward the original input_schema as-is (see mcp-hub.test.ts
+ * "Default behavior (passthrough)"). The tests in this file lock
+ * down the legacy path so that, if it is needed for a specific
+ * environment, we know exactly what it does.
+ *
+ * `cleanAndFixArguments` and `unpackMetaCall` are still used in
+ * /call regardless of the schema passthrough setting.
+ */
+
 import { describe, it, expect } from 'vitest';
 import { simplifySchema, cleanAndFixArguments, unpackMetaCall } from '../server/mcp-hub.js';
 
-describe('Schema Simplification', () => {
+describe('Schema Simplification (LEGACY_SCHEMA mode)', () => {
   it('should merge all anyOf/oneOf branches properties and required', () => {
     const complexSchema = {
       type: 'object',

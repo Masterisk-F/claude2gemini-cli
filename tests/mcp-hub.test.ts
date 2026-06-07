@@ -14,7 +14,7 @@
  *    simplifySchema.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from 'vitest';
 import { McpHub } from '../server/mcp-hub.js';
 
 let hub: McpHub;
@@ -135,7 +135,7 @@ describe('GET /tools', () => {
     expect(res.json.tools[0].input_schema).toBeUndefined();
   });
 
-  it('returns the SIMPLIFIED inputSchema, not the raw input_schema', async () => {
+  it('returns the RAW inputSchema (passthrough is the default)', async () => {
     hub.setTools([
       {
         name: 'complex',
@@ -149,10 +149,12 @@ describe('GET /tools', () => {
       },
     ]);
     const res = await fetchJson('/tools');
-    // simplifySchema should drop anyOf with [string, null] and keep the string type.
+    // Default behavior: the original schema is forwarded as-is so the LS
+    // sees anyOf/oneOf/allOf/enum/default/description verbatim. The
+    // simplify path is opt-in via MCP_HUB_LEGACY_SCHEMA=1.
     const valueSchema = res.json.tools[0].inputSchema.properties.value;
-    expect(valueSchema.type).toBe('string');
-    expect(valueSchema.anyOf).toBeUndefined();
+    expect(valueSchema.anyOf).toBeDefined();
+    expect(valueSchema.anyOf).toEqual([{ type: 'string' }, { type: 'null' }]);
   });
 
   it('returns 404 for unknown paths', async () => {
@@ -585,7 +587,7 @@ describe('Tool definition roundtrip: setTools → /tools', () => {
     expect(root.properties.outer.properties.middle.properties.inner.description).toBe('deepest field');
   });
 
-  it('merges allOf without losing required or description from any branch', async () => {
+  it('preserves allOf as-is (no flattening in passthrough mode)', async () => {
     const def = {
       name: 'mergeable',
       description: 'allOf test',
@@ -608,13 +610,15 @@ describe('Tool definition roundtrip: setTools → /tools', () => {
     hub.setTools([def]);
     const res = await fetchJson('/tools');
     const schema = res.json.tools[0].inputSchema;
-    expect(schema.allOf).toBeUndefined();
-    expect(schema.properties.a.description).toBe('param a');
-    expect(schema.properties.b.description).toBe('param b');
-    expect(schema.required.sort()).toEqual(['a', 'b']);
+    expect(schema.allOf).toBeDefined();
+    expect(schema.allOf).toHaveLength(2);
+    expect(schema.allOf[0].properties.a.description).toBe('param a');
+    expect(schema.allOf[1].properties.b.description).toBe('param b');
+    expect(schema.allOf[0].required).toEqual(['a']);
+    expect(schema.allOf[1].required).toEqual(['b']);
   });
 
-  it('merges anyOf (with null branch) and keeps the non-null type (description is currently dropped on the branch merge — see note)', async () => {
+  it('preserves anyOf as-is (with null branch)', async () => {
     const def = {
       name: 'optnull',
       description: 'optional nullable',
@@ -633,12 +637,11 @@ describe('Tool definition roundtrip: setTools → /tools', () => {
     hub.setTools([def]);
     const res = await fetchJson('/tools');
     const tag = res.json.tools[0].inputSchema.properties.tag;
-    expect(tag.type).toBe('string');
-    // The anyOf branch is dropped, so the description from the string branch
-    // is also dropped by the current implementation. This is a known
-    // limitation that LS-side models would benefit from fixing — see
-    // simplifySchema in mcp-hub.ts. Snapshotting current behavior here.
-    expect(tag.anyOf).toBeUndefined();
+    expect(tag.anyOf).toBeDefined();
+    expect(tag.anyOf).toEqual([
+      { type: 'string', description: 'a tag value' },
+      { type: 'null' },
+    ]);
   });
 
   it('emits inputSchema with type:"object" at the root (MCP expectation)', async () => {
@@ -721,5 +724,404 @@ describe('CORS headers', () => {
     await hub.resolveCall(callId, { content: [] });
     const res = await fetchPromise;
     expect(res.headers.get('access-control-allow-origin')).toBe('*');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// Default behavior (passthrough)
+//
+// As of the schema-compatibility investigation, setTools() forwards the
+// original input_schema as-is. anyOf/oneOf/allOf, descriptions, enums,
+// defaults, additionalProperties, and $ref are all preserved verbatim
+// so the LS sees the schema the tool author wrote. The legacy
+// simplifySchema path is opt-in via MCP_HUB_LEGACY_SCHEMA=1.
+// ─────────────────────────────────────────────────────────────────────────
+
+describe('Default behavior (passthrough — no env var)', () => {
+  beforeEach(setupHub);
+  afterEach(teardownHub);
+
+  it('preserves anyOf as-is (no branch merging, type kept on parent)', async () => {
+    const def = {
+      name: 'anyoftool',
+      description: 'tool with anyOf',
+      input_schema: {
+        type: 'object',
+        properties: {
+          value: {
+            anyOf: [
+              { type: 'string', description: 'string branch' },
+              { type: 'integer', description: 'integer branch' },
+              { type: 'null' },
+            ],
+            description: 'value field',
+          },
+        },
+        required: ['value'],
+      },
+    };
+    hub.setTools([def]);
+    const res = await fetchJson('/tools');
+    const prop = res.json.tools[0].inputSchema.properties.value;
+
+    expect(prop.anyOf).toBeDefined();
+    expect(prop.anyOf).toHaveLength(3);
+    expect(prop.anyOf[0].type).toBe('string');
+    expect(prop.anyOf[0].description).toBe('string branch');
+    expect(prop.anyOf[1].type).toBe('integer');
+    expect(prop.anyOf[1].description).toBe('integer branch');
+    expect(prop.anyOf[2].type).toBe('null');
+    expect(prop.description).toBe('value field');
+    expect(prop.type).toBeUndefined();
+  });
+
+  it('preserves oneOf as-is (XOR semantics intact — branches not flattened)', async () => {
+    const def = {
+      name: 'oneoftool',
+      description: 'tool with oneOf',
+      input_schema: {
+        type: 'object',
+        properties: {
+          mode: {
+            oneOf: [
+              { type: 'string', enum: ['a', 'b'], description: 'string mode' },
+              { type: 'number', description: 'numeric mode' },
+            ],
+            description: 'mode selector',
+          },
+        },
+      },
+    };
+    hub.setTools([def]);
+    const res = await fetchJson('/tools');
+    const prop = res.json.tools[0].inputSchema.properties.mode;
+
+    expect(prop.oneOf).toBeDefined();
+    expect(prop.oneOf).toHaveLength(2);
+    expect(prop.oneOf[0].enum).toEqual(['a', 'b']);
+    expect(prop.oneOf[0].description).toBe('string mode');
+    expect(prop.oneOf[1].description).toBe('numeric mode');
+  });
+
+  it('preserves allOf as-is (no flattening)', async () => {
+    const def = {
+      name: 'alloftool',
+      description: 'tool with allOf',
+      input_schema: {
+        allOf: [
+          {
+            type: 'object',
+            properties: { id: { type: 'string', description: 'id field' } },
+            required: ['id'],
+          },
+          {
+            type: 'object',
+            properties: { name: { type: 'string', description: 'name field' } },
+            required: ['name'],
+          },
+        ],
+      },
+    };
+    hub.setTools([def]);
+    const res = await fetchJson('/tools');
+    const schema = res.json.tools[0].inputSchema;
+
+    expect(schema.allOf).toBeDefined();
+    expect(schema.allOf).toHaveLength(2);
+    expect(schema.allOf[0].properties.id.description).toBe('id field');
+    expect(schema.allOf[1].properties.name.description).toBe('name field');
+  });
+
+  it('preserves enum values on individual properties', async () => {
+    const def = {
+      name: 'enumtool',
+      description: 'tool with enum',
+      input_schema: {
+        type: 'object',
+        properties: {
+          level: { type: 'string', enum: ['low', 'medium', 'high'], description: 'log level' },
+        },
+        required: ['level'],
+      },
+    };
+    hub.setTools([def]);
+    const res = await fetchJson('/tools');
+    const prop = res.json.tools[0].inputSchema.properties.level;
+
+    expect(prop.enum).toEqual(['low', 'medium', 'high']);
+    expect(prop.description).toBe('log level');
+  });
+
+  it('preserves default values on individual properties', async () => {
+    const def = {
+      name: 'defaulttool',
+      description: 'tool with default',
+      input_schema: {
+        type: 'object',
+        properties: {
+          retries: { type: 'integer', default: 3, description: 'retry count' },
+        },
+      },
+    };
+    hub.setTools([def]);
+    const res = await fetchJson('/tools');
+    const prop = res.json.tools[0].inputSchema.properties.retries;
+
+    expect(prop.default).toBe(3);
+    expect(prop.description).toBe('retry count');
+  });
+
+  it('preserves additionalProperties (the legacy simplifier used to drop it)', async () => {
+    const def = {
+      name: 'addltool',
+      description: 'tool with additionalProperties',
+      input_schema: {
+        type: 'object',
+        properties: { name: { type: 'string' } },
+        additionalProperties: false,
+      },
+    };
+    hub.setTools([def]);
+    const res = await fetchJson('/tools');
+    expect(res.json.tools[0].inputSchema.additionalProperties).toBe(false);
+  });
+
+  it('preserves multi-type array declarations like ["string", "null"]', async () => {
+    const def = {
+      name: 'multitypetool',
+      description: 'tool with multi-type',
+      input_schema: {
+        type: 'object',
+        properties: {
+          value: { type: ['string', 'null'], description: 'nullable string' },
+        },
+      },
+    };
+    hub.setTools([def]);
+    const res = await fetchJson('/tools');
+    const prop = res.json.tools[0].inputSchema.properties.value;
+
+    expect(prop.type).toEqual(['string', 'null']);
+    expect(prop.description).toBe('nullable string');
+  });
+
+  it('preserves descriptions on the root schema', async () => {
+    const def = {
+      name: 'rootdesctool',
+      description: 'tool description here',
+      input_schema: {
+        type: 'object',
+        description: 'the root schema description',
+        properties: { x: { type: 'integer' } },
+      },
+    };
+    hub.setTools([def]);
+    const res = await fetchJson('/tools');
+    expect(res.json.tools[0].inputSchema.description).toBe('the root schema description');
+  });
+
+  it('preserves deeply nested anyOf/oneOf/allOf intact', async () => {
+    const def = {
+      name: 'nestedtool',
+      description: 'nested composition',
+      input_schema: {
+        type: 'object',
+        properties: {
+          outer: {
+            anyOf: [
+              {
+                type: 'object',
+                properties: {
+                  inner: {
+                    oneOf: [
+                      { type: 'string', description: 'a' },
+                      { type: 'integer', description: 'b' },
+                    ],
+                    description: 'inner selector',
+                  },
+                },
+                required: ['inner'],
+              },
+              { type: 'null' },
+            ],
+            description: 'outer wrapper',
+          },
+        },
+      },
+    };
+    hub.setTools([def]);
+    const res = await fetchJson('/tools');
+    const outer = res.json.tools[0].inputSchema.properties.outer;
+
+    expect(outer.anyOf).toBeDefined();
+    expect(outer.anyOf).toHaveLength(2);
+    const inner = outer.anyOf[0].properties.inner;
+    expect(inner.oneOf).toBeDefined();
+    expect(inner.oneOf[0].description).toBe('a');
+    expect(inner.oneOf[1].description).toBe('b');
+  });
+
+  it('preserves $ref / $defs (passes them through unchanged)', async () => {
+    const def = {
+      name: 'reftool',
+      description: 'tool with $ref',
+      input_schema: {
+        type: 'object',
+        properties: {
+          foo: { $ref: '#/$defs/Bar', description: 'referenced' },
+        },
+        $defs: {
+          Bar: { type: 'string', description: 'bar def' },
+        },
+      },
+    };
+    hub.setTools([def]);
+    const res = await fetchJson('/tools');
+    const schema = res.json.tools[0].inputSchema;
+
+    expect(schema.properties.foo.$ref).toBe('#/$defs/Bar');
+    expect(schema.$defs.Bar.description).toBe('bar def');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// LEGACY_SCHEMA mode (MCP_HUB_LEGACY_SCHEMA=1)
+//
+// Opt-in escape hatch. With this env var set, setTools() routes the
+// input_schema through the legacy `simplifySchema()` flattener that
+// collapses anyOf/oneOf/allOf into a single object and drops
+// additionalProperties. Used in environments where the LS is known
+// to misbehave on raw JSON Schema 2020-12 input.
+// ─────────────────────────────────────────────────────────────────────────
+
+describe('LEGACY_SCHEMA mode (MCP_HUB_LEGACY_SCHEMA=1)', () => {
+  let originalEnv: string | undefined;
+
+  beforeAll(() => {
+    originalEnv = process.env.MCP_HUB_LEGACY_SCHEMA;
+    process.env.MCP_HUB_LEGACY_SCHEMA = '1';
+  });
+
+  afterAll(() => {
+    if (originalEnv === undefined) {
+      delete process.env.MCP_HUB_LEGACY_SCHEMA;
+    } else {
+      process.env.MCP_HUB_LEGACY_SCHEMA = originalEnv;
+    }
+  });
+
+  beforeEach(setupHub);
+  afterEach(teardownHub);
+
+  it('flattens anyOf ([string, null] → string)', async () => {
+    hub.setTools([
+      {
+        name: 'simplifyany',
+        description: 'simplify anyOf',
+        input_schema: {
+          type: 'object',
+          properties: {
+            value: { anyOf: [{ type: 'string' }, { type: 'null' }] },
+          },
+        },
+      },
+    ]);
+    const res = await fetchJson('/tools');
+    const prop = res.json.tools[0].inputSchema.properties.value;
+    expect(prop.type).toBe('string');
+    expect(prop.anyOf).toBeUndefined();
+  });
+
+  it('flattens oneOf by merging branches (preserves required/properties of all branches)', async () => {
+    hub.setTools([
+      {
+        name: 'simplifyone',
+        description: 'simplify oneOf',
+        input_schema: {
+          oneOf: [
+            {
+              type: 'object',
+              properties: { a: { type: 'string', description: 'branch a' } },
+              required: ['a'],
+            },
+            {
+              type: 'object',
+              properties: { b: { type: 'integer', description: 'branch b' } },
+              required: ['b'],
+            },
+          ],
+        },
+      },
+    ]);
+    const res = await fetchJson('/tools');
+    const schema = res.json.tools[0].inputSchema;
+    expect(schema.oneOf).toBeUndefined();
+    expect(schema.type).toBe('object');
+    expect(schema.properties.a.description).toBe('branch a');
+    expect(schema.properties.b.description).toBe('branch b');
+    expect(schema.required.sort()).toEqual(['a', 'b']);
+  });
+
+  it('flattens allOf by merging branches', async () => {
+    hub.setTools([
+      {
+        name: 'simplifyall',
+        description: 'simplify allOf',
+        input_schema: {
+          allOf: [
+            {
+              type: 'object',
+              properties: { a: { type: 'string', description: 'a' } },
+              required: ['a'],
+            },
+            {
+              type: 'object',
+              properties: { b: { type: 'integer', description: 'b' } },
+              required: ['b'],
+            },
+          ],
+        },
+      },
+    ]);
+    const res = await fetchJson('/tools');
+    const schema = res.json.tools[0].inputSchema;
+    expect(schema.allOf).toBeUndefined();
+    expect(schema.type).toBe('object');
+    expect(schema.properties.a.description).toBe('a');
+    expect(schema.properties.b.description).toBe('b');
+    expect(schema.required.sort()).toEqual(['a', 'b']);
+  });
+
+  it('removes additionalProperties in legacy mode', async () => {
+    hub.setTools([
+      {
+        name: 'addl',
+        description: 'with addl',
+        input_schema: {
+          type: 'object',
+          properties: { x: { type: 'string' } },
+          additionalProperties: false,
+        },
+      },
+    ]);
+    const res = await fetchJson('/tools');
+    expect(res.json.tools[0].inputSchema.additionalProperties).toBeUndefined();
+  });
+
+  it('shrinks multi-type array ["integer", "null"] to "integer"', async () => {
+    hub.setTools([
+      {
+        name: 'multi',
+        description: 'multi type',
+        input_schema: {
+          type: 'object',
+          properties: {
+            x: { type: ['integer', 'null'] },
+          },
+        },
+      },
+    ]);
+    const res = await fetchJson('/tools');
+    expect(res.json.tools[0].inputSchema.properties.x.type).toBe('integer');
   });
 });
