@@ -43,6 +43,7 @@ import {
   ViewCodeItemToolConfig, CommandStatusToolConfig, InternalSearchToolConfig,
   CodeSearchToolConfig, FinishToolConfig,
   CortexStepPlannerResponse, CortexTrajectorySource,
+  CascadeRunStatus, BrowserSubagentMode,
 } from 'antigravity-client/dist/src/gen/exa/cortex_pb/cortex_pb.js';
 import {
   SendUserCascadeMessageRequest,
@@ -65,7 +66,7 @@ import {
   buildToolNameLookup,
   type ExtractedTurn,
 } from './converters/history-builder.js';
-import type { ClaudeMessage, ClaudeContentBlock, ClaudeToolDefinition, BridgeMessage } from './types.js';
+import type { ClaudeMessage, ClaudeContentBlock, ClaudeToolDefinition, BridgeMessage, ClaudeToolResultBlock } from './types.js';
 import { createHash } from 'node:crypto';
 
 export class GeminiApiError extends Error {
@@ -323,7 +324,11 @@ export class AntigravityBackend {
       readKnowledgeBaseItem: new ReadKnowledgeBaseItemToolConfig({ enabled: false }),
 
       // ── Partial / scoped disables ──
-      browserSubagent:     new BrowserSubagentToolConfig({ disableScreenshot: true }),
+      browserSubagent:     new BrowserSubagentToolConfig({ 
+        mode: BrowserSubagentMode.MAIN_AGENT_ONLY,
+        suggestedMaxToolCalls: 0,
+        disableScreenshot: true 
+      }),
       workspaceApi:        new WorkspaceAPIToolConfig({ readOnly: true }),
 
       // ── Phase 2: tools that lack `forceDisable` / `enabled` and
@@ -841,39 +846,10 @@ export class AntigravityBackend {
    *    layer (see `decideInteraction`).
    */
   private static getBuiltInToolsDisclaimer(): string {
-    return `=== BUILT-IN TOOLS (DISABLED) ===
-The Antigravity language server has these built-in tools disabled. Calling any of them will be DENIED at the approval layer (no-op) — wasting a turn. Use the MCP-prefixed tools routed through \`claude2gemini-mcp-proxy\` instead.
-
-  runCommand
-  searchWeb
-  memory
-  mquery
-  find
-  generateImage
-  trajectorySearch
-  suggestedResponse
-  listDir
-  antigravityBrowser
-  invokeSubagent
-  notebookEdit
-  askQuestion
-  readKnowledgeBaseItem
-  browserSubagent
-  workspaceApi
-  viewCodeItem
-  internalSearch
-  codeSearch
-  finish
-  commandStatus
-  knowledgeBaseSearch
-  code
-  intent
-  grep
-  viewFile
-  notifyUser
-  taskBoundary
-
-NOTE: \`mcp\` is the only ENABLED built-in. Tool calls of the form \`mcp__claude2gemini-mcp-proxy__<ToolName>\` (e.g. _Bash, _Read, _Edit, _Write, _Glob, _Grep) are the only path that will execute.
+    return `=== IMPORTANT TOOL USAGE RULE ===
+You MUST ONLY use tools that start with the prefix \`mcp__\`.
+Any other built-in tools (even if they appear to be available) are DISABLED and will fail.
+For example, use \`mcp__playwright-mcp-chrome__browser_action\` (or other MCP tools provided in your schema) instead of any internal browser tools.
 =================================`;
   }
 
@@ -1079,11 +1055,14 @@ NOTE: \`mcp\` is the only ENABLED built-in. Tool calls of the form \`mcp__claude
   } | undefined> {
     if (!this.client) return undefined;
     try {
-      const resp = await this.client.lsClient.getCascadeTrajectoryGeneratorMetadata(
-        new GetCascadeTrajectoryGeneratorMetadataRequest({
-          cascadeId: cascade.cascadeId,
-        }),
-      );
+      const resp = await Promise.race([
+        this.client.lsClient.getCascadeTrajectoryGeneratorMetadata(
+          new GetCascadeTrajectoryGeneratorMetadataRequest({
+            cascadeId: cascade.cascadeId,
+          }),
+        ),
+        new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timeout')), 2000))
+      ]);
       const metas = resp.generatorMetadata;
       if (!metas || metas.length === 0) return undefined;
       // Use the last generator metadata entry (latest turn)
@@ -1131,10 +1110,18 @@ NOTE: \`mcp\` is the only ENABLED built-in. Tool calls of the form \`mcp__claude
     for (let i = startStepCount; i < steps.length; i++) {
       const step = steps[i];
       if (!step) continue;
-      if (step.step?.case !== 'plannerResponse') continue;
-      const planner = step.step.value as CortexStepPlannerResponse;
-      const response = planner.modifiedResponse || planner.response || '';
-      if (response) parts.push(response);
+      
+      if (step.step?.case === 'plannerResponse') {
+        const planner = step.step.value as CortexStepPlannerResponse;
+        const response = planner.modifiedResponse || planner.response || '';
+        if (response) parts.push(response);
+      } else if (step.step?.case === 'errorMessage') {
+        const errVal = step.step.value as any;
+        const msg = errVal?.error?.userErrorMessage || errVal?.error?.shortError || 'Unknown internal error';
+        parts.push(`\n\n[Antigravity LS Error]: ${msg}\n`);
+      } else if (step.status === 4) { // CortexStepStatus.FAILED = 4
+        parts.push(`\n\n[Antigravity LS Error]: Step ${step.step?.case || 'unknown'} failed.\n`);
+      }
     }
     return parts.join('');
   }
@@ -1196,12 +1183,50 @@ NOTE: \`mcp\` is the only ENABLED built-in. Tool calls of the form \`mcp__claude
 
     return new Promise<'idle' | 'tool_call'>((resolve, reject) => {
       let settled = false;
+      let pollTimer: ReturnType<typeof setInterval>;
+
+      const cleanup = () => {
+        this.mcpHub.off('pending_call', onPending);
+        if (pollTimer) clearInterval(pollTimer);
+      };
 
       // Listen for McpHub tool call events
       const onPending = () => {
         if (!settled) { settled = true; cleanup(); resolve('tool_call'); }
       };
       this.mcpHub.on('pending_call', onPending);
+
+      // Polling fallback to catch racing conditions where LS completes the turn instantly
+      // and waitForTurnComplete misses the IDLE transition.
+      let consecutiveIdleCount = 0;
+      pollTimer = setInterval(() => {
+        if (settled) return cleanup();
+
+        // Safety check: if the LS is hung on an unsupported internal step, cancel the cascade.
+        const steps = cascade.state?.trajectory?.steps ?? [];
+        for (let i = steps.length - 1; i >= 0; i--) {
+          const s = steps[i];
+          if (!s) continue;
+          if (s.status === 2 || s.status === 3 || s.status === 4) { // PENDING, RUNNING, WAITING
+            const stepCase = s.step?.case;
+            if (stepCase === 'browserSubagent' || stepCase === 'invokeSubagent') {
+              console.warn(`[Backend] Detected unsupported internal step '${stepCase}'. Cancelling cascade to avoid deadlock.`);
+              cascade.cancel().catch((e) => console.error('Failed to cancel unsupported step:', e));
+              break;
+            }
+          }
+        }
+
+        if (cascade.state?.status === CascadeRunStatus.IDLE) {
+          consecutiveIdleCount++;
+          // If it's been idle for ~100ms straight, it's definitely done.
+          if (consecutiveIdleCount >= 2) {
+            if (!settled) { settled = true; cleanup(); resolve('idle'); }
+          }
+        } else {
+          consecutiveIdleCount = 0;
+        }
+      }, 50);
 
       // Use the cascade's event-driven idle waiter
       cascade.waitForTurnComplete({ timeoutMs })
@@ -1218,10 +1243,6 @@ NOTE: \`mcp\` is the only ENABLED built-in. Tool calls of the form \`mcp__claude
             }
           }
         });
-
-      const cleanup = () => {
-        this.mcpHub.off('pending_call', onPending);
-      };
     });
   }
 
@@ -1257,7 +1278,7 @@ NOTE: \`mcp\` is the only ENABLED built-in. Tool calls of the form \`mcp__claude
     }
     const { pastTurns, currentUserMessage } = groupTurns(messages);
 
-    this.mcpHub.clearPendingCalls(`New request ${requestId} — clearing stale calls`);
+
 
     let cascade: Cascade | null = null;
     let sessionId: string | null = null;
@@ -1339,7 +1360,7 @@ NOTE: \`mcp\` is the only ENABLED built-in. Tool calls of the form \`mcp__claude
       // step 0 would concatenate every prior response and the user
       // would see the entire conversation history echoed at the start
       // of every new reply.
-      const stepCountBefore = cascade.state?.trajectory?.steps?.length ?? 0;
+      let stepCountBefore = cascade.state?.trajectory?.steps?.length ?? 0;
 
       // DEBUG (default ON, set DEBUG_HISTORY=off to disable): log the
       // cascade's current LS-side trajectory (what the model "sees"
@@ -1355,117 +1376,198 @@ NOTE: \`mcp\` is the only ENABLED built-in. Tool calls of the form \`mcp__claude
         );
       }
 
-      await this.sendMessage(
-        cascade,
-        text,
-        request.model,
-        apiKey,
-        images,
-        documents.map(d => ({ absolutePath: d.absolutePath, mediaType: d.mediaType })),
-      );
+      const toolResults = Array.isArray(currentUserMessage.content)
+        ? currentUserMessage.content.filter((b): b is ClaudeToolResultBlock => b.type === 'tool_result')
+        : [];
+      const hasToolResult = toolResults.length > 0;
 
-      if (debugMode !== 'off') {
-        this.#dumpNewTurn(
+      if (hasToolResult) {
+        for (const tr of toolResults) {
+          this.mcpHub.resolveCall(tr.tool_use_id, {
+            content: typeof tr.content === 'string' ? [{ type: 'text', text: tr.content }] : tr.content,
+            isError: tr.is_error || false,
+          }).catch((err) => {
+            console.warn(`[Backend] Failed to resolve tool call ${tr.tool_use_id} (may be stale):`, err);
+          });
+        }
+        console.log(`[Backend] Resolved ${toolResults.length} pending tool call(s) for requestId=${requestId}. Skipping sendMessage.`);
+      } else {
+        console.log(`[Backend] >>> sendMessage START (requestId=${requestId})`);
+        await this.sendMessage(
+          cascade,
           text,
+          request.model,
+          apiKey,
           images,
           documents.map(d => ({ absolutePath: d.absolutePath, mediaType: d.mediaType })),
-          `=== NEW TURN (requestId=${requestId}, cascadeId=${matchedCascadeId}, model=${request.model}) ===`,
-          debugMode,
         );
+        console.log(`[Backend] <<< sendMessage DONE (requestId=${requestId}, cascade status=${cascade.state?.status})`);
+
+        if (debugMode !== 'off') {
+          this.#dumpNewTurn(
+            text,
+            images,
+            documents.map(d => ({ absolutePath: d.absolutePath, mediaType: d.mediaType })),
+            `=== NEW TURN (requestId=${requestId}, cascadeId=${matchedCascadeId}, model=${request.model}) ===`,
+            debugMode,
+          );
+        }
+
+        console.log(`[Backend] Sending message (requestId=${requestId}, sessionId=${sessionId.slice(0, 8)}…, session_new=${createdNewCascade}, past_turns=${pastTurns.length}, text_length=${text.length}, model=${request.model})`);
       }
 
-      console.log(`[Backend] Sending message (requestId=${requestId}, sessionId=${sessionId.slice(0, 8)}…, session_new=${createdNewCascade}, past_turns=${pastTurns.length}, text_length=${text.length}, model=${request.model})`);
+      let turn: 'idle' | 'tool_call' = 'idle';
+      let timedOut = false;
+      let textFromThisTurn = '';
 
-      const turn = await this.waitForTurnOrToolCall(cascade);
+      while (true) {
+        console.log(`[Backend] >>> waitForTurnOrToolCall START (requestId=${requestId}, cascade status=${cascade.state?.status}, pendingCalls=${this.mcpHub.hasPendingCalls()})`);
+        try {
+          turn = await this.waitForTurnOrToolCall(cascade);
+          console.log(`[Backend] <<< waitForTurnOrToolCall DONE (requestId=${requestId}, turn=${turn}, cascade status=${cascade.state?.status})`);
+        } catch (err: any) {
+          if (err?.message?.includes('timeout')) {
+            console.error(`[Backend] Turn timed out waiting for completion: ${err.message}`);
+            turn = 'idle';
+            timedOut = true;
+          } else {
+            throw err;
+          }
+        }
 
-      // DEBUG: dump trajectory state for diagnosing empty responses.
-      // Gated on DEBUG_TRAJECTORY so production logs stay clean.
-      if (process.env.DEBUG_TRAJECTORY === 'true') {
+        // DEBUG: dump trajectory state for diagnosing empty responses.
+        // Gated on DEBUG_TRAJECTORY so production logs stay clean.
+        if (process.env.DEBUG_TRAJECTORY === 'true') {
+          const dbgSteps = cascade.state?.trajectory?.steps ?? [];
+          console.log(`[Backend] DEBUG cascade state: cascadeId=${cascade.cascadeId}, status=${cascade.state?.status}, total_steps=${dbgSteps.length}`);
+          for (let i = 0; i < dbgSteps.length; i++) {
+            const s = dbgSteps[i];
+            const typeName = s?.type ?? 'NONE';
+            const statusName = s?.status ?? 'NONE';
+            const stepCase = s?.step?.case ?? 'NONE';
+            let extra = '';
+            if (s?.step?.case === 'plannerResponse') {
+              const p: any = s.step.value;
+              extra = ` response_len=${(p?.response || '').length}, tool_calls=${(p?.toolCalls || []).length}, sig="${(p?.signature || '').slice(0, 20)}"`;
+            } else if (s?.step?.case === 'userInput') {
+              const u: any = s.step.value;
+              extra = ` query_len=${(u?.query || '').length}, items=${(u?.items || []).length}`;
+            } else if (s?.step?.case === 'mcpTool') {
+              const m: any = s.step.value;
+              extra = ` name=${m?.toolCall?.name || 'NONE'}, hasResult=${!!m?.result?.value}`;
+            } else if (s?.step?.case === 'errorMessage') {
+              const e: any = s.step.value;
+              extra = ` error="${(e?.error?.shortError || e?.error?.userErrorMessage || '').slice(0, 200)}"`;
+            }
+            console.log(`[Backend] DEBUG step[${i}]: type=${typeName}, status=${statusName}, case=${stepCase}${extra}`);
+          }
+        }
+
+        if (this.#cascadeError) {
+          const err = this.#cascadeError;
+          this.#cascadeError = null;
+          const status = this.#classifyConnectErrorCode(err);
+          yield { type: 'error', sessionId: requestId, message: `Antigravity LS error: ${err.message}`, status };
+          return;
+        }
+
+        if (turn === 'tool_call') {
+          const newText = this.collectTextFromSteps(cascade, stepCountBefore);
+          if (newText) {
+            textFromThisTurn += newText;
+          }
+          // Update stepCountBefore so we don't collect the same text again in the next loop
+          stepCountBefore = cascade.state?.trajectory?.steps?.length || stepCountBefore;
+
+          const allowedToolNames = request.tools?.map((t) => t.name) || [];
+          let yieldedAnyTool = false;
+
+          for (const call of this.mcpHub.getPendingCalls()) {
+            if (allowedToolNames.length > 0 && !allowedToolNames.includes(call.name)) {
+              console.log(`[Backend] Rejecting disallowed tool call: ${call.name} (${call.callId})`);
+              this.mcpHub.resolveCall(call.callId, {
+                content: [{ type: 'text', text: `Error: Tool ${call.name} is not allowed or available in this context.` }],
+                isError: true,
+              }).catch(() => {});
+              continue;
+            }
+            yieldedAnyTool = true;
+            yield { type: 'tool_call', sessionId: requestId, callId: call.callId, name: call.name, args: call.args };
+          }
+
+          if (!yieldedAnyTool) {
+            console.log(`[Backend] All pending tools were rejected. Waiting for next turn...`);
+            // If we have text, yield it before waiting again
+            if (textFromThisTurn) {
+              yield {
+                type: 'stream_event',
+                sessionId: requestId,
+                event: { type: 'content', value: textFromThisTurn },
+              };
+              textFromThisTurn = '';
+            }
+            continue; // Loop again to wait for the LS to handle the rejection
+          }
+
+          // At least one tool was yielded, so we can end the turn
+          if (textFromThisTurn) {
+            yield {
+              type: 'stream_event',
+              sessionId: requestId,
+              event: { type: 'content', value: textFromThisTurn },
+            };
+          }
+
+          const usage1 = await this.#fetchUsage(cascade);
+          this.#advanceSession(matchedCascadeId!, pastTurns, sessionId!);
+          keepAliveOnSuccess = true;
+          yield { type: 'turn_end', sessionId: requestId, stopReason: 'tool_use', usage: usage1 };
+          return;
+        }
+
+        // turn === 'idle'
         const dbgSteps = cascade.state?.trajectory?.steps ?? [];
-        console.log(`[Backend] DEBUG cascade state: cascadeId=${cascade.cascadeId}, status=${cascade.state?.status}, total_steps=${dbgSteps.length}`);
-        for (let i = 0; i < dbgSteps.length; i++) {
-          const s = dbgSteps[i];
-          const typeName = s?.type ?? 'NONE';
-          const statusName = s?.status ?? 'NONE';
-          const stepCase = s?.step?.case ?? 'NONE';
-          let extra = '';
-          if (s?.step?.case === 'plannerResponse') {
-            const p: any = s.step.value;
-            extra = ` response_len=${(p?.response || '').length}, tool_calls=${(p?.toolCalls || []).length}, sig="${(p?.signature || '').slice(0, 20)}"`;
-          } else if (s?.step?.case === 'userInput') {
-            const u: any = s.step.value;
-            extra = ` query_len=${(u?.query || '').length}, items=${(u?.items || []).length}`;
-          } else if (s?.step?.case === 'mcpTool') {
-            const m: any = s.step.value;
-            extra = ` name=${m?.toolCall?.name || 'NONE'}, hasResult=${!!m?.result?.value}`;
-          } else if (s?.step?.case === 'errorMessage') {
-            const e: any = s.step.value;
-            extra = ` error="${(e?.error?.shortError || e?.error?.userErrorMessage || '').slice(0, 200)}"`;
+        let cancelledStepName = null;
+        for (let i = stepCountBefore; i < dbgSteps.length; i++) {
+          if (dbgSteps[i]?.status === 6 /* CANCELED */) {
+            cancelledStepName = dbgSteps[i]?.step?.case;
+            break;
           }
-          console.log(`[Backend] DEBUG step[${i}]: type=${typeName}, status=${statusName}, case=${stepCase}${extra}`);
         }
-      }
 
-      if (this.#cascadeError) {
-        const err = this.#cascadeError;
-        this.#cascadeError = null;
-        const status = this.#classifyConnectErrorCode(err);
-        yield { type: 'error', sessionId: requestId, message: `Antigravity LS error: ${err.message}`, status };
-        return;
-      }
-
-      if (turn === 'tool_call') {
-        // The LS sometimes produces a plannerResponse that contains
-        // BOTH text and tool calls. In that case the trajectory's
-        // last step is the pending mcpTool (not the plannerResponse),
-        // and `waitForTurnOrToolCall` returns 'tool_call' because
-        // McpHub has a pending call. We must STILL collect the text
-        // from the plannerResponse and yield it BEFORE the tool_use
-        // events so Claude Code sees the text + tool calls in the
-        // correct order in the same assistant message. Without this,
-        // the user would only see the tool_use events (no text) when
-        // the model produces a response like "Let me check the file"
-        // followed by a Read call.
-        const textFromThisTurn = this.collectTextFromSteps(cascade, stepCountBefore);
-        if (textFromThisTurn) {
-          yield {
-            type: 'stream_event',
-            sessionId: requestId,
-            event: { type: 'content', value: textFromThisTurn },
-          };
-        }
-        const allowedToolNames = request.tools?.map((t) => t.name) || [];
-        for (const call of this.mcpHub.getPendingCalls()) {
-          if (allowedToolNames.length > 0 && !allowedToolNames.includes(call.name)) {
-            console.log(`[Backend] Rejecting disallowed tool call: ${call.name} (${call.callId})`);
-            this.mcpHub.resolveCall(call.callId, {
-              content: [{ type: 'text', text: `Error: Tool ${call.name} is not allowed or available in this context.` }],
-              isError: true,
-            }).catch(() => {});
-            continue;
+        if (cancelledStepName) {
+          // If the client disconnected, do not attempt to retry.
+          if (!this.inflightCascades.has(requestId)) {
+            console.log(`[Backend] Client disconnected. Aborting internal retry loop.`);
+            break;
           }
-          yield { type: 'tool_call', sessionId: requestId, callId: call.callId, name: call.name, args: call.args };
+
+          console.log(`[Backend] Detected cancelled step '${cancelledStepName}'. Injecting internal error message and looping...`);
+          // Append text generated so far so it streams to the user
+          const newText = this.collectTextFromSteps(cascade, stepCountBefore);
+          if (newText) {
+            textFromThisTurn += newText;
+          }
+          stepCountBefore = cascade.state?.trajectory?.steps?.length || stepCountBefore;
+
+          const internalErrorMsg = `[System Error]: The tool '${cancelledStepName}' is DISABLED and was automatically rejected. DO NOT use it. You MUST use the available MCP tools instead.`;
+
+          // We push this error as a new user message to the LS, making the model continue thinking
+          // within the same proxy stream, effectively hiding the retry from Claude Code!
+          await this.sendMessage(
+            cascade,
+            internalErrorMsg,
+            request.model,
+            apiKey,
+            [],
+            []
+          );
+
+          // Loop back to waitForTurnOrToolCall to continue the stream
+          continue;
         }
-        const usage1 = await this.#fetchUsage(cascade);
-        // Tool calls signal a successful end-of-turn — keep the
-        // cascade alive in the session store so the tool_result
-        // turn can re-attach. Append the just-completed turn to
-        // entry.pastTurns so the NEXT request (which adds the
-        // tool_result user message + the next assistant response)
-        // finds this cascade via strict-equality re-attach.
-        //
-        // IMPORTANT: This MUST run BEFORE yielding turn_end. The
-        // stream consumer (stream.ts) breaks out of the for-await
-        // loop on turn_end, so any code after that yield never
-        // runs. The finally block then handles keep/dispose based
-        // on keepAliveOnSuccess — if we never set the flag, the
-        // cascade gets disposed and the next turn starts from
-        // scratch, losing the trajectory and forcing the model to
-        // re-run the same diagnostic tools.
-        this.#advanceSession(matchedCascadeId!, pastTurns, sessionId!);
-        keepAliveOnSuccess = true;
-        yield { type: 'turn_end', sessionId: requestId, stopReason: 'tool_use', usage: usage1 };
-        return;
+
+        break; // turn === 'idle'
       }
 
       // The Cascade is a single trajectory over the whole session, so
@@ -1474,7 +1576,7 @@ NOTE: \`mcp\` is the only ENABLED built-in. Tool calls of the form \`mcp__claude
       // would concatenate every previous plannerResponse in the
       // trajectory, causing the user to see the entire prior
       // conversation echoed at the start of every new reply.
-      const collected = this.collectTextFromSteps(cascade, stepCountBefore);
+      let collected = textFromThisTurn + this.collectTextFromSteps(cascade, stepCountBefore);
 
       // Same logic for error detection: only flag errors that arose
       // from THIS turn's processing, not from any prior turn.
@@ -1486,7 +1588,11 @@ NOTE: \`mcp\` is the only ENABLED built-in. Tool calls of the form \`mcp__claude
 
       if (collected) {
         yield { type: 'stream_event', sessionId: requestId, event: { type: 'content', value: collected } };
+      } else if (timedOut) {
+        yield { type: 'error', sessionId: requestId, message: 'Timeout waiting for response from language server. The internal engine may be stuck on an unhandled error or an unsupported step.', status: 504 };
+        return;
       }
+
       const usage1 = await this.#fetchUsage(cascade);
       // IMPORTANT: Append the completed turn to entry.pastTurns and
       // set keepAliveOnSuccess BEFORE yielding turn_end. The stream
@@ -1530,7 +1636,7 @@ NOTE: \`mcp\` is the only ENABLED built-in. Tool calls of the form \`mcp__claude
         }
       }
       this.inflightCascades.delete(requestId);
-      this.mcpHub.clearPendingCalls(`Request ${requestId} completed`);
+
     }
   }
 
@@ -1544,7 +1650,7 @@ NOTE: \`mcp\` is the only ENABLED built-in. Tool calls of the form \`mcp__claude
         console.warn(`[Backend] Failed to cancel cascade for request ${requestId}:`, err);
       }
     }
-    this.mcpHub.clearPendingCalls('Session cancelled');
+
   }
 
   async shutdown(): Promise<void> {
