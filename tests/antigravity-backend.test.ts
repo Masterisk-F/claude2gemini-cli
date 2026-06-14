@@ -308,26 +308,13 @@ describe('AntigravityBackend', () => {
 
     const firstText = (sendSpy.mock.calls[0]?.[0] as any)?.items?.[0]?.chunk?.value ?? '';
     // Disclaimer present
-    expect(firstText).toContain('=== BUILT-IN TOOLS (DISABLED) ===');
+    expect(firstText).toContain('=== IMPORTANT TOOL USAGE RULE ===');
     expect(firstText).toContain('=================================');
-    // Sample tool names from each layer are all listed
-    expect(firstText).toContain('runCommand');
-    expect(firstText).toContain('searchWeb');
-    expect(firstText).toContain('antigravityBrowser');
-    expect(firstText).toContain('viewCodeItem');
-    expect(firstText).toContain('code');
-    expect(firstText).toContain('intent');
-    expect(firstText).toContain('grep');
-    expect(firstText).toContain('viewFile');
-    expect(firstText).toContain('notifyUser');
-    expect(firstText).toContain('taskBoundary');
     // MCP directive present
-    expect(firstText).toContain('mcp__claude2gemini-mcp-proxy');
-    expect(firstText).toContain('_Bash');
-    expect(firstText).toContain('_Read');
-    // Ordering: SYSTEM PROMPT < BUILT-IN TOOLS < USER INSTRUCTION
+    expect(firstText).toContain('mcp__playwright-mcp-chrome__browser_action');
+    // Ordering: SYSTEM PROMPT < IMPORTANT TOOL USAGE RULE < USER INSTRUCTION
     const sysIdx = firstText.indexOf('=== SYSTEM PROMPT ===');
-    const builtinIdx = firstText.indexOf('=== BUILT-IN TOOLS (DISABLED) ===');
+    const builtinIdx = firstText.indexOf('=== IMPORTANT TOOL USAGE RULE ===');
     const userIdx = firstText.indexOf('=== USER INSTRUCTION ===');
     expect(sysIdx).toBeGreaterThanOrEqual(0);
     expect(builtinIdx).toBeGreaterThan(sysIdx);
@@ -351,7 +338,7 @@ describe('AntigravityBackend', () => {
       system: 'You are a test assistant.',
     })) { /* drain */ }
     const firstText = (sendSpy.mock.calls[0]?.[0] as any)?.items?.[0]?.chunk?.value ?? '';
-    expect(firstText).toContain('=== BUILT-IN TOOLS (DISABLED) ===');
+    expect(firstText).toContain('=== IMPORTANT TOOL USAGE RULE ===');
 
     // Second turn: re-attach → disclaimer omitted
     const messages2 = [
@@ -365,7 +352,7 @@ describe('AntigravityBackend', () => {
       system: 'You are a test assistant.',
     })) { /* drain */ }
     const secondText = (sendSpy.mock.calls[1]?.[0] as any)?.items?.[0]?.chunk?.value ?? '';
-    expect(secondText).not.toContain('=== BUILT-IN TOOLS (DISABLED) ===');
+    expect(secondText).not.toContain('=== IMPORTANT TOOL USAGE RULE ===');
     expect(secondText).not.toContain('runCommand');
     // USER INSTRUCTION still present
     expect(secondText).toContain('=== USER INSTRUCTION ===');
@@ -770,7 +757,7 @@ describe('AntigravityBackend', () => {
 
     const errEvent = events.find((e: any) => e.type === 'error');
     expect(errEvent).toBeDefined();
-    expect(errEvent.message).toContain('timeout period');
+    expect(errEvent.message).toContain('Timeout waiting for response');
     expect(errEvent.status).toBe(504);
 
     mockState.timeoutError = null;

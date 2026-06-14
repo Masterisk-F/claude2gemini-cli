@@ -43,6 +43,7 @@ import {
   ViewCodeItemToolConfig, CommandStatusToolConfig, InternalSearchToolConfig,
   CodeSearchToolConfig, FinishToolConfig,
   CortexStepPlannerResponse, CortexTrajectorySource,
+  CortexStepUserInput, CortexStepErrorMessage, CortexStepMcpTool,
   CascadeRunStatus, BrowserSubagentMode,
 } from 'antigravity-client/dist/src/gen/exa/cortex_pb/cortex_pb.js';
 import {
@@ -162,11 +163,15 @@ export class AntigravityBackend {
   #cascadeError: Error | null = null;
   /** Interval for purging inactive sessions from the store */
   private sessionPurgeInterval?: NodeJS.Timeout;
+  private initPromise: Promise<void> | null = null;
 
   async initialize(): Promise<void> {
     if (this.client) return;
+    if (this.initPromise) return this.initPromise;
 
-    if (!this.sessionPurgeInterval) {
+    this.initPromise = (async () => {
+      try {
+        if (!this.sessionPurgeInterval) {
       this.sessionPurgeInterval = setInterval(() => {
         const now = Date.now();
         for (const [key, entry] of this.sessionStore.entries()) {
@@ -218,6 +223,11 @@ export class AntigravityBackend {
 
     // Refresh MCP servers to ensure proxy is recognized
     await this.#refreshMcpProxyOnLS();
+      } finally {
+        this.initPromise = null;
+      }
+    })();
+    await this.initPromise;
   }
 
   /**
@@ -870,7 +880,7 @@ For example, use \`mcp__playwright-mcp-chrome__browser_action\` (or other MCP to
     console.log(`[Backend]   total_steps=${steps.length}`);
     const PREVIEW_LEN = 200;
     for (let i = 0; i < steps.length; i++) {
-      const s = steps[i] as any;
+      const s = steps[i];
       const stepCase = s?.step?.case ?? 'NONE';
       let extra = '';
       if (stepCase === 'plannerResponse') {
@@ -910,9 +920,10 @@ For example, use \`mcp__playwright-mcp-chrome__browser_action\` (or other MCP to
     if (mode === 'full') {
       // also dump the first PREVIEW_LEN chars of the userInput that
       // initiated the conversation, for context
-      const firstUserInput = steps.find((s: any) => s?.step?.case === 'userInput');
+      const firstUserInput = steps.find((s) => s?.step?.case === 'userInput');
       if (firstUserInput) {
-        const q = ((firstUserInput as any).step.value?.query || '') as string;
+        const u = firstUserInput.step?.value as CortexStepUserInput;
+        const q = u.query || '';
         if (q) console.log(`[Backend]   first_user_query_preview="${truncateForLog(q, PREVIEW_LEN)}"`);
       }
     }
@@ -1116,7 +1127,7 @@ For example, use \`mcp__playwright-mcp-chrome__browser_action\` (or other MCP to
         const response = planner.modifiedResponse || planner.response || '';
         if (response) parts.push(response);
       } else if (step.step?.case === 'errorMessage') {
-        const errVal = step.step.value as any;
+        const errVal = step.step.value as CortexStepErrorMessage;
         const msg = errVal?.error?.userErrorMessage || errVal?.error?.shortError || 'Unknown internal error';
         parts.push(`\n\n[Antigravity LS Error]: ${msg}\n`);
       } else if (step.status === 4) { // CortexStepStatus.FAILED = 4
@@ -1184,6 +1195,7 @@ For example, use \`mcp__playwright-mcp-chrome__browser_action\` (or other MCP to
     return new Promise<'idle' | 'tool_call'>((resolve, reject) => {
       let settled = false;
       let pollTimer: ReturnType<typeof setInterval>;
+      let hasPendingCallEvent = false;
 
       const cleanup = () => {
         this.mcpHub.off('pending_call', onPending);
@@ -1192,12 +1204,13 @@ For example, use \`mcp__playwright-mcp-chrome__browser_action\` (or other MCP to
 
       // Listen for McpHub tool call events
       const onPending = () => {
-        if (!settled) { settled = true; cleanup(); resolve('tool_call'); }
+        hasPendingCallEvent = true;
       };
       this.mcpHub.on('pending_call', onPending);
 
       // Polling fallback to catch racing conditions where LS completes the turn instantly
-      // and waitForTurnComplete misses the IDLE transition.
+      // and waitForTurnComplete misses the IDLE transition. Also handles waiting for 
+      // the trajectory to catch up to pending tool calls.
       let consecutiveIdleCount = 0;
       pollTimer = setInterval(() => {
         if (settled) return cleanup();
@@ -1213,6 +1226,26 @@ For example, use \`mcp__playwright-mcp-chrome__browser_action\` (or other MCP to
               console.warn(`[Backend] Detected unsupported internal step '${stepCase}'. Cancelling cascade to avoid deadlock.`);
               cascade.cancel().catch((e) => console.error('Failed to cancel unsupported step:', e));
               break;
+            }
+          }
+        }
+
+        if (hasPendingCallEvent) {
+          const pendingCalls = this.mcpHub.getPendingCalls();
+          if (pendingCalls.length > 0) {
+            let found = false;
+            for (let i = steps.length - 1; i >= 0; i--) {
+              if (steps[i]?.step?.case === 'mcpTool') {
+                const m = steps[i].step.value as CortexStepMcpTool;
+                if (pendingCalls.some(c => c.name === m.toolCall?.name)) {
+                  found = true;
+                  break;
+                }
+              }
+            }
+            if (found) {
+              if (!settled) { settled = true; cleanup(); resolve('tool_call'); }
+              return;
             }
           }
         }
@@ -1277,8 +1310,6 @@ For example, use \`mcp__playwright-mcp-chrome__browser_action\` (or other MCP to
       throw new Error('No messages provided');
     }
     const { pastTurns, currentUserMessage } = groupTurns(messages);
-
-
 
     let cascade: Cascade | null = null;
     let sessionId: string | null = null;
@@ -1381,16 +1412,34 @@ For example, use \`mcp__playwright-mcp-chrome__browser_action\` (or other MCP to
         : [];
       const hasToolResult = toolResults.length > 0;
 
+      // Clear pending tools from previous incomplete or aborted requests
+      // ONLY if this is a fresh user instruction, to prevent cross-session leakage.
+      if (!hasToolResult) {
+        this.mcpHub.clearPendingCalls('New user instruction received, clearing stale calls');
+      }
+
+      let resolvedCount = 0;
       if (hasToolResult) {
         for (const tr of toolResults) {
-          this.mcpHub.resolveCall(tr.tool_use_id, {
-            content: typeof tr.content === 'string' ? [{ type: 'text', text: tr.content }] : tr.content,
-            isError: tr.is_error || false,
-          }).catch((err) => {
+          try {
+            await this.mcpHub.resolveCall(tr.tool_use_id, {
+              content: typeof tr.content === 'string' ? [{ type: 'text', text: tr.content }] : tr.content,
+              isError: tr.is_error || false,
+            });
+            resolvedCount++;
+          } catch (err) {
             console.warn(`[Backend] Failed to resolve tool call ${tr.tool_use_id} (may be stale):`, err);
-          });
+          }
         }
-        console.log(`[Backend] Resolved ${toolResults.length} pending tool call(s) for requestId=${requestId}. Skipping sendMessage.`);
+      }
+
+      // If we successfully resolved at least one pending tool call, the Language Server
+      // proxy will receive the HTTP response and the LS will automatically resume generation.
+      // In that case, we DO NOT send a new message.
+      // However, if we resolved NO tool calls (e.g. because they were stale from a cancelled session),
+      // the LS is idle, and we MUST send the message to wake it up.
+      if (resolvedCount > 0) {
+        console.log(`[Backend] Resolved ${resolvedCount} pending tool call(s) for requestId=${requestId}. Skipping sendMessage.`);
       } else {
         console.log(`[Backend] >>> sendMessage START (requestId=${requestId})`);
         await this.sendMessage(
@@ -1447,16 +1496,16 @@ For example, use \`mcp__playwright-mcp-chrome__browser_action\` (or other MCP to
             const stepCase = s?.step?.case ?? 'NONE';
             let extra = '';
             if (s?.step?.case === 'plannerResponse') {
-              const p: any = s.step.value;
+              const p = s.step.value as CortexStepPlannerResponse;
               extra = ` response_len=${(p?.response || '').length}, tool_calls=${(p?.toolCalls || []).length}, sig="${(p?.signature || '').slice(0, 20)}"`;
             } else if (s?.step?.case === 'userInput') {
-              const u: any = s.step.value;
+              const u = s.step.value as CortexStepUserInput;
               extra = ` query_len=${(u?.query || '').length}, items=${(u?.items || []).length}`;
             } else if (s?.step?.case === 'mcpTool') {
-              const m: any = s.step.value;
+              const m = s.step.value as CortexStepMcpTool;
               extra = ` name=${m?.toolCall?.name || 'NONE'}, hasResult=${!!m?.result?.value}`;
             } else if (s?.step?.case === 'errorMessage') {
-              const e: any = s.step.value;
+              const e = s.step.value as CortexStepErrorMessage;
               extra = ` error="${(e?.error?.shortError || e?.error?.userErrorMessage || '').slice(0, 200)}"`;
             }
             console.log(`[Backend] DEBUG step[${i}]: type=${typeName}, status=${statusName}, case=${stepCase}${extra}`);
@@ -1482,6 +1531,16 @@ For example, use \`mcp__playwright-mcp-chrome__browser_action\` (or other MCP to
           const allowedToolNames = request.tools?.map((t) => t.name) || [];
           let yieldedAnyTool = false;
 
+          // If we have text, yield it BEFORE any tool calls so the UI renders properly
+          if (textFromThisTurn) {
+            yield {
+              type: 'stream_event',
+              sessionId: requestId,
+              event: { type: 'content', value: textFromThisTurn },
+            };
+            textFromThisTurn = '';
+          }
+
           for (const call of this.mcpHub.getPendingCalls()) {
             if (allowedToolNames.length > 0 && !allowedToolNames.includes(call.name)) {
               console.log(`[Backend] Rejecting disallowed tool call: ${call.name} (${call.callId})`);
@@ -1497,25 +1556,7 @@ For example, use \`mcp__playwright-mcp-chrome__browser_action\` (or other MCP to
 
           if (!yieldedAnyTool) {
             console.log(`[Backend] All pending tools were rejected. Waiting for next turn...`);
-            // If we have text, yield it before waiting again
-            if (textFromThisTurn) {
-              yield {
-                type: 'stream_event',
-                sessionId: requestId,
-                event: { type: 'content', value: textFromThisTurn },
-              };
-              textFromThisTurn = '';
-            }
             continue; // Loop again to wait for the LS to handle the rejection
-          }
-
-          // At least one tool was yielded, so we can end the turn
-          if (textFromThisTurn) {
-            yield {
-              type: 'stream_event',
-              sessionId: requestId,
-              event: { type: 'content', value: textFromThisTurn },
-            };
           }
 
           const usage1 = await this.#fetchUsage(cascade);
@@ -1588,7 +1629,9 @@ For example, use \`mcp__playwright-mcp-chrome__browser_action\` (or other MCP to
 
       if (collected) {
         yield { type: 'stream_event', sessionId: requestId, event: { type: 'content', value: collected } };
-      } else if (timedOut) {
+      }
+      
+      if (timedOut) {
         yield { type: 'error', sessionId: requestId, message: 'Timeout waiting for response from language server. The internal engine may be stuck on an unhandled error or an unsupported step.', status: 504 };
         return;
       }
