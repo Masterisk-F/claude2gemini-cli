@@ -1195,10 +1195,12 @@ For example, use \`mcp__playwright-mcp-chrome__browser_action\` (or other MCP to
       if (step.step?.case === 'errorMessage') {
         const errMsg = step.step.value;
         const details = errMsg.error;
+        console.error(`[Backend] Error step found at ${i}:`, JSON.stringify(details, null, 2));
         return details?.userErrorMessage || details?.shortError || details?.fullError || 'Unknown Antigravity LS error';
       }
       // Check step status === error
       if (step.status === 11 /* StepStatus.ERROR */) {
+        console.error(`[Backend] Step ${i} failed with status ERROR:`, JSON.stringify(step.step, null, 2));
         return `Step ${i} failed with status: error`;
       }
     }
