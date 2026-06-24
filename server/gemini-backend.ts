@@ -388,6 +388,7 @@ export class AntigravityBackend {
     apiKey: string,
     images: { base64Data: string; mimeType: string }[] = [],
     documents: { absolutePath: string; mediaType: string }[] = [],
+    systemPrompt?: string,
   ): Promise<void> {
     const toolConfig = AntigravityBackend.createToolConfig();
 
@@ -448,6 +449,25 @@ export class AntigravityBackend {
           }),
         }),
       }),
+      customAgentSpec: {
+        promptSectionCustomization: {
+          removePromptSections: [
+            'web_application_development',
+            'artifacts',
+            'slash_commands',
+            'planning_mode',
+            'planning_mode_artifacts',
+            'subagents',
+            'messaging'
+          ],
+          replacePromptSections: systemPrompt ? [
+            {
+              type: 'identity',
+              text: systemPrompt
+            }
+          ] : []
+        }
+      } as any,
       blocking: false,
       clientType: 1, // IDE
     });
@@ -470,7 +490,7 @@ export class AntigravityBackend {
    * Throws on LS errors (no fallback) — the caller's catch yields an
    * error BridgeMessage to the Claude client.
    */
-  async #startCascade(systemPrompt?: string): Promise<Cascade> {
+  async #startCascade(): Promise<Cascade> {
     if (!this.client) throw new Error('Antigravity client not initialized');
 
     const apiKey = process.env.ANTIGRAVITY_API_KEY || readAuthStatus()?.apiKey || '';
@@ -482,26 +502,6 @@ export class AntigravityBackend {
       extensionVersion: '0.2.0',
     });
 
-    const customAgentSpec = {
-      promptSectionCustomization: {
-        removePromptSections: [
-          'web_application_development',
-          'artifacts',
-          'slash_commands',
-          'planning_mode',
-          'planning_mode_artifacts',
-          'subagents',
-          'messaging'
-        ],
-        replacePromptSections: systemPrompt ? [
-          {
-            type: 'identity',
-            text: systemPrompt
-          }
-        ] : []
-      }
-    };
-
     // The LS was launched in workspaceDir (a /tmp directory; see
     // initialize()), so it knows about this workspace. We do NOT
     // pass workspaceUris to startCascade — the client library's
@@ -511,7 +511,6 @@ export class AntigravityBackend {
     const { cascadeId } = await this.client.lsClient.startCascade({
       metadata,
       source: CortexTrajectorySource.CASCADE_CLIENT,
-      customAgentSpec: customAgentSpec as any,
     });
     return this.#wrapCascade(cascadeId, apiKey);
   }
@@ -1388,7 +1387,7 @@ For example, use \`mcp__playwright-mcp-chrome__browser_action\` (or other MCP to
         cascade = parent.cascade;
         matchedCascadeId = parent.cascadeId;
       } else {
-        cascade = await this.#startCascade(systemPromptToExtract);
+        cascade = await this.#startCascade();
         this.#registerSession(cascade, pastTurns, sessionId);
         matchedCascadeId = cascade.cascadeId;
         createdNewCascade = true;
@@ -1476,6 +1475,7 @@ For example, use \`mcp__playwright-mcp-chrome__browser_action\` (or other MCP to
           apiKey,
           images,
           documents.map(d => ({ absolutePath: d.absolutePath, mediaType: d.mediaType })),
+          systemPromptToExtract,
         );
         console.log(`[Backend] <<< sendMessage DONE (requestId=${requestId}, cascade status=${cascade.state?.status})`);
 
