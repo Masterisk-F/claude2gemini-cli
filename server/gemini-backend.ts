@@ -211,9 +211,18 @@ export class AntigravityBackend {
 
     console.log('[Backend] Launching Antigravity Language Server...');
     try {
+      const apiKey = process.env.ANTIGRAVITY_API_KEY || readAuthStatus()?.apiKey || '';
+      const authData = apiKey ? {
+        apiKey,
+        email: '',
+        name: '',
+        ussOAuth: { key: 'oauthTokenInfoSentinelKey', value: '' }
+      } : undefined;
+
       this.client = await AntigravityClient.launch({
         workspacePath: this.workspaceDir!,
         verbose: process.env.VERBOSE === 'true',
+        authData,
       });
       console.log('[Backend] Antigravity LS launched successfully.');
     } catch (error) {
