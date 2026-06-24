@@ -2,8 +2,8 @@ FROM archlinux:base-devel
 
 WORKDIR /app
 
-# Install Node.js, npm, git
-RUN pacman -Syu --noconfirm nodejs npm git
+# Install Node.js, npm, git, sqlite (for reading auth status)
+RUN pacman -Syu --noconfirm nodejs npm git sqlite
 
 # Create a non-root user for makepkg
 RUN useradd -m -G wheel builder && \
