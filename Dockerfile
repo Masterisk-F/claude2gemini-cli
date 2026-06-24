@@ -24,8 +24,8 @@ USER root
 COPY antigravity-client ./antigravity-client
 COPY package*.json ./
 
-# Install dependencies (this will also build antigravity-client due to its prepare script)
-RUN npm install
+# Install dependencies and explicitly build the local library
+RUN npm install && cd antigravity-client && npm install && npm run build
 
 # Copy source code
 COPY . .
