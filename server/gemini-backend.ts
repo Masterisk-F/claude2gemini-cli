@@ -451,7 +451,15 @@ export class AntigravityBackend {
               text: systemPrompt
             }
           ] : []
-        }
+        },
+        cascadeConfig: new CascadeConfig({
+          plannerConfig: new CascadePlannerConfig({
+            toolConfig,
+            requestedModel: new ModelOrAlias({
+              choice: { case: 'model', value: modelId },
+            }),
+          }),
+        }),
       },
       messageOrigin: 4 as any, // AGENT_MESSAGE_ORIGIN_CUSTOM_AGENT
       blocking: false,
