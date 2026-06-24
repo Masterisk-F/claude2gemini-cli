@@ -461,7 +461,7 @@ export class AntigravityBackend {
           }),
         }),
       },
-      messageOrigin: 4 as any, // AGENT_MESSAGE_ORIGIN_CUSTOM_AGENT
+      messageOrigin: 2, // AGENT_MESSAGE_ORIGIN_SDK_EXECUTABLE
       blocking: false,
       clientType: 1, // IDE
     });
