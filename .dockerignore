@@ -3,7 +3,5 @@ npm-debug.log
 .git
 .vscode
 dist
-gemini-cli/node_modules
-gemini-cli/packages/*/node_modules
-gemini-cli/packages/*/dist
+gemini-cli
 *.tsbuildinfo
