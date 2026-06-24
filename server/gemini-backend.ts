@@ -446,27 +446,25 @@ export class AntigravityBackend {
           requestedModel: new ModelOrAlias({
             choice: { case: 'model', value: modelId },
           }),
+          promptSectionCustomizationConfig: {
+            removePromptSections: [
+              'web_application_development',
+              'artifacts',
+              'slash_commands',
+              'planning_mode',
+              'planning_mode_artifacts',
+              'subagents',
+              'messaging'
+            ],
+            replacePromptSections: systemPrompt ? [
+              {
+                type: 'identity',
+                text: systemPrompt
+              }
+            ] : []
+          } as any,
         }),
       }),
-      customAgentSpec: {
-        promptSectionCustomization: {
-          removePromptSections: [
-            'web_application_development',
-            'artifacts',
-            'slash_commands',
-            'planning_mode',
-            'planning_mode_artifacts',
-            'subagents',
-            'messaging'
-          ],
-          replacePromptSections: systemPrompt ? [
-            {
-              type: 'identity',
-              text: systemPrompt
-            }
-          ] : []
-        }
-      } as any,
       blocking: false,
       clientType: 1, // IDE
     });
