@@ -400,7 +400,6 @@ export class AntigravityBackend {
       extensionVersion: '0.2.0',
     });
 
-    const modelId = await this.client!.resolveModelId(modelName || '');
 
     const items: TextOrScopeItem[] = [
       new TextOrScopeItem({
