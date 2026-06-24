@@ -384,7 +384,7 @@ export class AntigravityBackend {
   private async sendMessage(
     cascade: Cascade,
     text: string,
-    modelName: string,
+    modelId: number,
     apiKey: string,
     images: { base64Data: string; mimeType: string }[] = [],
     documents: { absolutePath: string; mediaType: string }[] = [],
@@ -1367,6 +1367,11 @@ For example, use \`mcp__playwright-mcp-chrome__browser_action\` (or other MCP to
         ? lastPastTurn.assistantMessages[lastPastTurn.assistantMessages.length - 1]
         : undefined;
       const toolNameById = buildToolNameLookup(prevAssistantMsg);
+
+      // Resolve the model ID BEFORE starting the cascade.
+      // Antigravity 2.1.4 throws `GetCascadeModelConfigData() is nil` if
+      // `getUserStatus` is called after a fresh `startCascade`.
+      const resolvedModelId = await this.client!.resolveModelId(request.model || '');
       const { text: userText, images, documents } = await extractCurrentUserPayload(
         currentUserMessage, this.workspaceDir!, toolNameById,
       );
@@ -1471,7 +1476,7 @@ For example, use \`mcp__playwright-mcp-chrome__browser_action\` (or other MCP to
         await this.sendMessage(
           cascade,
           text,
-          request.model,
+          resolvedModelId, // Pass the pre-resolved model ID
           apiKey,
           images,
           documents.map(d => ({ absolutePath: d.absolutePath, mediaType: d.mediaType })),
