@@ -434,37 +434,26 @@ export class AntigravityBackend {
         base64Data: img.base64Data,
         mimeType: img.mimeType,
       })),
-      cascadeConfig: new CascadeConfig({
-        plannerConfig: new CascadePlannerConfig({
-          toolConfig,
-          plannerTypeConfig: {
-            case: 'conversational',
-            value: new CascadeConversationalPlannerConfig({
-              plannerMode: 1, // DEFAULT
-            }),
-          },
-          requestedModel: new ModelOrAlias({
-            choice: { case: 'model', value: modelId },
-          }),
-          promptSectionCustomizationConfig: {
-            removePromptSections: [
-              'web_application_development',
-              'artifacts',
-              'slash_commands',
-              'planning_mode',
-              'planning_mode_artifacts',
-              'subagents',
-              'messaging'
-            ],
-            replacePromptSections: systemPrompt ? [
-              {
-                type: 'identity',
-                text: systemPrompt
-              }
-            ] : []
-          } as any,
-        }),
-      }),
+      customAgentSpec: {
+        promptSectionCustomization: {
+          removePromptSections: [
+            'web_application_development',
+            'artifacts',
+            'slash_commands',
+            'planning_mode',
+            'planning_mode_artifacts',
+            'subagents',
+            'messaging'
+          ],
+          replacePromptSections: systemPrompt ? [
+            {
+              type: 'identity',
+              text: systemPrompt
+            }
+          ] : []
+        }
+      },
+      messageOrigin: 4 as any, // AGENT_MESSAGE_ORIGIN_CUSTOM_AGENT
       blocking: false,
       clientType: 1, // IDE
     });
