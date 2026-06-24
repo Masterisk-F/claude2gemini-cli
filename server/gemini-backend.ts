@@ -470,7 +470,7 @@ export class AntigravityBackend {
    * Throws on LS errors (no fallback) — the caller's catch yields an
    * error BridgeMessage to the Claude client.
    */
-  async #startCascade(): Promise<Cascade> {
+  async #startCascade(systemPrompt?: string): Promise<Cascade> {
     if (!this.client) throw new Error('Antigravity client not initialized');
 
     const apiKey = process.env.ANTIGRAVITY_API_KEY || readAuthStatus()?.apiKey || '';
@@ -482,6 +482,26 @@ export class AntigravityBackend {
       extensionVersion: '0.2.0',
     });
 
+    const customAgentSpec = {
+      promptSectionCustomization: {
+        removePromptSections: [
+          'web_application_development',
+          'artifacts',
+          'slash_commands',
+          'planning_mode',
+          'planning_mode_artifacts',
+          'subagents',
+          'messaging'
+        ],
+        replacePromptSections: systemPrompt ? [
+          {
+            type: 'identity',
+            text: systemPrompt
+          }
+        ] : []
+      }
+    };
+
     // The LS was launched in workspaceDir (a /tmp directory; see
     // initialize()), so it knows about this workspace. We do NOT
     // pass workspaceUris to startCascade — the client library's
@@ -491,6 +511,7 @@ export class AntigravityBackend {
     const { cascadeId } = await this.client.lsClient.startCascade({
       metadata,
       source: CortexTrajectorySource.CASCADE_CLIENT,
+      customAgentSpec: customAgentSpec as any,
     });
     return this.#wrapCascade(cascadeId, apiKey);
   }
@@ -893,19 +914,19 @@ For example, use \`mcp__playwright-mcp-chrome__browser_action\` (or other MCP to
       const stepCase = s?.step?.case ?? 'NONE';
       let extra = '';
       if (stepCase === 'plannerResponse') {
-        const p = s.step.value ?? {};
+        const p: any = s.step.value;
         extra = ` response_len=${(p.response || '').length}, tool_calls=${(p.toolCalls || []).length}`;
         if (mode === 'full' && p.response) {
           extra += ` response="${truncateForLog(p.response, 1000)}"`;
         }
       } else if (stepCase === 'userInput') {
-        const u = s.step.value ?? {};
+        const u: any = s.step.value;
         extra = ` query_len=${(u.query || '').length}, items=${(u.items || []).length}`;
         if (mode === 'full' && u.query) {
           extra += ` query="${truncateForLog(u.query, 1000)}"`;
         }
       } else if (stepCase === 'mcpTool') {
-        const m = s.step.value ?? {};
+        const m: any = s.step.value;
         const name = m?.toolCall?.name || 'NONE';
         const resultLen = m?.result?.value
           ? (typeof m.result.value === 'string' ? m.result.value.length : JSON.stringify(m.result.value).length)
@@ -918,10 +939,10 @@ For example, use \`mcp__playwright-mcp-chrome__browser_action\` (or other MCP to
           if (argsStr) extra += ` args="${truncateForLog(argsStr, 500)}"`;
         }
       } else if (stepCase === 'errorMessage') {
-        const e = s.step.value?.error ?? {};
+        const e: any = (s.step.value as any)?.error ?? {};
         extra = ` error="${truncateForLog(e.shortError || e.userErrorMessage || '', 200)}"`;
       } else if (stepCase === 'finish') {
-        const f = s.step.value ?? {};
+        const f: any = s.step.value;
         extra = ` reason=${f.reason ?? 'NONE'}`;
       }
       console.log(`[Backend]   step[${i}]: case=${stepCase}${extra}`);
@@ -929,7 +950,7 @@ For example, use \`mcp__playwright-mcp-chrome__browser_action\` (or other MCP to
     if (mode === 'full') {
       // also dump the first PREVIEW_LEN chars of the userInput that
       // initiated the conversation, for context
-      const firstUserInput = steps.find((s) => s?.step?.case === 'userInput');
+      const firstUserInput = steps.find((s: any) => s?.step?.case === 'userInput');
       if (firstUserInput) {
         const u = firstUserInput.step?.value as CortexStepUserInput;
         const q = u.query || '';
@@ -1233,7 +1254,7 @@ For example, use \`mcp__playwright-mcp-chrome__browser_action\` (or other MCP to
             const stepCase = s.step?.case;
             if (stepCase === 'browserSubagent' || stepCase === 'invokeSubagent') {
               console.warn(`[Backend] Detected unsupported internal step '${stepCase}'. Cancelling cascade to avoid deadlock.`);
-              cascade.cancel().catch((e) => console.error('Failed to cancel unsupported step:', e));
+              cascade.cancel().catch((e: any) => console.error('Failed to cancel unsupported step:', e));
               break;
             }
           }
@@ -1361,24 +1382,21 @@ For example, use \`mcp__playwright-mcp-chrome__browser_action\` (or other MCP to
       // text length (~8K → ~0.3K chars) and clutter the debug logs.
       sessionId = this.#computeSessionId(pastTurns);
       const parent = await this.#findParentCascadeByPrefix(pastTurns);
+      const systemPromptToExtract = !parent ? extractSystemPrompt(request.system, request.messages) : undefined;
+
       if (parent) {
         cascade = parent.cascade;
         matchedCascadeId = parent.cascadeId;
       } else {
-        cascade = await this.#startCascade();
+        cascade = await this.#startCascade(systemPromptToExtract);
         this.#registerSession(cascade, pastTurns, sessionId);
         matchedCascadeId = cascade.cascadeId;
         createdNewCascade = true;
       }
       this.inflightCascades.set(requestId, cascade);
 
-      // Build the new-turn text. The system prompt header is only emitted
-      // on the first turn of a fresh cascade (`createdNewCascade`).
-      const systemPrompt = createdNewCascade ? extractSystemPrompt(request.system) : undefined;
+      // Build the new-turn text.
       let text = '';
-      if (systemPrompt) {
-        text += `=== SYSTEM PROMPT ===\n${systemPrompt}\n=====================\n\n`;
-      }
       // On first turn of a fresh cascade, also inject the disabled-
       // tool list so the model does not waste turns attempting
       // built-in tools that the approval layer will deny. Re-attach

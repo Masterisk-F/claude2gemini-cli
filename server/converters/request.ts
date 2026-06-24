@@ -51,19 +51,36 @@ export function mapModelName(model: string): string {
 }
 
 /**
- * Claude の system パラメータを抽出・正規化する
+ * Claude の system パラメータと messages 内の system メッセージを抽出・結合する
  */
-export function extractSystemPrompt(system?: any): string | undefined {
-  if (!system) return undefined;
-  if (typeof system === 'string') return system;
-  if (Array.isArray(system)) {
-    return system
-      .map((block) => {
-        if (typeof block === 'string') return block;
-        if (block?.type === 'text' && typeof block.text === 'string') return block.text;
-        return JSON.stringify(block);
-      })
-      .join('\n');
+export function extractSystemPrompt(system?: any, messages?: any[]): string | undefined {
+  let sysPrompt = '';
+
+  if (system) {
+    if (typeof system === 'string') {
+      sysPrompt += system;
+    } else if (Array.isArray(system)) {
+      sysPrompt += system
+        .map((block) => {
+          if (typeof block === 'string') return block;
+          if (block?.type === 'text' && typeof block.text === 'string') return block.text;
+          return JSON.stringify(block);
+        })
+        .join('\n');
+    } else {
+      sysPrompt += String(system);
+    }
   }
-  return String(system);
+
+  if (messages && Array.isArray(messages)) {
+    for (const msg of messages) {
+      if (msg.role === 'system') {
+        const content = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content);
+        if (sysPrompt) sysPrompt += '\n\n';
+        sysPrompt += content;
+      }
+    }
+  }
+
+  return sysPrompt.trim() || undefined;
 }
