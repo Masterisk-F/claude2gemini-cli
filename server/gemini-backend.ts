@@ -1370,7 +1370,7 @@ For example, use \`mcp__playwright-mcp-chrome__browser_action\` (or other MCP to
       // Resolve the model ID BEFORE starting the cascade.
       // Antigravity 2.1.4 throws `GetCascadeModelConfigData() is nil` if
       // `getUserStatus` is called and no settings.json exists (e.g. headless docker).
-      let resolvedModelId = 0; // Default fallback to UNSPECIFIED if unknown
+      let resolvedModelId = 281; // Default fallback to CLAUDE_4_SONNET if unknown
       try {
         resolvedModelId = await this.client!.resolveModelId(request.model || '');
       } catch (err) {
