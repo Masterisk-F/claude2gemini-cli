@@ -20,8 +20,11 @@ RUN cd /tmp && \
 # Switch back to root
 USER root
 
-# Copy package.json and install dependencies
+# Copy package files and local libraries
+COPY antigravity-client ./antigravity-client
 COPY package*.json ./
+
+# Install dependencies (this will also build antigravity-client due to its prepare script)
 RUN npm install
 
 # Copy source code
