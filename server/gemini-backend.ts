@@ -1237,6 +1237,7 @@ Any other built-in tools native to the local agent (even if they appear to be av
       // Polling fallback to catch racing conditions where LS completes the turn instantly
       // and waitForTurnComplete misses the IDLE transition. Also handles waiting for 
       // the trajectory to catch up to pending tool calls.
+      let isCancelling = false;
       let consecutiveIdleCount = 0;
       pollTimer = setInterval(() => {
         if (settled) return cleanup();
@@ -1249,8 +1250,11 @@ Any other built-in tools native to the local agent (even if they appear to be av
           if (s.status === 2 || s.status === 3 || s.status === 4) { // PENDING, RUNNING, WAITING
             const stepCase = s.step?.case;
             if (stepCase === 'browserSubagent' || stepCase === 'invokeSubagent') {
-              console.warn(`[Backend] Detected unsupported internal step '${stepCase}'. Cancelling cascade to avoid deadlock.`);
-              cascade.cancel().catch((e: any) => console.error('Failed to cancel unsupported step:', e));
+              if (!isCancelling) {
+                isCancelling = true;
+                console.warn(`[Backend] Detected unsupported internal step '${stepCase}'. Cancelling cascade to avoid deadlock.`);
+                cascade.cancel().catch((e: any) => console.error('Failed to cancel unsupported step:', e));
+              }
               break;
             }
           }
