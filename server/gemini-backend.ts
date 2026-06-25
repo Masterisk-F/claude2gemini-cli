@@ -877,10 +877,13 @@ export class AntigravityBackend {
    *  - Residual tools with no config handle: denied at the approval
    *    layer (see `decideInteraction`).
    */
-  private static getBuiltInToolsDisclaimer(): string {
+  private static getBuiltInToolsDisclaimer(allowedTools: string[]): string {
+    const toolsList = allowedTools.length > 0
+      ? `\nSpecifically, the following tools are available and permitted for your use:\n${allowedTools.map(t => `- \`${t}\``).join('\n')}`
+      : '';
     return `=== IMPORTANT TOOL USAGE RULE ===
-You MUST ONLY use tools provided through \`claude2gemini-mcp-proxy\`.
-Any other built-in tools native to the local agent (even if they appear to be available) are DISABLED and will fail.
+You MUST ONLY use tools provided through the \`claude2gemini-mcp-proxy\` MCP server.${toolsList}
+Any other built-in tools native to the local agent (even if they appear to be available in your schema) are DISABLED and will fail. Do not attempt to use them.
 =================================`;
   }
 
@@ -1420,7 +1423,8 @@ Any other built-in tools native to the local agent (even if they appear to be av
       // turns skip this — the model already has the list from turn
       // 1's userInput step, which lives in the LS-side trajectory.
       if (createdNewCascade) {
-        text += AntigravityBackend.getBuiltInToolsDisclaimer() + '\n';
+        const allowedToolNames = this.mcpHub.getTools().map(t => t.name);
+        text += AntigravityBackend.getBuiltInToolsDisclaimer(allowedToolNames) + '\n';
       }
       text += `=== USER INSTRUCTION ===\n${userText}`;
 
