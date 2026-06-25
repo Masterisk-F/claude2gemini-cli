@@ -10,4 +10,4 @@ services:
       # Antigravityの認証情報をホストと共有するためのマウント
       - ~/.config/Antigravity:/root/.config/Antigravity
       # 開発時はソースコードをバインドマウントすると便利ですが、必要に応じてコメントアウトを外してください
-      # - ./:/app 
+      - ./:/app 
