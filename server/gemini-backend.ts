@@ -1371,7 +1371,7 @@ For example, use \`mcp__playwright-mcp-chrome__browser_action\` (or other MCP to
       try {
         resolvedModelId = await this.client!.getDefaultModelId();
       } catch (e) {
-        resolvedModelId = 0; // Absolute fallback if even default fails
+        resolvedModelId = 334; // Absolute fallback if even default fails
       }
 
       try {
