@@ -211,7 +211,7 @@ export class AntigravityBackend {
 
     console.log('[Backend] Launching Antigravity Language Server...');
     try {
-      const apiKey = process.env.ANTIGRAVITY_API_KEY || readAuthStatus()?.apiKey || '';
+      const apiKey = process.env.ANTIGRAVITY_API_KEY || '';
       const authData = apiKey ? {
         apiKey,
         email: '',
@@ -487,7 +487,7 @@ export class AntigravityBackend {
   async #startCascade(): Promise<Cascade> {
     if (!this.client) throw new Error('Antigravity client not initialized');
 
-    const apiKey = process.env.ANTIGRAVITY_API_KEY || readAuthStatus()?.apiKey || '';
+    const apiKey = process.env.ANTIGRAVITY_API_KEY || '';
     const metadata = new Metadata({
       apiKey,
       ideName: 'vscode',
@@ -1384,7 +1384,7 @@ For example, use \`mcp__playwright-mcp-chrome__browser_action\` (or other MCP to
       const { text: userText, images, documents } = await extractCurrentUserPayload(
         currentUserMessage, this.workspaceDir!, toolNameById,
       );
-      const apiKey = process.env.ANTIGRAVITY_API_KEY || readAuthStatus()?.apiKey || '';
+      const apiKey = process.env.ANTIGRAVITY_API_KEY || '';
 
       // Cascade lookup must run BEFORE we build the new-turn text, because
       // we only want to prepend the system prompt on the FIRST turn of a
