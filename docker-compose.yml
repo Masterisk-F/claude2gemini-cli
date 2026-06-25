@@ -8,6 +8,6 @@ services:
       - "8111:8080"
     volumes:
       # Antigravityの認証情報をホストと共有するためのマウント
-      - ~/.config/Antigravity:/root/.config/Antigravity
+      - ./.config/Antigravity:/root/.config/Antigravity
       # 開発時はソースコードをバインドマウントすると便利ですが、必要に応じてコメントアウトを外してください
       - ./:/app 
