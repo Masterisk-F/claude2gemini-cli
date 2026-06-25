@@ -44,7 +44,7 @@ import {
   CodeSearchToolConfig, FinishToolConfig,
   CortexStepPlannerResponse, CortexTrajectorySource,
   CortexStepUserInput, CortexStepErrorMessage, CortexStepMcpTool,
-  CascadeRunStatus, BrowserSubagentMode,
+  CascadeRunStatus, BrowserSubagentMode, PromptSection
 } from 'antigravity-client/dist/src/gen/exa/cortex_pb/cortex_pb.js';
 import {
   SendUserCascadeMessageRequest,
@@ -446,10 +446,10 @@ export class AntigravityBackend {
             'messaging'
           ],
           replacePromptSections: systemPrompt ? [
-            {
-              type: 'identity',
-              text: systemPrompt
-            }
+            new PromptSection({
+              title: 'identity',
+              content: systemPrompt
+            })
           ] : []
         },
         cascadeConfig: new CascadeConfig({
