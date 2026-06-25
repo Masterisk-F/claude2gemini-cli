@@ -1493,29 +1493,60 @@ Any other built-in tools native to the local agent (even if they appear to be av
       if (resolvedCount > 0) {
         console.log(`[Backend] Resolved ${resolvedCount} pending tool call(s) for requestId=${requestId}. Skipping sendMessage.`);
       } else {
-        console.log(`[Backend] >>> sendMessage START (requestId=${requestId})`);
-        await this.sendMessage(
-          cascade,
-          text,
-          resolvedModelId, // Pass the pre-resolved model ID
-          apiKey,
-          images,
-          documents.map(d => ({ absolutePath: d.absolutePath, mediaType: d.mediaType })),
-          systemPromptToExtract,
-        );
-        console.log(`[Backend] <<< sendMessage DONE (requestId=${requestId}, cascade status=${cascade.state?.status})`);
-
-        if (debugMode !== 'off') {
-          this.#dumpNewTurn(
-            text,
-            images,
-            documents.map(d => ({ absolutePath: d.absolutePath, mediaType: d.mediaType })),
-            `=== NEW TURN (requestId=${requestId}, cascadeId=${matchedCascadeId}, model=${request.model}) ===`,
-            debugMode,
-          );
+        let isRetry = false;
+        if (parent) {
+          const steps = cascade.state?.trajectory?.steps || [];
+          if (hasToolResult) {
+            isRetry = true;
+          } else {
+            for (let i = steps.length - 1; i >= 0; i--) {
+              if (steps[i]?.step?.case === 'userInput') {
+                const u = steps[i].step!.value as any; // CortexStepUserInput
+                if (u?.query?.endsWith(userText)) {
+                  isRetry = true;
+                }
+                break;
+              }
+            }
+          }
         }
 
-        console.log(`[Backend] Sending message (requestId=${requestId}, sessionId=${sessionId.slice(0, 8)}…, session_new=${createdNewCascade}, past_turns=${pastTurns.length}, text_length=${text.length}, model=${request.model})`);
+        if (isRetry) {
+          console.log(`[Backend] Detected retry of a dropped stream for requestId=${requestId}. Skipping sendMessage to avoid duplicating the user instruction.`);
+          // Rewind stepCountBefore so we re-stream the already generated (or generating) response
+          const steps = cascade.state?.trajectory?.steps || [];
+          for (let i = steps.length - 1; i >= 0; i--) {
+            const stepCase = steps[i]?.step?.case;
+            if (stepCase === 'userInput' || stepCase === 'mcpTool') {
+              stepCountBefore = i + 1;
+              break;
+            }
+          }
+        } else {
+          console.log(`[Backend] >>> sendMessage START (requestId=${requestId})`);
+          await this.sendMessage(
+            cascade,
+            text,
+            resolvedModelId, // Pass the pre-resolved model ID
+            apiKey,
+            images,
+            documents.map(d => ({ absolutePath: d.absolutePath, mediaType: d.mediaType })),
+            systemPromptToExtract,
+          );
+          console.log(`[Backend] <<< sendMessage DONE (requestId=${requestId}, cascade status=${cascade.state?.status})`);
+
+          if (debugMode !== 'off') {
+            this.#dumpNewTurn(
+              text,
+              images,
+              documents.map(d => ({ absolutePath: d.absolutePath, mediaType: d.mediaType })),
+              `=== NEW TURN (requestId=${requestId}, cascadeId=${matchedCascadeId}, model=${request.model}) ===`,
+              debugMode,
+            );
+          }
+
+          console.log(`[Backend] Sending message (requestId=${requestId}, sessionId=${sessionId?.slice(0, 8)}…, session_new=${createdNewCascade}, past_turns=${pastTurns.length}, text_length=${text.length}, model=${request.model})`);
+        }
       }
 
       let turn: 'idle' | 'tool_call' = 'idle';
