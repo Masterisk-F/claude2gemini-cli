@@ -879,9 +879,8 @@ export class AntigravityBackend {
    */
   private static getBuiltInToolsDisclaimer(): string {
     return `=== IMPORTANT TOOL USAGE RULE ===
-You MUST ONLY use tools that start with the prefix \`mcp__\`.
-Any other built-in tools (even if they appear to be available) are DISABLED and will fail.
-For example, use \`mcp__playwright-mcp-chrome__browser_action\` (or other MCP tools provided in your schema) instead of any internal browser tools.
+You MUST ONLY use tools provided through \`claude2gemini-mcp-proxy\`.
+Any other built-in tools native to the local agent (even if they appear to be available) are DISABLED and will fail.
 =================================`;
   }
 

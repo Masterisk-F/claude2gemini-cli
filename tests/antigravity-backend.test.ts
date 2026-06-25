@@ -249,8 +249,8 @@ describe('AntigravityBackend', () => {
 
     const firstCall = sendSpy.mock.calls[0]?.[0] as any;
     const firstText = firstCall?.items?.[0]?.chunk?.value ?? '';
-    expect(firstText).toContain('=== SYSTEM PROMPT ===');
-    expect(firstText).toContain('You are a test assistant.');
+    const customAgentSpec = firstCall?.customAgentSpec;
+    expect(customAgentSpec?.promptSectionCustomization?.replacePromptSections?.[0]?.content).toContain('You are a test assistant.');
     expect(firstText).toContain('=== USER INSTRUCTION ===');
   });
 
@@ -271,8 +271,8 @@ describe('AntigravityBackend', () => {
       messages: messages1,
       system: 'You are a test assistant.',
     })) { /* drain */ }
-    const firstText = (sendSpy.mock.calls[0]?.[0] as any)?.items?.[0]?.chunk?.value ?? '';
-    expect(firstText).toContain('=== SYSTEM PROMPT ===');
+    const firstCall = sendSpy.mock.calls[0]?.[0] as any;
+    expect(firstCall?.customAgentSpec?.promptSectionCustomization?.replacePromptSections?.[0]?.content).toContain('You are a test assistant.');
 
     // Second turn in the same session: re-attach. System prompt is
     // suppressed — the model already has it from turn 1's userInput
@@ -287,9 +287,9 @@ describe('AntigravityBackend', () => {
       messages: messages2,
       system: 'You are a test assistant.',
     })) { /* drain */ }
-    const secondText = (sendSpy.mock.calls[1]?.[0] as any)?.items?.[0]?.chunk?.value ?? '';
-    expect(secondText).not.toContain('=== SYSTEM PROMPT ===');
-    expect(secondText).not.toContain('You are a test assistant.');
+    const secondCall = sendSpy.mock.calls[1]?.[0] as any;
+    const secondText = secondCall?.items?.[0]?.chunk?.value ?? '';
+    expect(secondCall?.customAgentSpec?.promptSectionCustomization?.replacePromptSections?.length).toBeFalsy();
     expect(secondText).toContain('=== USER INSTRUCTION ===');
     expect(secondText).toContain('Another one.');
   });
@@ -305,19 +305,16 @@ describe('AntigravityBackend', () => {
       messages: [{ role: 'user', content: 'Hello' }],
       system: 'You are a test assistant.',
     })) { /* drain */ }
-
     const firstText = (sendSpy.mock.calls[0]?.[0] as any)?.items?.[0]?.chunk?.value ?? '';
     // Disclaimer present
     expect(firstText).toContain('=== IMPORTANT TOOL USAGE RULE ===');
     expect(firstText).toContain('=================================');
     // MCP directive present
-    expect(firstText).toContain('mcp__playwright-mcp-chrome__browser_action');
-    // Ordering: SYSTEM PROMPT < IMPORTANT TOOL USAGE RULE < USER INSTRUCTION
-    const sysIdx = firstText.indexOf('=== SYSTEM PROMPT ===');
+    expect(firstText).toContain('claude2gemini-mcp-proxy');
+    // Ordering: IMPORTANT TOOL USAGE RULE < USER INSTRUCTION
     const builtinIdx = firstText.indexOf('=== IMPORTANT TOOL USAGE RULE ===');
     const userIdx = firstText.indexOf('=== USER INSTRUCTION ===');
-    expect(sysIdx).toBeGreaterThanOrEqual(0);
-    expect(builtinIdx).toBeGreaterThan(sysIdx);
+    expect(builtinIdx).toBeGreaterThanOrEqual(0);
     expect(userIdx).toBeGreaterThan(builtinIdx);
   });
 
