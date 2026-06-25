@@ -301,14 +301,13 @@ export class AntigravityBackend {
       } catch { /* best-effort */ }
     }
 
-    try {
-      await this.client.lsClient.refreshMcpServers(
-        new RefreshMcpServersRequest({ shallow: false, serverName: 'claude2gemini-mcp-proxy' }),
-      );
+    this.client.lsClient.refreshMcpServers(
+      new RefreshMcpServersRequest({ shallow: false, serverName: 'claude2gemini-mcp-proxy' }),
+    ).then(() => {
       console.log('[Backend] MCP proxy registered with LS (refreshMcpServers OK)');
-    } catch (error: unknown) {
+    }).catch((error: unknown) => {
       console.warn('[Backend] refreshMcpServers failed:', error);
-    }
+    });
   }
 
   /**
@@ -1347,7 +1346,13 @@ For example, use \`mcp__playwright-mcp-chrome__browser_action\` (or other MCP to
         const toolsHash = JSON.stringify(tools);
         if (this.lastRegisteredToolsHash !== toolsHash) {
           this.lastRegisteredToolsHash = toolsHash;
-          await this.#refreshMcpProxyOnLS();
+          // Do not await refreshMcpProxyOnLS.
+          // If a cascade is waiting for a tool call (e.g. Claude Code Agent tool),
+          // awaiting refreshMcpServers can deadlock because the LS might queue it
+          // behind the active cascade, hanging the subagent's new request.
+          this.#refreshMcpProxyOnLS().catch(err => {
+            console.warn('[Backend] Background refreshMcpProxyOnLS error:', err);
+          });
         }
       }
 
