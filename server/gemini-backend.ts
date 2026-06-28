@@ -170,28 +170,30 @@ export class AntigravityBackend {
     if (this.initPromise) return this.initPromise;
 
     this.initPromise = (async () => {
+      let sessionPurgeIntervalCreated = false;
       try {
         if (!this.sessionPurgeInterval) {
-      this.sessionPurgeInterval = setInterval(() => {
-        const now = Date.now();
-        for (const [key, entry] of this.sessionStore.entries()) {
-          if (now - entry.lastUsed > 60 * 60 * 1000) { // 1 hour
-            console.log(`[Backend] Purging inactive session: cascadeId=${key}, sessionId=${entry.sessionId}`);
-            this.sessionStore.delete(key);
-            this.#deleteCascadeTrajectoryBestEffort(key);
-            try {
-              entry.cascade.dispose();
-            } catch (err) {
-              console.warn(`[Backend] Failed to dispose cascade ${key} during purge:`, err);
+          this.sessionPurgeInterval = setInterval(() => {
+            const now = Date.now();
+            for (const [key, entry] of this.sessionStore.entries()) {
+              if (now - entry.lastUsed > 60 * 60 * 1000) { // 1 hour
+                console.log(`[Backend] Purging inactive session: cascadeId=${key}, sessionId=${entry.sessionId}`);
+                this.sessionStore.delete(key);
+                this.#deleteCascadeTrajectoryBestEffort(key);
+                try {
+                  entry.cascade.dispose();
+                } catch (err) {
+                  console.warn(`[Backend] Failed to dispose cascade ${key} during purge:`, err);
+                }
+              }
             }
-          }
+          }, 5 * 60 * 1000); // 5 minutes
+          this.sessionPurgeInterval.unref?.();
+          sessionPurgeIntervalCreated = true;
         }
-      }, 5 * 60 * 1000); // 5 minutes
-      this.sessionPurgeInterval.unref?.();
-    }
 
-    // Start the MCP Hub first so we know the port before LS starts
-    try {
+        // Start the MCP Hub first so we know the port before LS starts
+        try {
       await this.mcpHub.start();
       console.log(`[Backend] McpHub started on port ${this.mcpHub.port}`);
     } catch (error) {
@@ -232,9 +234,16 @@ export class AntigravityBackend {
 
     // Refresh MCP servers to ensure proxy is recognized
     await this.#refreshMcpProxyOnLS();
-      } finally {
-        this.initPromise = null;
-      }
+  } catch (error) {
+    // If initialization failed and we created the purge interval, clean it up
+    if (sessionPurgeIntervalCreated && this.sessionPurgeInterval) {
+      clearInterval(this.sessionPurgeInterval);
+      this.sessionPurgeInterval = undefined;
+    }
+    throw error;
+  } finally {
+    this.initPromise = null;
+  }
     })();
     await this.initPromise;
   }
@@ -1682,7 +1691,7 @@ Any other built-in tools native to the local agent (even if they appear to be av
           await this.sendMessage(
             cascade,
             internalErrorMsg,
-            request.model,
+            resolvedModelId,
             apiKey,
             [],
             []
