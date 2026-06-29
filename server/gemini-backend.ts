@@ -27,10 +27,11 @@ import { isDeepStrictEqual } from 'node:util';
 import { AntigravityClient, readAuthStatus } from 'antigravity-client';
 import {
   TextOrScopeItem, ModelOrAlias, Metadata, ImageData, ContextScopeItem, PathScopeItem,
+  PermissionGrantsConfig,
 } from 'antigravity-client/dist/src/gen/exa/codeium_common_pb/codeium_common_pb.js';
 import {
   CascadeConfig, CascadePlannerConfig, CascadeConversationalPlannerConfig,
-  CascadeToolConfig,
+  CascadeToolConfig, PermissionConfig,
   RunCommandToolConfig, SearchWebToolConfig, MemoryToolConfig, McpToolConfig,
   MqueryToolConfig, FindToolConfig, GenerateImageToolConfig, TrajectorySearchToolConfig,
   AntigravityBrowserToolConfig, BrowserSubagentToolConfig, InvokeSubagentToolConfig,
@@ -219,7 +220,8 @@ export class AntigravityBackend {
         apiKey,
         email: '',
         name: '',
-        ussOAuth: { key: 'oauthTokenInfoSentinelKey', value: '' }
+        ussOAuth: { key: 'oauthTokenInfoSentinelKey', value: '' },
+        ussUserStatus: { key: '', value: '' }
       } : undefined;
 
       this.client = await AntigravityClient.launch({
@@ -383,6 +385,19 @@ export class AntigravityBackend {
 
       // ── Global flag for simple research tools ──
       disableSimpleResearchTools: true,
+
+      permissionConfig: new PermissionConfig({
+        globalPermissionGrants: new PermissionGrantsConfig({
+          deny: [
+            "read_file(*)",
+            "write_file(*)",
+            "read_url(*)",
+            "execute_url(*)",
+            "command(*)",
+            "unsandboxed(*)"
+          ]
+        })
+      }),
     });
     return AntigravityBackend.disabledToolConfig;
   }
@@ -1650,7 +1665,7 @@ Instead, call the tools directly by their native names as listed above (e.g. cal
               // Find a pending call that matches name and args and is either unclaimed or claimed by us
               const matchIndex = pendingCalls.findIndex(c => 
                 c.name === toolName &&
-                (!c.claimedBy || c.claimedBy === cascade.cascadeId) &&
+                (!c.claimedBy || c.claimedBy === cascade?.cascadeId) &&
                 isDeepStrictEqual(c.args, parsedArgs)
               );
               
