@@ -23,6 +23,8 @@ export interface PendingCall {
   name: string;
   /** Tool arguments */
   args: any;
+  /** If claimed by a cascade */
+  claimedBy?: string;
 }
 
 interface PendingEntry {
@@ -32,6 +34,7 @@ interface PendingEntry {
   resolve: (result: unknown) => void;
   reject: (err: Error) => void;
   timer: NodeJS.Timeout;
+  claimedBy?: string;
 }
 
 // ── Hub ────────────────────────────────────────────────────────────────────
@@ -114,13 +117,29 @@ export class McpHub extends EventEmitter {
 
   // ── Call management ──
 
-  /** Get all currently pending (unresolved) tool calls. */
+  /**
+   * Return a list of pending tool calls that have been received by the hub
+   * but not yet resolved.
+   */
   getPendingCalls(): PendingCall[] {
-    return Array.from(this.pending.values()).map((e) => ({
-      callId: e.callId,
-      name: e.name,
-      args: e.args,
+    return Array.from(this.pending.values()).map(entry => ({
+      callId: entry.callId,
+      name: entry.name,
+      args: entry.args,
+      claimedBy: entry.claimedBy,
     }));
+  }
+
+  /**
+   * Claim a pending call for a specific cascade to prevent other concurrent
+   * cascades from picking up the same tool call.
+   */
+  claimCall(callId: string, cascadeId: string): boolean {
+    const call = this.pending.get(callId);
+    if (!call) return false;
+    if (call.claimedBy && call.claimedBy !== cascadeId) return false;
+    call.claimedBy = cascadeId;
+    return true;
   }
 
   /** True when at least one tool call is waiting for resolution. */

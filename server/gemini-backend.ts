@@ -23,6 +23,7 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 import { AntigravityClient, readAuthStatus } from 'antigravity-client';
 import {
   TextOrScopeItem, ModelOrAlias, Metadata, ImageData, ContextScopeItem, PathScopeItem,
@@ -1234,18 +1235,10 @@ Instead, call the tools directly by their native names as listed above (e.g. cal
     return new Promise<'idle' | 'tool_call'>((resolve, reject) => {
       let settled = false;
       let pollTimer: ReturnType<typeof setInterval>;
-      let hasPendingCallEvent = false;
-
+      
       const cleanup = () => {
-        this.mcpHub.off('pending_call', onPending);
         if (pollTimer) clearInterval(pollTimer);
       };
-
-      // Listen for McpHub tool call events
-      const onPending = () => {
-        hasPendingCallEvent = true;
-      };
-      this.mcpHub.on('pending_call', onPending);
 
       // Polling fallback to catch racing conditions where LS completes the turn instantly
       // and waitForTurnComplete misses the IDLE transition. Also handles waiting for 
@@ -1273,23 +1266,32 @@ Instead, call the tools directly by their native names as listed above (e.g. cal
           }
         }
 
-        if (hasPendingCallEvent) {
-          const pendingCalls = this.mcpHub.getPendingCalls();
-          if (pendingCalls.length > 0) {
-            let found = false;
-            for (let i = steps.length - 1; i >= 0; i--) {
-              if (steps[i]?.step?.case === 'mcpTool') {
-                const m = steps[i].step.value as CortexStepMcpTool;
-                if (pendingCalls.some(c => c.name === m.toolCall?.name)) {
-                  found = true;
-                  break;
-                }
+        const pendingCalls = this.mcpHub.getPendingCalls();
+        if (pendingCalls.length > 0) {
+          let found = false;
+          for (let i = steps.length - 1; i >= 0; i--) {
+            if (steps[i]?.step?.case === 'mcpTool') {
+              const m = steps[i].step.value as CortexStepMcpTool;
+              const toolName = m.toolCall?.name;
+              const argsStr = (m.toolCall as any)?.argumentsJson || (m.toolCall as any)?.arguments_json || (m.toolCall as any)?.arguments || '{}';
+              let parsedArgs = {};
+              try { parsedArgs = typeof argsStr === 'string' ? JSON.parse(argsStr) : argsStr; } catch (e) {}
+
+              const matchIndex = pendingCalls.findIndex(c => 
+                c.name === toolName &&
+                (!c.claimedBy || c.claimedBy === cascade.cascadeId) &&
+                isDeepStrictEqual(c.args, parsedArgs)
+              );
+              
+              if (matchIndex !== -1) {
+                found = true;
+                break;
               }
             }
-            if (found) {
-              if (!settled) { settled = true; cleanup(); resolve('tool_call'); }
-              return;
-            }
+          }
+          if (found) {
+            if (!settled) { settled = true; cleanup(); resolve('tool_call'); }
+            return;
           }
         }
 
@@ -1477,12 +1479,6 @@ Instead, call the tools directly by their native names as listed above (e.g. cal
         : [];
       const hasToolResult = toolResults.length > 0;
 
-      // Clear pending tools from previous incomplete or aborted requests
-      // ONLY if this is a fresh user instruction, to prevent cross-session leakage.
-      if (!hasToolResult) {
-        this.mcpHub.clearPendingCalls('New user instruction received, clearing stale calls');
-      }
-
       let resolvedCount = 0;
       if (hasToolResult) {
         for (const tr of toolResults) {
@@ -1638,7 +1634,35 @@ Instead, call the tools directly by their native names as listed above (e.g. cal
             textFromThisTurn = '';
           }
 
-          for (const call of this.mcpHub.getPendingCalls()) {
+          const pendingCalls = this.mcpHub.getPendingCalls();
+          const matchedCalls: typeof pendingCalls = [];
+          const steps = cascade.state?.trajectory?.steps ?? [];
+          for (let i = steps.length - 1; i >= 0; i--) {
+            if (steps[i]?.step?.case === 'mcpTool') {
+              const m = steps[i].step.value as CortexStepMcpTool;
+              const toolName = m.toolCall?.name;
+              const argsStr = (m.toolCall as any)?.argumentsJson || (m.toolCall as any)?.arguments_json || (m.toolCall as any)?.arguments || '{}';
+              let parsedArgs = {};
+              try { parsedArgs = typeof argsStr === 'string' ? JSON.parse(argsStr) : argsStr; } catch (e) {}
+
+              // Find a pending call that matches name and args and is either unclaimed or claimed by us
+              const matchIndex = pendingCalls.findIndex(c => 
+                c.name === toolName &&
+                (!c.claimedBy || c.claimedBy === cascade.cascadeId) &&
+                isDeepStrictEqual(c.args, parsedArgs)
+              );
+              
+              if (matchIndex !== -1) {
+                const call = pendingCalls[matchIndex];
+                if (this.mcpHub.claimCall(call.callId, cascade.cascadeId)) {
+                  matchedCalls.push(call);
+                  pendingCalls.splice(matchIndex, 1);
+                }
+              }
+            }
+          }
+
+          for (const call of matchedCalls) {
             if (allowedToolNames.length > 0 && !allowedToolNames.includes(call.name)) {
               console.log(`[Backend] Rejecting disallowed tool call: ${call.name} (${call.callId})`);
               this.mcpHub.resolveCall(call.callId, {

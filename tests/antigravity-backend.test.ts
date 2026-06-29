@@ -625,30 +625,6 @@ describe('AntigravityBackend', () => {
     expect((backend as any).inflightCascades.size).toBe(0);
   });
 
-  it('should clear pending MCP tool calls at request boundaries', async () => {
-    const backend = new AntigravityBackend();
-    await backend.initialize();
-
-    // Simulate a stale pending call from a previous (abandoned) request
-    (backend.mcpHub as any).pending.set('stale', {
-      callId: 'stale',
-      name: 'Bash',
-      args: {},
-      resolve: vi.fn(),
-      reject: vi.fn(),
-      timer: setTimeout(() => {}, 1000),
-    });
-    expect(backend.mcpHub.hasPendingCalls()).toBe(true);
-
-    const stream = backend.createMessageStream('req-clear', {
-      model: 'Gemini_3.5_Flash_High',
-      messages: [{ role: 'user', content: 'Hello' }],
-    });
-    for await (const _ of stream) { /* drain */ }
-
-    // Boundary clear should have removed the stale call
-    expect(backend.mcpHub.hasPendingCalls()).toBe(false);
-  });
 
   // --- Error / Usage / Cancel ---
 
@@ -863,7 +839,7 @@ describe('AntigravityBackend', () => {
           step: {
             case: 'mcpTool',
             value: {
-              toolCall: { name: 'Read' },
+              toolCall: { name: 'Read', arguments: '{"file_path":"/tmp/test"}' },
               result: { value: '' },
             },
           },
@@ -871,9 +847,6 @@ describe('AntigravityBackend', () => {
         },
       );
     });
-
-    // Prevent clearPendingCalls from clearing our pre-populated test call.
-    vi.spyOn(backend.mcpHub, 'clearPendingCalls').mockImplementation(() => {});
 
     // Pre-populate mcpHub with a pending call matching the tool call.
     (backend.mcpHub as any).pending.set('test-call-text-and-tool', {
@@ -1163,25 +1136,6 @@ describe('Tool result delivery + session isolation', () => {
     hub.clearPendingCalls('test cleanup');
   });
 
-  it('clearPendingCalls is GLOBAL — it rejects every pending call regardless of session', async () => {
-    // Snapshot the current behavior: clearPendingCalls is a singleton-wide
-    // sweep. If a future change makes it session-scoped, this test will
-    // need to be updated and the bug fix documented.
-    const backend = new AntigravityBackend();
-    await backend.initialize();
-    const hub = backend.mcpHub;
-
-    const a = { callId: 'A', name: 'Bash', args: {}, resolve: vi.fn(), reject: vi.fn(), timer: setTimeout(() => {}, 60_000) };
-    const b = { callId: 'B', name: 'Bash', args: {}, resolve: vi.fn(), reject: vi.fn(), timer: setTimeout(() => {}, 60_000) };
-    (hub as any).pending.set(a.callId, a);
-    (hub as any).pending.set(b.callId, b);
-
-    hub.clearPendingCalls('boundary clear');
-
-    expect(a.reject).toHaveBeenCalledWith(new Error('boundary clear'));
-    expect(b.reject).toHaveBeenCalledWith(new Error('boundary clear'));
-    expect(hub.hasPendingCalls()).toBe(false);
-  });
 
   it('generates distinct callIds for concurrent /call requests (no collisions)', async () => {
     const backend = new AntigravityBackend();
@@ -1399,14 +1353,14 @@ describe('Tool result delivery + session isolation', () => {
         { status: 3, step: { case: 'userInput', value: {} }, requestedInteraction: null },
         {
           status: 0,
-          step: { case: 'mcpTool', value: { toolCall: { name: 'Read', arguments: '{}' }, result: { value: '' } } },
+          step: { case: 'mcpTool', value: { toolCall: { name: 'Read', arguments: '{"file":"foo.ts"}' }, result: { value: '' } } },
           requestedInteraction: null
         }
       );
       (backend.mcpHub as any).pending.set('call_tc1', {
         callId: 'call_tc1',
         name: 'Read',
-        args: {},
+        args: { file: 'foo.ts' },
         resolve: vi.fn(),
         reject: vi.fn(),
       });
@@ -1433,14 +1387,14 @@ describe('Tool result delivery + session isolation', () => {
         { status: 3, step: { case: 'userInput', value: {} }, requestedInteraction: null },
         {
           status: 0,
-          step: { case: 'mcpTool', value: { toolCall: { name: 'Write', arguments: '{}' }, result: { value: '' } } },
+          step: { case: 'mcpTool', value: { toolCall: { name: 'Write', arguments: '{"file":"bar.ts"}' }, result: { value: '' } } },
           requestedInteraction: null
         }
       );
       (backend.mcpHub as any).pending.set('call_tc2', {
         callId: 'call_tc2',
         name: 'Write',
-        args: {},
+        args: { file: 'bar.ts' },
         resolve: vi.fn(),
         reject: vi.fn(),
       });
@@ -1548,12 +1502,12 @@ describe('Tool result delivery + session isolation', () => {
         { status: 3, step: { case: 'userInput', value: {} }, requestedInteraction: null },
         {
           status: 0,
-          step: { case: 'mcpTool', value: { toolCall: { name: 'Read', arguments: '{}' }, result: { value: '' } } },
+          step: { case: 'mcpTool', value: { toolCall: { name: 'Read', arguments: '{"file":"fileA.ts"}' }, result: { value: '' } } },
           requestedInteraction: null
         },
         {
           status: 0,
-          step: { case: 'mcpTool', value: { toolCall: { name: 'Write', arguments: '{}' }, result: { value: '' } } },
+          step: { case: 'mcpTool', value: { toolCall: { name: 'Write', arguments: '{"file":"fileB.ts"}' }, result: { value: '' } } },
           requestedInteraction: null
         }
       );
@@ -1562,14 +1516,14 @@ describe('Tool result delivery + session isolation', () => {
       (backend.mcpHub as any).pending.set('call_parallel_A', {
         callId: 'call_parallel_A',
         name: 'Read',
-        args: {},
+        args: { file: 'fileA.ts' },
         resolve: vi.fn(),
         reject: vi.fn(),
       });
       (backend.mcpHub as any).pending.set('call_parallel_B', {
         callId: 'call_parallel_B',
         name: 'Write',
-        args: {},
+        args: { file: 'fileB.ts' },
         resolve: vi.fn(),
         reject: vi.fn(),
       });
