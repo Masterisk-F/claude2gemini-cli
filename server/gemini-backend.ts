@@ -1384,15 +1384,20 @@ Instead, call the tools directly by their native names as listed above (e.g. cal
         const toolsHash = JSON.stringify(tools);
         if (this.lastRegisteredToolsHash !== toolsHash) {
           this.lastRegisteredToolsHash = toolsHash;
-          // Await refreshMcpProxyOnLS with a short timeout to prevent "unknown tool" errors
-          // on the first turn, while avoiding deadlocks if a cascade is blocking the LS queue.
+          // Await refreshMcpProxyOnLS fully on the first turn (no inflight cascades)
+          // to prevent "unknown tool" errors. If there are active cascades, use a
+          // short timeout to avoid deadlocks (e.g. subagent calling during a turn).
           const refreshPromise = this.#refreshMcpProxyOnLS().catch(err => {
             console.warn('[Backend] Background refreshMcpProxyOnLS error:', err);
           });
-          await Promise.race([
-            refreshPromise,
-            new Promise(resolve => setTimeout(resolve, 1500))
-          ]);
+          if (this.inflightCascades.size === 0) {
+            await refreshPromise;
+          } else {
+            await Promise.race([
+              refreshPromise,
+              new Promise(resolve => setTimeout(resolve, 1500))
+            ]);
+          }
         }
       }
 
