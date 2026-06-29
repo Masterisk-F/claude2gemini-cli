@@ -710,13 +710,13 @@ describe('AntigravityBackend', () => {
   });
 
   it('should yield 504 error on waitForTurnComplete timeout', async () => {
+    vi.useFakeTimers();
+    
     const backend = new AntigravityBackend();
     await backend.initialize();
 
-    // Set the shared mock flag so every MockCascade's waitForTurnComplete
-    // rejects with a timeout error. The sharedState mechanism means
-    // #wrapCascade's `new Cascade(...)` returns an instance that honors it.
-    mockState.timeoutError = new Error('waitForTurnComplete: timeout after 120000ms');
+    // Prevent the cascade from immediately reporting IDLE so it actually waits
+    mockState.sharedState.status = 2; // RUNNING
 
     const stream = backend.createMessageStream('req-timeout', {
       model: 'Gemini_3.5_Flash_High',
@@ -724,14 +724,23 @@ describe('AntigravityBackend', () => {
     });
 
     const events: any[] = [];
-    for await (const event of stream) {
-      events.push(event);
-    }
+    const collectPromise = (async () => {
+      for await (const event of stream) {
+        events.push(event);
+      }
+    })();
+    
+    // Advance time by 120 seconds to trigger the timeout
+    await vi.advanceTimersByTimeAsync(120_000);
+    await collectPromise;
 
     const errEvent = events.find((e: any) => e.type === 'error');
     expect(errEvent).toBeDefined();
     expect(errEvent.message).toContain('Timeout waiting for response');
     expect(errEvent.status).toBe(504);
+
+    mockState.sharedState.status = 1; // back to IDLE
+    vi.useRealTimers();
 
     mockState.timeoutError = null;
   });

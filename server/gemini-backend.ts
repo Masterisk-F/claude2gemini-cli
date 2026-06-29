@@ -1235,9 +1235,13 @@ Instead, call the tools directly by their native names as listed above (e.g. cal
     return new Promise<'idle' | 'tool_call'>((resolve, reject) => {
       let settled = false;
       let pollTimer: ReturnType<typeof setInterval>;
+      let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
+      let onStatusChange: (ev: any) => void;
       
       const cleanup = () => {
         if (pollTimer) clearInterval(pollTimer);
+        if (timeoutTimer) clearTimeout(timeoutTimer);
+        if (onStatusChange) cascade.off('statusChange', onStatusChange);
       };
 
       // Polling fallback to catch racing conditions where LS completes the turn instantly
@@ -1306,21 +1310,19 @@ Instead, call the tools directly by their native names as listed above (e.g. cal
         }
       }, 50);
 
-      // Use the cascade's event-driven idle waiter
-      cascade.waitForTurnComplete({ timeoutMs })
-        .then(() => {
+      // Use a custom statusChange listener to avoid listener leaks
+      onStatusChange = (ev: any) => {
+        if (ev.status === CascadeRunStatus.IDLE || ev.status === 'IDLE') {
           if (!settled) { settled = true; cleanup(); resolve('idle'); }
-        })
-        .catch((err: Error) => {
-          if (!settled) { settled = true; cleanup();
-            // Timeout → propagate to outer handler with 504
-            if (err.message?.includes('timeout')) {
-              reject(err);
-            } else {
-              resolve('idle');
-            }
-          }
-        });
+        }
+      };
+      cascade.on('statusChange', onStatusChange);
+
+      if (timeoutMs > 0) {
+        timeoutTimer = setTimeout(() => {
+          if (!settled) { settled = true; cleanup(); reject(new Error('waitForTurnComplete timeout')); }
+        }, timeoutMs);
+      }
     });
   }
 
