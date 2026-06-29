@@ -1384,13 +1384,15 @@ Instead, call the tools directly by their native names as listed above (e.g. cal
         const toolsHash = JSON.stringify(tools);
         if (this.lastRegisteredToolsHash !== toolsHash) {
           this.lastRegisteredToolsHash = toolsHash;
-          // Do not await refreshMcpProxyOnLS.
-          // If a cascade is waiting for a tool call (e.g. Claude Code Agent tool),
-          // awaiting refreshMcpServers can deadlock because the LS might queue it
-          // behind the active cascade, hanging the subagent's new request.
-          this.#refreshMcpProxyOnLS().catch(err => {
+          // Await refreshMcpProxyOnLS with a short timeout to prevent "unknown tool" errors
+          // on the first turn, while avoiding deadlocks if a cascade is blocking the LS queue.
+          const refreshPromise = this.#refreshMcpProxyOnLS().catch(err => {
             console.warn('[Backend] Background refreshMcpProxyOnLS error:', err);
           });
+          await Promise.race([
+            refreshPromise,
+            new Promise(resolve => setTimeout(resolve, 1500))
+          ]);
         }
       }
 
