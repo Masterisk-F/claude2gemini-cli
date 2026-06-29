@@ -1375,4 +1375,222 @@ describe('Tool result delivery + session isolation', () => {
     const result = await callPromise;
     expect(result.result.content[0].text).toBe('matched');
   });
+
+  describe('Parallel sessions and repeated tool calls (User Requested Validations)', () => {
+    it('should handle repeated tool calls in the same session without breaking continuity', async () => {
+    const backend = new AntigravityBackend();
+    await backend.initialize();
+
+    const startSpy = vi.spyOn((backend as any).client.lsClient, 'startCascade');
+    startSpy.mockClear();
+    const sendSpy = vi.spyOn((backend as any).client.lsClient, 'sendUserCascadeMessage');
+    sendSpy.mockClear();
+
+    const originalResolveCall = backend.mcpHub.resolveCall.bind(backend.mcpHub);
+    const resolveSpy = vi.spyOn(backend.mcpHub, 'resolveCall');
+
+    // Turn 1: user asks a question, model returns a tool call
+    const messages1: any[] = [
+      { role: 'user', content: 'Do task 1' }
+    ];
+
+    sendSpy.mockImplementationOnce(async () => {
+      mockState.sharedState.trajectory.steps.push(
+        { status: 3, step: { case: 'userInput', value: {} }, requestedInteraction: null },
+        {
+          status: 0,
+          step: { case: 'mcpTool', value: { toolCall: { name: 'Read', arguments: '{}' }, result: { value: '' } } },
+          requestedInteraction: null
+        }
+      );
+      (backend.mcpHub as any).pending.set('call_tc1', {
+        callId: 'call_tc1',
+        name: 'Read',
+        args: {},
+        resolve: vi.fn(),
+        reject: vi.fn(),
+      });
+    });
+
+    const stream1 = backend.createMessageStream('req-tc1', { model: 'Gemini_3.5_Flash_High', messages: messages1 });
+    let events1: any[] = [];
+    for await (const e of stream1) events1.push(e);
+
+    expect(startSpy).toHaveBeenCalledTimes(1);
+    const tc1 = events1.find((e: any) => e.type === 'tool_call');
+    expect(tc1).toBeDefined();
+
+    // Turn 2: user returns tool_result, model returns ANOTHER tool call
+    const messages2: any[] = [
+      ...messages1,
+      { role: 'assistant', content: [{ type: 'tool_use', id: tc1.id, name: 'Read', input: {} }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: tc1.id, content: 'result 1' }] }
+    ];
+
+    resolveSpy.mockImplementationOnce(async (callId: string, result: unknown) => {
+      const p = originalResolveCall(callId, result);
+      mockState.sharedState.trajectory.steps.push(
+        { status: 3, step: { case: 'userInput', value: {} }, requestedInteraction: null },
+        {
+          status: 0,
+          step: { case: 'mcpTool', value: { toolCall: { name: 'Write', arguments: '{}' }, result: { value: '' } } },
+          requestedInteraction: null
+        }
+      );
+      (backend.mcpHub as any).pending.set('call_tc2', {
+        callId: 'call_tc2',
+        name: 'Write',
+        args: {},
+        resolve: vi.fn(),
+        reject: vi.fn(),
+      });
+      return p;
+    });
+
+    const stream2 = backend.createMessageStream('req-tc2', { model: 'Gemini_3.5_Flash_High', messages: messages2 });
+    let events2: any[] = [];
+    for await (const e of stream2) events2.push(e);
+
+    // Should re-attach!
+    expect(startSpy).toHaveBeenCalledTimes(1);
+    const tc2 = events2.find((e: any) => e.type === 'tool_call');
+    expect(tc2).toBeDefined();
+
+    // Turn 3: user returns second tool_result, model finishes
+    const messages3: any[] = [
+      ...messages2,
+      { role: 'assistant', content: [{ type: 'tool_use', id: tc2.id, name: 'Write', input: {} }] },
+      { role: 'user', content: [{ type: 'tool_result', tool_use_id: tc2.id, content: 'result 2' }] }
+    ];
+
+    resolveSpy.mockImplementationOnce(async (callId: string, result: unknown) => {
+      const p = originalResolveCall(callId, result);
+      mockState.sharedState.trajectory.steps.push(
+        { status: 3, step: { case: 'userInput', value: {} }, requestedInteraction: null },
+        {
+          status: 4, 
+          step: { case: 'plannerResponse', value: { response: 'Task completed!', thinking: '' } },
+          requestedInteraction: null
+        }
+      );
+      return p;
+    });
+
+    const stream3 = backend.createMessageStream('req-tc3', { model: 'Gemini_3.5_Flash_High', messages: messages3 });
+    let events3: any[] = [];
+    for await (const e of stream3) events3.push(e);
+
+    // Still re-attaching!
+    expect(startSpy).toHaveBeenCalledTimes(1);
+    expect((backend as any).sessionStore.size).toBe(1);
+    const contentEvent = events3.find((e: any) => e.type === 'stream_event');
+    expect(contentEvent).toBeDefined();
+    expect(contentEvent.event.value).toBe('Task completed!');
+  });
+
+  it('should handle multiple concurrent sessions without conflicts', async () => {
+    const backend = new AntigravityBackend();
+    await backend.initialize();
+
+    const startSpy = vi.spyOn((backend as any).client.lsClient, 'startCascade');
+    startSpy.mockClear();
+    
+    // We launch two requests simultaneously.
+    const p1 = (async () => {
+      const stream = backend.createMessageStream('req-parallel-1', {
+        model: 'Gemini_3.5_Flash_High',
+        messages: [{ role: 'user', content: 'Parallel 1' }]
+      });
+      const events = [];
+      for await (const e of stream) events.push(e);
+      return events;
+    })();
+
+    const p2 = (async () => {
+      const stream = backend.createMessageStream('req-parallel-2', {
+        model: 'Gemini_3.5_Flash_High',
+        messages: [{ role: 'user', content: 'Parallel 2' }]
+      });
+      const events = [];
+      for await (const e of stream) events.push(e);
+      return events;
+    })();
+
+    const [events1, events2] = await Promise.all([p1, p2]);
+
+    // Both should complete successfully
+    expect(events1.length).toBeGreaterThan(0);
+    expect(events2.length).toBeGreaterThan(0);
+
+    // startCascade should be called exactly twice because they are different sessions
+    expect(startSpy).toHaveBeenCalledTimes(2);
+
+    // Two distinct cascades should be in the session store
+    expect((backend as any).sessionStore.size).toBe(2);
+    expect(events1.find((e: any) => e.type === 'turn_end')).toBeDefined();
+    expect(events2.find((e: any) => e.type === 'turn_end')).toBeDefined();
+  });
+
+  it('should handle multiple tool calls (parallel tool calling) in a single turn', async () => {
+    const backend = new AntigravityBackend();
+    await backend.initialize();
+
+    const startSpy = vi.spyOn((backend as any).client.lsClient, 'startCascade');
+    startSpy.mockClear();
+    const sendSpy = vi.spyOn((backend as any).client.lsClient, 'sendUserCascadeMessage');
+    sendSpy.mockClear();
+
+    const messages: any[] = [{ role: 'user', content: 'Do tasks A and B' }];
+
+    sendSpy.mockImplementationOnce(async () => {
+      // Simulate trajectory emitting TWO mcpTool steps
+      mockState.sharedState.trajectory.steps.push(
+        { status: 3, step: { case: 'userInput', value: {} }, requestedInteraction: null },
+        {
+          status: 0,
+          step: { case: 'mcpTool', value: { toolCall: { name: 'Read', arguments: '{}' }, result: { value: '' } } },
+          requestedInteraction: null
+        },
+        {
+          status: 0,
+          step: { case: 'mcpTool', value: { toolCall: { name: 'Write', arguments: '{}' }, result: { value: '' } } },
+          requestedInteraction: null
+        }
+      );
+      
+      // Both tools pend simultaneously in mcpHub
+      (backend.mcpHub as any).pending.set('call_parallel_A', {
+        callId: 'call_parallel_A',
+        name: 'Read',
+        args: {},
+        resolve: vi.fn(),
+        reject: vi.fn(),
+      });
+      (backend.mcpHub as any).pending.set('call_parallel_B', {
+        callId: 'call_parallel_B',
+        name: 'Write',
+        args: {},
+        resolve: vi.fn(),
+        reject: vi.fn(),
+      });
+    });
+
+    const stream = backend.createMessageStream('req-parallel-tools', { model: 'Gemini_3.5_Flash_High', messages });
+    const events: any[] = [];
+    for await (const e of stream) events.push(e);
+
+    expect(startSpy).toHaveBeenCalledTimes(1);
+
+    // We should see TWO tool_call events sequentially in the stream
+    const toolCalls = events.filter((e: any) => e.type === 'tool_call');
+    expect(toolCalls.length).toBe(2);
+    expect(toolCalls[0].name).toBe('Read');
+    expect(toolCalls[0].callId).toBe('call_parallel_A');
+    expect(toolCalls[1].name).toBe('Write');
+    expect(toolCalls[1].callId).toBe('call_parallel_B');
+
+    // And a turn_end event at the end
+    expect(events.find((e: any) => e.type === 'turn_end')).toBeDefined();
+  });
+});
 });

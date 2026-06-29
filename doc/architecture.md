@@ -135,6 +135,16 @@ sequenceDiagram
     P-->>C: SSE text_delta & message_stop
 ```
 
+### Parallel Tool Calling and Sequential Fallback (Race Condition Handling)
+
+The system supports parallel tool calling (when the LS issues multiple tool calls simultaneously). However, due to the asynchronous nature of HTTP requests and the proxy's polling interval, race conditions can occur if multiple tool calls arrive at `McpHub` with slight timing discrepancies.
+
+The proxy handles this robustly by seamlessly degrading parallel calls into sequential calls from the client's perspective:
+1. **Ideal Parallel Case**: If both `mcpTool(A)` and `mcpTool(B)` arrive at `McpHub` before `waitForTurnOrToolCall` finishes its loop, they are bundled and returned as a single `turn_end` containing two `tool_call` blocks.
+2. **Race Condition Case**: If `mcpTool(A)` arrives and is instantly flushed to the client, `mcpTool(B)` may arrive milliseconds later. It is not lost; it remains pending in `McpHub`.
+3. **Sequential Fallback**: When the client responds with `tool_result(A)`, `McpHub` resolves `A`. The very next stream request immediately detects the still-pending `mcpTool(B)` and yields it as a new, standalone `tool_call` response.
+4. **Client Experience**: From the client's (Claude API) perspective, the assistant simply decided to execute tool A, observed the result, and *then* decided to execute tool B sequentially. The LS seamlessly proceeds once both HTTP responses have returned.
+
 ### Advantages of the New Design
 - **Single-Process Simplicity**: No more complex socket management or round-robin process pools. The main Express application handles everything in a single process.
 - **LS Subprocess Isolation**: The Go-based language server process is launched cleanly as a subprocess.
