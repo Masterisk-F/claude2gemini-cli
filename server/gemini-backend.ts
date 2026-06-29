@@ -313,13 +313,15 @@ export class AntigravityBackend {
       } catch { /* best-effort */ }
     }
 
-    this.client.lsClient.refreshMcpServers(
-      new RefreshMcpServersRequest({ shallow: false, serverName: 'claude2gemini-mcp-proxy' }),
-    ).then(() => {
+    try {
+      await this.client.lsClient.refreshMcpServers(
+        new RefreshMcpServersRequest({ shallow: false, serverName: 'claude2gemini-mcp-proxy' }),
+      );
       console.log('[Backend] MCP proxy registered with LS (refreshMcpServers OK)');
-    }).catch((error: unknown) => {
+    } catch (error: unknown) {
       console.warn('[Backend] refreshMcpServers failed:', error);
-    });
+      throw error;
+    }
   }
 
   /**
