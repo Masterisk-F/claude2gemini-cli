@@ -1637,7 +1637,7 @@ Instead, call the tools directly by their native names as listed above (e.g. cal
           const pendingCalls = this.mcpHub.getPendingCalls();
           const matchedCalls: typeof pendingCalls = [];
           const steps = cascade.state?.trajectory?.steps ?? [];
-          for (let i = steps.length - 1; i >= 0; i--) {
+          for (let i = 0; i < steps.length; i++) {
             if (steps[i]?.step?.case === 'mcpTool') {
               const m = steps[i].step.value as CortexStepMcpTool;
               const toolName = m.toolCall?.name;
