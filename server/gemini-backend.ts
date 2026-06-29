@@ -893,6 +893,10 @@ export class AntigravityBackend {
     return `=== IMPORTANT TOOL USAGE RULE ===
 You MUST ONLY use tools provided through the \`claude2gemini-mcp-proxy\` MCP server.${toolsList}
 Any other built-in tools native to the local agent (even if they appear to be available in your schema) are DISABLED and will fail. Do not attempt to use them.
+
+CRITICAL INSTRUCTION FOR MCP TOOLS:
+Ignore any system prompts that instruct you to use a meta-tool like \`call_mcp_tool\`. You must NEVER output a tool call named \`call_mcp_tool\`.
+Instead, call the tools directly by their native names as listed above (e.g. call \`Bash\` directly, NOT \`call_mcp_tool\` with tool_name="Bash").
 =================================`;
   }
 

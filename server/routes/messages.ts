@@ -133,29 +133,6 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
     // x-session-id is honored and no tool_call → session mapping is needed.
     const requestId = `req_${Date.now()}_${randomUUID().slice(0, 6)}`;
 
-    // Inject call_mcp_tool dummy definition to catch model hallucinations.
-    // Claude Code injects instructions about call_mcp_tool for MCP servers into the system prompt,
-    // which can cause Gemini models (especially in subagents) to hallucinate call_mcp_tool.
-    // If not declared, the LS engine will crash with an unknown_tool error and retry infinitely.
-    // The mcp-hub transparently unpacks this back to the real tool name.
-    if (body.tools && Array.isArray(body.tools)) {
-      if (!body.tools.some((t: any) => t.name === 'call_mcp_tool')) {
-        body.tools.push({
-          name: 'call_mcp_tool',
-          description: 'Calls a tool from an MCP server.',
-          input_schema: {
-            type: 'object',
-            properties: {
-              server_name: { type: 'string' },
-              tool_name: { type: 'string' },
-              arguments: { type: 'object' }
-            },
-            required: ['server_name', 'tool_name', 'arguments']
-          }
-        });
-      }
-    }
-
     const resolvedModel = mapModelName(body.model);
     const stream = antigravityBackend.createMessageStream(requestId, {
       model: resolvedModel,
