@@ -322,8 +322,8 @@ export class AntigravityBackend {
       );
       console.log('[Backend] MCP proxy registered with LS (refreshMcpServers OK)');
     } catch (error: unknown) {
-      console.warn('[Backend] refreshMcpServers failed:', error);
-      throw error;
+      console.warn('[Backend] refreshMcpServers failed (non-fatal):', error);
+      // Do not throw; multiple concurrent subagents can cause "loading already in progress".
     }
 
     // Wait for the MCP proxy to actually fetch the updated tool list
@@ -1346,13 +1346,25 @@ Instead, call the tools directly by their native names as listed above (e.g. cal
 
               console.log(`[Backend Debug] Comparing pending calls with trajectory step: toolName="${toolName}", parsedArgs=${JSON.stringify(parsedArgs)}`);
               
+              const deepEqual = (a: any, b: any): boolean => {
+                if (a === b) return true;
+                if (typeof a !== 'object' || a === null || typeof b !== 'object' || b === null) return false;
+                const keysA = Object.keys(a), keysB = Object.keys(b);
+                if (keysA.length !== keysB.length) return false;
+                for (const key of keysA) {
+                  if (!keysB.includes(key) || !deepEqual(a[key], b[key])) return false;
+                }
+                return true;
+              };
+
               const matchIndex = pendingCalls.findIndex(c => {
                 const nameMatch = c.name === toolName;
                 const claimMatch = (!c.claimedBy || c.claimedBy === cascade.cascadeId);
+                const argsMatch = deepEqual(c.args, parsedArgs);
                 if (nameMatch) {
-                  console.log(`[Backend Debug] Name matched! claimMatch=${claimMatch} (c.args=${JSON.stringify(c.args)}, parsedArgs=${JSON.stringify(parsedArgs)})`);
+                  console.log(`[Backend Debug] Name matched! claimMatch=${claimMatch} argsMatch=${argsMatch} (c.args=${JSON.stringify(c.args)}, parsedArgs=${JSON.stringify(parsedArgs)})`);
                 }
-                return nameMatch && claimMatch;
+                return nameMatch && claimMatch && argsMatch;
               });
 
               if (matchIndex !== -1) {
