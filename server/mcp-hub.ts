@@ -497,10 +497,13 @@ export function unpackMetaCall(name: string, args: any): { name: string; args: a
   // Strip MCP server prefix if present (safety net for models that prepend it)
   const MCP_PREFIX = 'claude2gemini-mcp-proxy:';
   const MCP_ALT_PREFIX = 'claude2gemini-mcp-proxy__';
+  const MCP_SYS_PREFIX = 'mcp__claude2gemini-mcp-proxy__';
   if (typeof resolvedName === 'string' && resolvedName.startsWith(MCP_PREFIX)) {
     resolvedName = resolvedName.slice(MCP_PREFIX.length);
   } else if (typeof resolvedName === 'string' && resolvedName.startsWith(MCP_ALT_PREFIX)) {
     resolvedName = resolvedName.slice(MCP_ALT_PREFIX.length);
+  } else if (typeof resolvedName === 'string' && resolvedName.startsWith(MCP_SYS_PREFIX)) {
+    resolvedName = resolvedName.slice(MCP_SYS_PREFIX.length);
   }
 
   if (resolvedName === 'call_mcp_tool' && args && typeof args === 'object') {

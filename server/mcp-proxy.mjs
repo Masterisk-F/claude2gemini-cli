@@ -72,16 +72,27 @@ async function handleToolsList(requestId) {
   }
 }
 
+function stripMCPPrefix(name) {
+  const PREFIX = 'claude2gemini-mcp-proxy:';
+  const ALT_PREFIX = 'claude2gemini-mcp-proxy__';
+  const MCP_SYS_PREFIX = 'mcp__claude2gemini-mcp-proxy__';
+  if (typeof name === 'string' && name.startsWith(PREFIX)) return name.slice(PREFIX.length);
+  if (typeof name === 'string' && name.startsWith(ALT_PREFIX)) return name.slice(ALT_PREFIX.length);
+  if (typeof name === 'string' && name.startsWith(MCP_SYS_PREFIX)) return name.slice(MCP_SYS_PREFIX.length);
+  return name;
+}
+
 async function handleToolsCall(requestId, params) {
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), CALL_TIMEOUT_MS);
 
+    const rawName = stripMCPPrefix(params.name);
     const resp = await fetch(`${HUB_BASE}/call`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        name: params.name,
+        name: rawName,
         arguments: params.arguments ?? params.Arguments ?? {},
         _meta: params._meta,
       }),

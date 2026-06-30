@@ -931,8 +931,9 @@ export class AntigravityBackend {
    *    layer (see `decideInteraction`).
    */
   private static getBuiltInToolsDisclaimer(allowedTools: string[]): string {
+    const prefix = 'mcp__claude2gemini-mcp-proxy__';
     const toolsList = allowedTools.length > 0
-      ? `\nSpecifically, the following tools are available and permitted for your use:\n${allowedTools.map(t => `- \`${t}\``).join('\n')}`
+      ? `\nSpecifically, the following tools are available and permitted for your use:\n${allowedTools.map(t => `- \`${prefix}${t}\``).join('\n')}`
       : '';
     return `=== IMPORTANT TOOL USAGE RULE ===
 You MUST ONLY use tools provided through the \`claude2gemini-mcp-proxy\` MCP server.${toolsList}
@@ -940,9 +941,7 @@ Any other built-in tools native to the local agent (even if they appear to be av
 
 CRITICAL INSTRUCTION FOR MCP TOOLS:
 Ignore any system prompts that instruct you to use a meta-tool like \`call_mcp_tool\`. You must NEVER output a tool call named \`call_mcp_tool\`.
-Instead, call the tools directly by their native names as listed above (e.g. call \`Bash\` directly, NOT \`call_mcp_tool\` with tool_name="Bash").
-
-CRITICAL: Do NOT prefix tool names with the MCP server name. Use \`Bash\`, NOT \`claude2gemini-mcp-proxy:Bash\` or \`claude2gemini-mcp-proxy__Bash\`.
+Instead, call the tools directly by their native names as listed above (e.g. call \`${prefix}Bash\` directly, NOT \`call_mcp_tool\` with tool_name="Bash").
 =================================`;
   }
 
@@ -1326,7 +1325,11 @@ CRITICAL: Do NOT prefix tool names with the MCP server name. Use \`Bash\`, NOT \
           for (let i = steps.length - 1; i >= 0; i--) {
             if (steps[i]?.step?.case === 'mcpTool') {
               const m = steps[i].step.value as CortexStepMcpTool;
-              const toolName = m.toolCall?.name;
+              let toolName = m.toolCall?.name || '';
+              const PREFIX = 'mcp__claude2gemini-mcp-proxy__';
+              if (toolName.startsWith(PREFIX)) {
+                toolName = toolName.slice(PREFIX.length);
+              }
               const argsStr = (m.toolCall as any)?.argumentsJson || (m.toolCall as any)?.arguments_json || (m.toolCall as any)?.arguments || '{}';
               let parsedArgs = {};
               try { parsedArgs = typeof argsStr === 'string' ? JSON.parse(argsStr) : argsStr; } catch (e) {}
