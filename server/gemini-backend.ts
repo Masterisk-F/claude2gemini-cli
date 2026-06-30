@@ -1339,11 +1339,10 @@ Instead, call the tools directly by their native names as listed above (e.g. cal
               const matchIndex = pendingCalls.findIndex(c => {
                 const nameMatch = c.name === toolName;
                 const claimMatch = (!c.claimedBy || c.claimedBy === cascade.cascadeId);
-                const argsMatch = isDeepStrictEqual(c.args, parsedArgs);
                 if (nameMatch) {
-                  console.log(`[Backend Debug] Name matched! claimMatch=${claimMatch}, argsMatch=${argsMatch} (c.args=${JSON.stringify(c.args)}, parsedArgs=${JSON.stringify(parsedArgs)})`);
+                  console.log(`[Backend Debug] Name matched! claimMatch=${claimMatch} (c.args=${JSON.stringify(c.args)}, parsedArgs=${JSON.stringify(parsedArgs)})`);
                 }
-                return nameMatch && claimMatch && argsMatch;
+                return nameMatch && claimMatch;
               });
 
               if (matchIndex !== -1) {
@@ -1738,11 +1737,10 @@ Instead, call the tools directly by their native names as listed above (e.g. cal
               let parsedArgs = {};
               try { parsedArgs = typeof argsStr === 'string' ? JSON.parse(argsStr) : argsStr; } catch (e) {}
 
-              // Find a pending call that matches name and args and is either unclaimed or claimed by us
+              // Find a pending call that matches name and is either unclaimed or claimed by us
               const matchIndex = pendingCalls.findIndex(c => 
                 c.name === toolName &&
-                (!c.claimedBy || c.claimedBy === cascade?.cascadeId) &&
-                isDeepStrictEqual(c.args, parsedArgs)
+                (!c.claimedBy || c.claimedBy === cascade?.cascadeId)
               );
               
               if (matchIndex !== -1) {
