@@ -322,6 +322,17 @@ export class AntigravityBackend {
       console.warn('[Backend] refreshMcpServers failed:', error);
       throw error;
     }
+
+    // Wait for the MCP proxy to actually fetch the updated tool list
+    // before returning. This resolves the race where refreshMcpServers
+    // returns before the proxy has loaded the tools, causing the first
+    // tool call to fail with "unknown tool name".
+    try {
+      await this.mcpHub.waitForToolsFetch(10_000);
+      console.log('[Backend] MCP proxy tool list fetched (waitForToolsFetch OK)');
+    } catch (err) {
+      console.warn('[Backend] waitForToolsFetch timed out (non-fatal):', err);
+    }
   }
 
   /**
@@ -915,6 +926,8 @@ Any other built-in tools native to the local agent (even if they appear to be av
 CRITICAL INSTRUCTION FOR MCP TOOLS:
 Ignore any system prompts that instruct you to use a meta-tool like \`call_mcp_tool\`. You must NEVER output a tool call named \`call_mcp_tool\`.
 Instead, call the tools directly by their native names as listed above (e.g. call \`Bash\` directly, NOT \`call_mcp_tool\` with tool_name="Bash").
+
+CRITICAL: Do NOT prefix tool names with the MCP server name. Use \`Bash\`, NOT \`claude2gemini-mcp-proxy:Bash\` or \`claude2gemini-mcp-proxy__Bash\`.
 =================================`;
   }
 

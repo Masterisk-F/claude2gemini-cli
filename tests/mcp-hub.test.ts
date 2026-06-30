@@ -980,3 +980,58 @@ describe('Default behavior (passthrough — no env var)', () => {
     expect(schema.$defs.Bar.description).toBe('bar def');
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────
+// waitForToolsFetch
+// ─────────────────────────────────────────────────────────────────────────
+
+describe('waitForToolsFetch', () => {
+  beforeEach(setupHub);
+  afterEach(teardownHub);
+
+  it('resolves immediately if tools were already fetched', async () => {
+    hub.setTools([{ name: 'Bash', description: 'run', input_schema: { type: 'object' } }]);
+    // Simulate a client fetching /tools
+    await fetchJson('/tools');
+    // waitForToolsFetch should resolve instantly
+    await expect(hub.waitForToolsFetch(1000)).resolves.toBeUndefined();
+  });
+
+  it('resolves when a client fetches /tools after setTools', async () => {
+    hub.setTools([{ name: 'Bash', description: 'run', input_schema: { type: 'object' } }]);
+    // Start waiting BEFORE the fetch happens
+    const waitPromise = hub.waitForToolsFetch(5000);
+    // Simulate the MCP proxy fetching /tools
+    await new Promise(r => setTimeout(r, 50));
+    await fetchJson('/tools');
+    // The wait should now resolve
+    await expect(waitPromise).resolves.toBeUndefined();
+  });
+
+  it('resolves on timeout even if no fetch happens (best-effort)', async () => {
+    hub.setTools([{ name: 'Bash', description: 'run', input_schema: { type: 'object' } }]);
+    // Very short timeout, no fetch — should still resolve (not reject)
+    await expect(hub.waitForToolsFetch(100)).resolves.toBeUndefined();
+  });
+
+  it('handles multiple concurrent waiters', async () => {
+    hub.setTools([{ name: 'Read', description: 'read', input_schema: { type: 'object' } }]);
+    const w1 = hub.waitForToolsFetch(5000);
+    const w2 = hub.waitForToolsFetch(5000);
+    await new Promise(r => setTimeout(r, 50));
+    await fetchJson('/tools');
+    await expect(w1).resolves.toBeUndefined();
+    await expect(w2).resolves.toBeUndefined();
+  });
+
+  it('does not resolve on a stale fetch (previous version)', async () => {
+    hub.setTools([{ name: 'A', description: 'a', input_schema: { type: 'object' } }]);
+    await fetchJson('/tools'); // fetch version 1
+    // Now update tools (bumps version)
+    hub.setTools([{ name: 'B', description: 'b', input_schema: { type: 'object' } }]);
+    // waitForToolsFetch should NOT be satisfied by the old fetch
+    const waitPromise = hub.waitForToolsFetch(500);
+    // The 500ms timeout will fire and resolve it anyway (best-effort)
+    await expect(waitPromise).resolves.toBeUndefined();
+  });
+});

@@ -47,6 +47,21 @@ export class McpHub extends EventEmitter {
   private running = false;
   private originalSchemas = new Map<string, any>();
 
+  /**
+   * Timestamp (ms) of the last tools registration via setTools().
+   * Used to verify the MCP proxy has fetched the updated tool list.
+   */
+  private toolsVersion = 0;
+  /**
+   * Version of the tool list last served to a client (mcp-proxy) via GET /tools.
+   * Compared against `toolsVersion` to detect stale fetches.
+   */
+  private lastServedVersion = 0;
+  /**
+   * Resolvers waiting for the proxy to fetch the latest tool list.
+   */
+  private toolsFetchWaiters: Array<{ version: number; resolve: () => void }> = [];
+
   constructor() {
     super();
     this.server = http.createServer((req, res) => this.#onRequest(req, res));
@@ -107,6 +122,30 @@ export class McpHub extends EventEmitter {
         description: d.description ?? '',
         inputSchema: originalSchema,
       };
+    });
+    this.toolsVersion++;
+  }
+
+  /**
+   * Wait until an MCP client (the mcp-proxy) has fetched the current
+   * tool list via GET /tools. This resolves the race condition where
+   * refreshMcpServers returns before the proxy has actually loaded
+   * the tools.
+   */
+  async waitForToolsFetch(timeoutMs = 10_000): Promise<void> {
+    // Already fetched — return immediately
+    if (this.lastServedVersion >= this.toolsVersion) return;
+    return new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        // Remove this waiter from the list
+        this.toolsFetchWaiters = this.toolsFetchWaiters.filter(w => w.resolve !== wrappedResolve);
+        resolve(); // Don't reject — just proceed (best-effort)
+      }, timeoutMs);
+      const wrappedResolve = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+      this.toolsFetchWaiters.push({ version: this.toolsVersion, resolve: wrappedResolve });
     });
   }
 
@@ -197,6 +236,16 @@ export class McpHub extends EventEmitter {
 
   /** GET /tools → return tools in MCP format */
   #handleToolsList(res: http.ServerResponse): void {
+    this.lastServedVersion = this.toolsVersion;
+    // Wake up any waiters that were waiting for this fetch
+    const currentVersion = this.toolsVersion;
+    this.toolsFetchWaiters = this.toolsFetchWaiters.filter(w => {
+      if (w.version <= currentVersion) {
+        w.resolve();
+        return false;
+      }
+      return true;
+    });
     res.writeHead(200);
     res.end(JSON.stringify({ tools: this.tools }));
   }
@@ -439,7 +488,17 @@ export function cleanAndFixArguments(args: any, schema: any): any {
  * Unpacks metadata tool calls (e.g. call_mcp_tool) into their target tool name and arguments.
  */
 export function unpackMetaCall(name: string, args: any): { name: string; args: any } {
-  if (name === 'call_mcp_tool' && args && typeof args === 'object') {
+  let resolvedName = name;
+  // Strip MCP server prefix if present (safety net for models that prepend it)
+  const MCP_PREFIX = 'claude2gemini-mcp-proxy:';
+  const MCP_ALT_PREFIX = 'claude2gemini-mcp-proxy__';
+  if (typeof resolvedName === 'string' && resolvedName.startsWith(MCP_PREFIX)) {
+    resolvedName = resolvedName.slice(MCP_PREFIX.length);
+  } else if (typeof resolvedName === 'string' && resolvedName.startsWith(MCP_ALT_PREFIX)) {
+    resolvedName = resolvedName.slice(MCP_ALT_PREFIX.length);
+  }
+
+  if (resolvedName === 'call_mcp_tool' && args && typeof args === 'object') {
     const toolName = args.ToolName || args.toolName;
     const toolArgs = args.Arguments || args.arguments;
     if (toolName && typeof toolName === 'string') {
@@ -449,5 +508,5 @@ export function unpackMetaCall(name: string, args: any): { name: string; args: a
       };
     }
   }
-  return { name, args };
+  return { name: resolvedName, args };
 }
