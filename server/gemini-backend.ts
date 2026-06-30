@@ -58,7 +58,7 @@ import { Cascade } from 'antigravity-client';
 import { Launcher } from 'antigravity-client/dist/src/server/launcher.js';
 import type { ApprovalRequest } from 'antigravity-client/dist/src/types.js';
 import type { ConnectError } from '@connectrpc/connect';
-import { McpHub } from './mcp-hub.js';
+import { McpHub, cleanAndFixArguments } from './mcp-hub.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { writeFile, mkdir, rm } from 'node:fs/promises';
@@ -1343,6 +1343,11 @@ Instead, call the tools directly by their native names as listed above (e.g. cal
               const argsStr = (m.toolCall as any)?.argumentsJson || (m.toolCall as any)?.arguments_json || (m.toolCall as any)?.arguments || '{}';
               let parsedArgs = {};
               try { parsedArgs = typeof argsStr === 'string' ? JSON.parse(argsStr) : argsStr; } catch (e) {}
+
+              const originalSchema = this.mcpHub.getOriginalSchema(toolName);
+              if (originalSchema) {
+                parsedArgs = cleanAndFixArguments(parsedArgs, originalSchema);
+              }
 
               console.log(`[Backend Debug] Comparing pending calls with trajectory step: toolName="${toolName}", parsedArgs=${JSON.stringify(parsedArgs)}`);
               
