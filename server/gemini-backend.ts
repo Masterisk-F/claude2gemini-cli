@@ -1399,19 +1399,22 @@ CRITICAL: Do NOT prefix tool names with the MCP server name. Use \`Bash\`, NOT \
         const toolsHash = JSON.stringify(tools);
         if (this.lastRegisteredToolsHash !== toolsHash) {
           this.lastRegisteredToolsHash = toolsHash;
-          // Await refreshMcpProxyOnLS fully on the first turn (no inflight cascades)
-          // to prevent "unknown tool" errors. If there are active cascades, use a
-          // short timeout to avoid deadlocks (e.g. subagent calling during a turn).
-          const refreshPromise = this.#refreshMcpProxyOnLS().catch(err => {
-            console.warn('[Backend] Background refreshMcpProxyOnLS error:', err);
-          });
           if (this.inflightCascades.size === 0) {
-            await refreshPromise;
+            // First request: await full refresh so tools are loaded before
+            // the model generates. This blocks until the proxy has fetched
+            // the tool list from McpHub.
+            try {
+              await this.#refreshMcpProxyOnLS();
+            } catch (err) {
+              console.warn('[Backend] refreshMcpProxyOnLS error:', err);
+            }
           } else {
-            await Promise.race([
-              refreshPromise,
-              new Promise(resolve => setTimeout(resolve, 1500))
-            ]);
+            // Subsequent request with inflight cascades: skip the
+            // refreshMcpServers RPC to avoid blocking the LS (which is
+            // busy processing active cascades). The mcp-proxy's 1-second
+            // polling will detect the updated tool list and notify the LS
+            // via notifications/tools/list_changed automatically.
+            console.log('[Backend] Skipping refreshMcpProxyOnLS (inflight cascades active, proxy polling will pick up tool changes)');
           }
         }
       }
