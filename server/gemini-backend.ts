@@ -166,6 +166,9 @@ export class AntigravityBackend {
   /** Interval for purging inactive sessions from the store */
   private sessionPurgeInterval?: NodeJS.Timeout;
   private initPromise: Promise<void> | null = null;
+  /** Cached model ID to avoid repeated LS RPC calls */
+  private modelIdCache = new Map<string, number>();
+  private defaultModelIdCache: number | null = null;
 
   async initialize(): Promise<void> {
     if (this.client) return;
@@ -1445,18 +1448,26 @@ CRITICAL: Do NOT prefix tool names with the MCP server name. Use \`Bash\`, NOT \
       const toolNameById = buildToolNameLookup(prevAssistantMsg);
 
       // Resolve the model ID BEFORE starting the cascade.
-      // Antigravity 2.1.4 throws `GetCascadeModelConfigData() is nil` if
-      // `getUserStatus` is called and no settings.json exists (e.g. headless docker).
+      // Use cached values when available to avoid blocking LS RPCs when
+      // the LS is busy processing other cascades.
       let resolvedModelId: number;
-      try {
-        resolvedModelId = await this.client!.getDefaultModelId();
-      } catch (e) {
-        resolvedModelId = 334; // Absolute fallback if even default fails
+      if (request.model && this.modelIdCache.has(request.model)) {
+        resolvedModelId = this.modelIdCache.get(request.model)!;
+      } else if (this.defaultModelIdCache !== null) {
+        resolvedModelId = this.defaultModelIdCache;
+      } else {
+        try {
+          resolvedModelId = await this.client!.getDefaultModelId();
+          this.defaultModelIdCache = resolvedModelId;
+        } catch (e) {
+          resolvedModelId = 334; // Absolute fallback if even default fails
+        }
       }
 
       try {
-        if (request.model) {
+        if (request.model && !this.modelIdCache.has(request.model)) {
           resolvedModelId = await this.client!.resolveModelId(request.model);
+          this.modelIdCache.set(request.model, resolvedModelId);
         }
       } catch (err) {
         console.warn(`[Backend] Failed to resolve model ID "${request.model}", using default fallback: ${err instanceof Error ? err.message : String(err)}`);
