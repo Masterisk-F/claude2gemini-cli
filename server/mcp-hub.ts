@@ -154,6 +154,11 @@ export class McpHub extends EventEmitter {
     return this.tools;
   }
 
+  /** Return the original input_schema for a tool (for argument validation). */
+  getOriginalSchema(name: string): any {
+    return this.originalSchemas.get(name);
+  }
+
   // ── Call management ──
 
   /**

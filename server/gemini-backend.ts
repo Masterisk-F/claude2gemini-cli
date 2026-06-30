@@ -1751,6 +1751,25 @@ CRITICAL: Do NOT prefix tool names with the MCP server name. Use \`Bash\`, NOT \
               }).catch(() => {});
               continue;
             }
+
+            // Reject tool calls with empty/invalid arguments (e.g., Read {} without path)
+            // to prevent LS from hanging indefinitely on invalid calls.
+            const schema = this.mcpHub.getOriginalSchema?.(call.name);
+            if (schema && schema.required && Array.isArray(schema.required)) {
+              const missingRequired = schema.required.filter((req: string) => {
+                const val = call.args?.[req];
+                return val === undefined || val === null || val === '';
+              });
+              if (missingRequired.length > 0) {
+                console.log(`[Backend] Rejecting tool call with missing required args: ${call.name} missing ${missingRequired.join(', ')}`);
+                this.mcpHub.resolveCall(call.callId, {
+                  content: [{ type: 'text', text: `Error: Tool ${call.name} requires arguments: ${missingRequired.join(', ')}` }],
+                  isError: true,
+                }).catch(() => {});
+                continue;
+              }
+            }
+
             yieldedAnyTool = true;
             yield { type: 'tool_call', sessionId: requestId, callId: call.callId, name: call.name, args: call.args };
           }
