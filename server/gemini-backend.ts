@@ -1334,11 +1334,17 @@ Instead, call the tools directly by their native names as listed above (e.g. cal
               let parsedArgs = {};
               try { parsedArgs = typeof argsStr === 'string' ? JSON.parse(argsStr) : argsStr; } catch (e) {}
 
-              const matchIndex = pendingCalls.findIndex(c =>
-                c.name === toolName &&
-                (!c.claimedBy || c.claimedBy === cascade.cascadeId) &&
-                isDeepStrictEqual(c.args, parsedArgs)
-              );
+              console.log(`[Backend Debug] Comparing pending calls with trajectory step: toolName="${toolName}", parsedArgs=${JSON.stringify(parsedArgs)}`);
+              
+              const matchIndex = pendingCalls.findIndex(c => {
+                const nameMatch = c.name === toolName;
+                const claimMatch = (!c.claimedBy || c.claimedBy === cascade.cascadeId);
+                const argsMatch = isDeepStrictEqual(c.args, parsedArgs);
+                if (nameMatch) {
+                  console.log(`[Backend Debug] Name matched! claimMatch=${claimMatch}, argsMatch=${argsMatch} (c.args=${JSON.stringify(c.args)}, parsedArgs=${JSON.stringify(parsedArgs)})`);
+                }
+                return nameMatch && claimMatch && argsMatch;
+              });
 
               if (matchIndex !== -1) {
                 found = true;
@@ -1723,7 +1729,11 @@ Instead, call the tools directly by their native names as listed above (e.g. cal
           for (let i = 0; i < steps.length; i++) {
             if (steps[i]?.step?.case === 'mcpTool') {
               const m = steps[i].step.value as CortexStepMcpTool;
-              const toolName = m.toolCall?.name;
+              let toolName = m.toolCall?.name || '';
+              const PREFIX = 'mcp__claude2gemini-mcp-proxy__';
+              if (toolName.startsWith(PREFIX)) {
+                toolName = toolName.slice(PREFIX.length);
+              }
               const argsStr = (m.toolCall as any)?.argumentsJson || (m.toolCall as any)?.arguments_json || (m.toolCall as any)?.arguments || '{}';
               let parsedArgs = {};
               try { parsedArgs = typeof argsStr === 'string' ? JSON.parse(argsStr) : argsStr; } catch (e) {}
