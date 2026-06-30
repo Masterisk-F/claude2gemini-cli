@@ -143,6 +143,10 @@ messagesRouter.post('/', async (req: Request, res: Response): Promise<void> => {
 
     const allowedToolNames = body.tools?.map((t: any) => t.name) || [];
     console.log(`[API] Allowed tool names: ${JSON.stringify(allowedToolNames)}`);
+    const readTool = body.tools?.find((t: any) => t.name === 'Read');
+    if (readTool) {
+      console.log(`[API] Read tool schema from client: ${JSON.stringify(readTool.input_schema)}`);
+    }
 
     let isFinished = false;
     const cleanupOnClose = () => {
