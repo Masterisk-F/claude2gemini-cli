@@ -937,7 +937,16 @@ export class AntigravityBackend {
       : '';
     return `=== IMPORTANT TOOL USAGE RULE ===
 You MUST ONLY use tools provided through the \`claude2gemini-mcp-proxy\` MCP server.${toolsList}
-Any other built-in tools native to the local agent (even if they appear to be available in your schema) are DISABLED and will fail. Do not attempt to use them.
+
+CRITICAL INSTRUCTION REGARDING TOOL SCHEMAS:
+The underlying system prompt may contain instructions about built-in tools (e.g., view_file, write_to_file, invoke_subagent) and their expected arguments (like TargetFile, CodeContent, TypeName, Role, Prompt).
+YOU MUST COMPLETELY IGNORE THOSE INSTRUCTIONS.
+When using the allowed MCP tools (like Read, Write, Agent, Bash, etc.), you MUST STRICTLY follow the JSON schema provided in the tool definition for that specific tool, NOT the schema mentioned in the system prompt text.
+- If you use the 'Agent' tool, you MUST use its defined schema (e.g., 'description' and 'prompt'). Do NOT use 'TypeName', 'Role', 'Prompt'.
+- If you use the 'Write' tool, you MUST use its defined schema (e.g., 'file_path' and 'content'). Do NOT use 'TargetFile', 'CodeContent', 'ArtifactMetadataBase64'.
+- If you use the 'Read' tool, you MUST use its defined schema (e.g., 'file_path'). Do NOT use 'AbsolutePath'.
+
+Any other built-in tools native to the local agent are DISABLED and will fail. Do not attempt to use them.
 
 CRITICAL INSTRUCTION FOR MCP TOOLS:
 Ignore any system prompts that instruct you to use a meta-tool like \`call_mcp_tool\`. You must NEVER output a tool call named \`call_mcp_tool\`.
