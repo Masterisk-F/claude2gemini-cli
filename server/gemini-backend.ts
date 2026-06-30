@@ -1102,6 +1102,8 @@ Instead, call the tools directly by their native names as listed above (e.g. cal
     // surfaces errors to the client; once disposal begins, swallowing any
     // trailing error is the correct behaviour.
     cascade.on('error', () => { /* swallow post-dispose errors */ });
+    // Clear any stale pending tool calls to prevent them from interfering with future runs.
+    this.mcpHub.clearPendingCalls('Cascade disposed');
 
     try {
       const status = cascade.state?.status ?? 0;
@@ -1278,8 +1280,7 @@ Instead, call the tools directly by their native names as listed above (e.g. cal
     cascade: Cascade,
     timeoutMs = 120_000,
   ): Promise<'idle' | 'tool_call'> {
-    // If a tool call is already pending, return immediately
-    if (this.mcpHub.hasPendingCalls()) return 'tool_call';
+    // We must wait to verify the tool call exists in the trajectory.
 
     return new Promise<'idle' | 'tool_call'>((resolve, reject) => {
       let settled = false;
