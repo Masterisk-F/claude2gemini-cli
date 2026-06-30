@@ -1331,12 +1331,12 @@ CRITICAL: Do NOT prefix tool names with the MCP server name. Use \`Bash\`, NOT \
               let parsedArgs = {};
               try { parsedArgs = typeof argsStr === 'string' ? JSON.parse(argsStr) : argsStr; } catch (e) {}
 
-              const matchIndex = pendingCalls.findIndex(c => 
+              const matchIndex = pendingCalls.findIndex(c =>
                 c.name === toolName &&
                 (!c.claimedBy || c.claimedBy === cascade.cascadeId) &&
                 isDeepStrictEqual(c.args, parsedArgs)
               );
-              
+
               if (matchIndex !== -1) {
                 found = true;
                 break;
@@ -1347,6 +1347,11 @@ CRITICAL: Do NOT prefix tool names with the MCP server name. Use \`Bash\`, NOT \
             if (!settled) { settled = true; cleanup(); resolve('tool_call'); }
             return;
           }
+
+          // Pending calls exist but not yet visible in trajectory — LS is
+          // still processing them. Reset idle counter and DO NOT resolve
+          // idle to avoid premature stream termination.
+          consecutiveIdleCount = 0;
         }
 
         if (cascade.state?.status === CascadeRunStatus.IDLE) {
