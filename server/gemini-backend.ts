@@ -333,6 +333,18 @@ export class AntigravityBackend {
     } catch (err) {
       console.warn('[Backend] waitForToolsFetch timed out (non-fatal):', err);
     }
+
+    // Even after the proxy serves the tool list, the LS needs additional
+    // time to fully integrate the tools into its planner context. Without
+    // this delay, the first tool call in a new cascade may fail with
+    // "unknown tool name" because the planner hasn't finished processing
+    // the tool registration. This delay only applies during server
+    // initialization and first-request tool refresh — subsequent requests
+    // reuse the already-registered tools.
+    if (this.mcpHub.getTools().length > 0) {
+      await new Promise(resolve => setTimeout(resolve, 3000));
+      console.log('[Backend] Post-refresh delay complete (3s)');
+    }
   }
 
   /**
