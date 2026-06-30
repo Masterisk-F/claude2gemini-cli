@@ -1286,6 +1286,7 @@ Instead, call the tools directly by their native names as listed above (e.g. cal
    */
   private async waitForTurnOrToolCall(
     cascade: Cascade,
+    stepCountBefore: number,
     timeoutMs = 120_000,
   ): Promise<'idle' | 'tool_call'> {
     // We must wait to verify the tool call exists in the trajectory.
@@ -1331,7 +1332,7 @@ Instead, call the tools directly by their native names as listed above (e.g. cal
         const pendingCalls = this.mcpHub.getPendingCalls();
         if (pendingCalls.length > 0) {
           let found = false;
-          for (let i = steps.length - 1; i >= 0; i--) {
+          for (let i = steps.length - 1; i >= stepCountBefore; i--) {
             if (steps[i]?.step?.case === 'mcpTool') {
               const m = steps[i].step.value as CortexStepMcpTool;
               let toolName = m.toolCall?.name || '';
@@ -1662,7 +1663,7 @@ Instead, call the tools directly by their native names as listed above (e.g. cal
       while (true) {
         console.log(`[Backend] >>> waitForTurnOrToolCall START (requestId=${requestId}, cascade status=${cascade.state?.status}, pendingCalls=${this.mcpHub.hasPendingCalls()})`);
         try {
-          turn = await this.waitForTurnOrToolCall(cascade);
+          turn = await this.waitForTurnOrToolCall(cascade, stepCountBefore);
           console.log(`[Backend] <<< waitForTurnOrToolCall DONE (requestId=${requestId}, turn=${turn}, cascade status=${cascade.state?.status})`);
         } catch (err: any) {
           if (err?.message?.includes('timeout')) {
