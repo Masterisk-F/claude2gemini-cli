@@ -1252,6 +1252,11 @@ CRITICAL: Do NOT prefix tool names with the MCP server name. Use \`Bash\`, NOT \
       if (step.step?.case === 'errorMessage') {
         const errMsg = step.step.value;
         const details = errMsg.error;
+        // Skip benign errors — the LS marks tool-call parse failures as
+        // isBenign=true when it intends to retry internally. Returning
+        // these to the client would prematurely terminate the stream
+        // when the LS will self-correct on the next attempt.
+        if (details?.isBenign) continue;
         console.error(`[Backend] Error step found at ${i}:`, JSON.stringify(details, null, 2));
         return details?.userErrorMessage || details?.shortError || details?.fullError || 'Unknown Antigravity LS error';
       }
