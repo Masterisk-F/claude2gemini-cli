@@ -1477,6 +1477,31 @@ CRITICAL: Do NOT prefix tool names with the MCP server name. Use \`Bash\`, NOT \
       );
       const apiKey = process.env.ANTIGRAVITY_API_KEY || '';
 
+      // Resolve tool results BEFORE cascade lookup.
+      // If the LS is busy waiting for tool results, getHistory() in
+      // #findParentCascadeByPrefix would block indefinitely, causing
+      // a deadlock: the LS waits for the tool result, but the tool
+      // result won't be sent until getHistory() completes.
+      const toolResults = Array.isArray(currentUserMessage.content)
+        ? currentUserMessage.content.filter((b): b is ClaudeToolResultBlock => b.type === 'tool_result')
+        : [];
+      const hasToolResult = toolResults.length > 0;
+
+      let resolvedCount = 0;
+      if (hasToolResult) {
+        for (const tr of toolResults) {
+          try {
+            await this.mcpHub.resolveCall(tr.tool_use_id, {
+              content: typeof tr.content === 'string' ? [{ type: 'text', text: tr.content }] : tr.content,
+              isError: tr.is_error || false,
+            });
+            resolvedCount++;
+          } catch (err) {
+            console.warn(`[Backend] Failed to resolve tool call ${tr.tool_use_id} (may be stale):`, err);
+          }
+        }
+      }
+
       // Cascade lookup must run BEFORE we build the new-turn text, because
       // we only want to prepend the system prompt on the FIRST turn of a
       // new cascade. On re-attach (prefix match hit), the model already has
@@ -1537,26 +1562,6 @@ CRITICAL: Do NOT prefix tool names with the MCP server name. Use \`Bash\`, NOT \
           `=== CASCADE HISTORY (requestId=${requestId}, cascadeId=${matchedCascadeId}, session_new=${createdNewCascade}, past_turns=${pastTurns.length}) ===`,
           debugMode,
         );
-      }
-
-      const toolResults = Array.isArray(currentUserMessage.content)
-        ? currentUserMessage.content.filter((b): b is ClaudeToolResultBlock => b.type === 'tool_result')
-        : [];
-      const hasToolResult = toolResults.length > 0;
-
-      let resolvedCount = 0;
-      if (hasToolResult) {
-        for (const tr of toolResults) {
-          try {
-            await this.mcpHub.resolveCall(tr.tool_use_id, {
-              content: typeof tr.content === 'string' ? [{ type: 'text', text: tr.content }] : tr.content,
-              isError: tr.is_error || false,
-            });
-            resolvedCount++;
-          } catch (err) {
-            console.warn(`[Backend] Failed to resolve tool call ${tr.tool_use_id} (may be stale):`, err);
-          }
-        }
       }
 
       // If we successfully resolved at least one pending tool call, the Language Server
