@@ -1,26 +1,34 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { classifyError } from '../server/routes/messages.js';
-import { childManager } from '../server/child-manager.js';
-import { sessionStore } from '../server/session-store.js';
+import { antigravityBackend, GeminiApiError } from '../server/gemini-backend.js';
+import express from 'express';
+import request from 'supertest';
+import { messagesRouter } from '../server/routes/messages.js';
 
-vi.mock('../server/child-manager.js', () => ({
-  childManager: {
-    sendRequest: vi.fn(() => Promise.resolve({ type: 'success' })),
-    onMessage: vi.fn(() => () => {}),
-    onChildExit: vi.fn(() => () => {}),
-  }
-}));
+vi.mock('../server/gemini-backend.js', () => {
+  return {
+    GeminiApiError: class extends Error {
+        constructor(message: string, public status?: number) {
+            super(message);
+        }
+    },
+    antigravityBackend: {
+      initialize: vi.fn().mockResolvedValue(undefined),
+      createMessageStream: vi.fn(),
+      shutdown: vi.fn().mockResolvedValue(undefined),
+      cancelSession: vi.fn().mockResolvedValue(undefined),
+    }
+  };
+});
+
+const app = express();
+app.use(express.json());
+app.use('/', messagesRouter);
 
 describe('messages route error handling', () => {
   describe('classifyError', () => {
     it('classifies QUOTA_EXHAUSTED as overloaded_error', () => {
       const result = classifyError(new Error('QUOTA_EXHAUSTED'));
-      expect(result.statusCode).toBe(500);
-      expect(result.errorType).toBe('overloaded_error');
-    });
-
-    it('classifies RESOURCE_EXHAUSTED as overloaded_error', () => {
-      const result = classifyError(new Error('RESOURCE_EXHAUSTED'));
       expect(result.statusCode).toBe(500);
       expect(result.errorType).toBe('overloaded_error');
     });
@@ -33,122 +41,177 @@ describe('messages route error handling', () => {
       expect(result.errorType).toBe('overloaded_error');
     });
 
-    it('classifies TerminalQuotaError as overloaded_error', () => {
-      const error: any = new Error('Terminal quota exceeded');
-      error.name = 'TerminalQuotaError';
-      const result = classifyError(error);
-      expect(result.statusCode).toBe(500);
-      expect(result.errorType).toBe('overloaded_error');
-    });
-
     it('classifies generic error as api_error 500', () => {
       const result = classifyError(new Error('Unknown generic error'));
       expect(result.statusCode).toBe(500);
       expect(result.errorType).toBe('api_error');
     });
+
+    it('maps ConnectRPC ResourceExhausted (code=8) to 429 overloaded_error', () => {
+      const error: any = new Error('[resource_exhausted] quota exceeded');
+      error.code = 8;
+      const result = classifyError(error);
+      expect(result.statusCode).toBe(429);
+      expect(result.errorType).toBe('overloaded_error');
+    });
+
+    it('maps ConnectRPC Unauthenticated (code=16) to 401 authentication_error', () => {
+      const error: any = new Error('[unauthenticated] auth required');
+      error.code = 16;
+      const result = classifyError(error);
+      expect(result.statusCode).toBe(401);
+      expect(result.errorType).toBe('authentication_error');
+    });
+
+    it('maps ConnectRPC Unavailable (code=14) to 503 api_error', () => {
+      const error: any = new Error('[unavailable] service unavailable');
+      error.code = 14;
+      const result = classifyError(error);
+      expect(result.statusCode).toBe(503);
+      expect(result.errorType).toBe('api_error');
+    });
+
+    it('maps ConnectRPC DeadlineExceeded (code=4) to 504 api_error', () => {
+      const error: any = new Error('[deadline_exceeded] timeout');
+      error.code = 4;
+      const result = classifyError(error);
+      expect(result.statusCode).toBe(504);
+      expect(result.errorType).toBe('api_error');
+    });
+
+    it('maps ConnectRPC PermissionDenied (code=7) to 403 authentication_error', () => {
+      const error: any = new Error('[permission_denied] denied');
+      error.code = 7;
+      const result = classifyError(error);
+      expect(result.statusCode).toBe(403);
+      expect(result.errorType).toBe('authentication_error');
+    });
   });
 });
-import express from 'express';
-import request from 'supertest';
-import { messagesRouter } from '../server/routes/messages.js';
-import { accountPool } from '../server/account-pool.js';
-
-vi.mock('../server/account-pool.js', () => ({
-  accountPool: {
-    nextAccount: vi.fn(() => 'test-account-1'),
-  }
-}));
-
-vi.mock('../server/session-store.js', () => ({
-  sessionStore: {
-    resolveToolCall: vi.fn(),
-    getSession: vi.fn(),
-    getOrCreateSession: vi.fn(() => ({ accountId: 'test-account-1' })),
-    addPendingToolCall: vi.fn(),
-    deleteSession: vi.fn(),
-  }
-}));
-
-const app = express();
-app.use(express.json());
-app.use('/', messagesRouter);
 
 describe('POST /', () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
 
-  it('cancels pending session and falls back to stateless when text and tool_result are mixed', async () => {
-    // Mock resolveToolCall to return a mock session ID
-    (sessionStore.resolveToolCall as any).mockReturnValue('mock-session-id');
-    (sessionStore.getSession as any).mockReturnValue({ accountId: 'test-account-1' });
+  it('returns successful response for a simple message', async () => {
+    async function* mockStream() {
+      yield { type: 'stream_event', event: { type: 'content', value: 'Hello' } };
+      yield { type: 'turn_end', usage: { input_tokens: 10, output_tokens: 5, context_window_estimated_tokens: 30000 } };
+    }
+    (antigravityBackend.createMessageStream as any).mockReturnValue(mockStream());
 
     const payload = {
       model: 'claude-3-opus-20240229',
-      messages: [
-        {
-          role: 'user',
-          content: [
-            {
-              type: 'tool_result',
-              tool_use_id: 'tool_123',
-              content: 'Original tool result'
-            },
-            {
-              type: 'text',
-              text: 'User additional instruction'
-            }
-          ]
-        }
-      ]
+      messages: [{ role: 'user', content: 'Hi' }]
     };
 
-    const promise = request(app)
+    const res = await request(app)
       .post('/')
-      .send(payload)
-      .expect(200);
+      .send(payload);
 
-    // Provide content so buildClaudeResponse doesn't throw
-    // We need to wait for the request to be sent to get the new sessionId
-    const waitPromise = vi.waitFor(() => {
-      const onMessageCalls = (childManager.onMessage as any).mock.calls;
-      if (onMessageCalls.length === 0) throw new Error('onMessage not called');
-      const callback = onMessageCalls[0][1];
+    expect(res.status).toBe(200);
+    expect(res.body.content[0].text).toBe('Hello');
+    expect(res.body.usage.input_tokens).toBe(10);
+    expect(res.body.usage.output_tokens).toBe(5);
+    expect(res.body.usage.context_window_estimated_tokens).toBe(30000);
+  });
 
-      const sendRequestCalls = (childManager.sendRequest as any).mock.calls;
-      const requestCall = sendRequestCalls.find((c: any) => c[1].type === 'request');
-      if (!requestCall) throw new Error('request call not found');
+  describe('request ID generation', () => {
+    it('generates a fresh requestId prefixed with req_ for every request', async () => {
+      async function* mockStream() {
+        yield { type: 'turn_end', usage: { input_tokens: 5, output_tokens: 3 } };
+      }
+      (antigravityBackend.createMessageStream as any).mockReturnValue(mockStream());
 
-      const newSessionId = requestCall[1].sessionId;
-      callback({ type: 'stream_event', sessionId: newSessionId, event: { type: 'content', value: 'Hello' } });
-      callback({ type: 'turn_end', sessionId: newSessionId });
+      const payload = {
+        model: 'claude-3-opus-20240229',
+        messages: [{ role: 'user', content: 'Just a simple message' }],
+      };
+
+      await request(app).post('/').send(payload);
+
+      const callArgs = (antigravityBackend.createMessageStream as any).mock.calls[0];
+      expect(callArgs[0]).toMatch(/^req_/);
     });
 
-    await Promise.all([promise, waitPromise]);
+    it('does NOT honor x-session-id header (stateless — every request is independent)', async () => {
+      async function* mockStream() {
+        yield { type: 'turn_end', usage: { input_tokens: 5, output_tokens: 3 } };
+      }
+      (antigravityBackend.createMessageStream as any).mockReturnValue(mockStream());
 
-    // 1. Verify session was deleted from store
-    expect(sessionStore.deleteSession).toHaveBeenCalledWith('mock-session-id');
+      const payload = {
+        model: 'claude-3-opus-20240229',
+        messages: [{ role: 'user', content: 'Hi' }],
+      };
 
-    // 2. Verify cancel_session was sent to child worker
-    expect(childManager.sendRequest).toHaveBeenCalledWith(
-      'test-account-1',
-      expect.objectContaining({
-        type: 'cancel_session',
-        sessionId: 'mock-session-id'
-      })
-    );
+      await request(app)
+        .post('/')
+        .set('x-session-id', 'explicit-session-id')
+        .send(payload);
 
-    // 3. Verify a new request was sent (stateless mode)
-    expect(childManager.sendRequest).toHaveBeenCalledWith(
-      'test-account-1',
-      expect.objectContaining({
-        type: 'request',
-        messages: payload.messages
-      })
-    );
+      const callArgs = (antigravityBackend.createMessageStream as any).mock.calls[0];
+      // x-session-id is ignored: a fresh req_ id is always generated.
+      expect(callArgs[0]).toMatch(/^req_/);
+      expect(callArgs[0]).not.toBe('explicit-session-id');
+    });
 
-    // Verify it used a DIFFERENT session ID than the cancelled one
-    const requestCall = (childManager.sendRequest as any).mock.calls.find((c: any) => c[1].type === 'request');
-    expect(requestCall[1].sessionId).not.toBe('mock-session-id');
+    it('generates a unique requestId per call (no cross-request state)', async () => {
+      async function* mockStream() {
+        yield { type: 'turn_end', usage: { input_tokens: 5, output_tokens: 3 } };
+      }
+      (antigravityBackend.createMessageStream as any).mockReturnValue(mockStream());
+
+      const payload = {
+        model: 'claude-3-opus-20240229',
+        messages: [{ role: 'user', content: 'Hi' }],
+      };
+
+      await request(app).post('/').send(payload);
+      await request(app).post('/').send(payload);
+
+      const id1 = (antigravityBackend.createMessageStream as any).mock.calls[0][0];
+      const id2 = (antigravityBackend.createMessageStream as any).mock.calls[1][0];
+      expect(id1).toMatch(/^req_/);
+      expect(id2).toMatch(/^req_/);
+      expect(id1).not.toBe(id2);
+    });
+  });
+
+  it('calls cancelSession when client disconnects early', async () => {
+    async function* mockStream() {
+      yield { type: 'stream_event', event: { type: 'content', value: 'Hello' } };
+      // Wait indefinitely to simulate ongoing stream
+      await new Promise<void>(() => {});
+      yield { type: 'turn_end', usage: { input_tokens: 10, output_tokens: 5 } };
+    }
+
+    const cancelSpy = vi.spyOn(antigravityBackend, 'cancelSession').mockResolvedValue(undefined);
+    (antigravityBackend.createMessageStream as any).mockReturnValue(mockStream());
+
+    const reqObj = request(app)
+      .post('/')
+      .send({
+        model: 'claude-3-opus-20240229',
+        messages: [{ role: 'user', content: 'Hi' }],
+        stream: true
+      });
+
+    // Wait a brief moment to let request connect, then abort
+    setTimeout(() => {
+      reqObj.abort();
+    }, 50);
+
+    try {
+      await reqObj;
+    } catch (e) {
+      // Expected to throw due to abort
+    }
+
+    // Allow time for the close event listener and async cancelSession to be invoked
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(cancelSpy).toHaveBeenCalled();
   });
 });

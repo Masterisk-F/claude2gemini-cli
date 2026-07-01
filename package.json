@@ -5,15 +5,12 @@
   "type": "module",
   "scripts": {
     "dev": "tsx server/index.ts",
-    "build": "tsc",
+    "build": "tsc && cp server/mcp-proxy.mjs dist/server/mcp-proxy.mjs",
     "start": "node dist/server/index.js",
-    "account:add": "tsx cli/manage-accounts.ts add",
-    "account:list": "tsx cli/manage-accounts.ts list",
-    "account:remove": "tsx cli/manage-accounts.ts remove",
     "test": "vitest run --config ./vitest.config.ts"
   },
   "dependencies": {
-    "@google/gemini-cli-sdk": "file:./gemini-cli/packages/sdk",
+    "antigravity-client": "file:./antigravity-client",
     "express": "^5.1.0",
     "zod": "^3.23.8"
   },

@@ -32,7 +32,29 @@ This proxy uses the **Gemini CLI SDK**, which is included in the `gemini-cli` pa
 **Recommendations:**
 - Monitor your API usage and billing dashboard regularly
 - Be mindful of rate limits — high-frequency tool use loops can generate many API calls
-- Consider using `gemini-2.5-flash` (via model mapping) for lighter workloads to reduce costs
+- Consider using `gemini-flash` (via model mapping) for lighter workloads to reduce costs
+
+## Model Selection & Mapping
+
+Claude model names are automatically mapped to appropriate Antigravity/Gemini models. You can also use formal Antigravity model names directly.
+
+| Category | Input Model / Alias | Mapped Antigravity Model |
+| :--- | :--- | :--- |
+| **Claude Aliases** | `claude-opus` | `Claude_Opus_4.6_Thinking` |
+| | `claude-sonnet` | `Claude_Sonnet_4.6_Thinking` |
+| | `claude-haiku` | `Gemini_3.1_Flash_Lite` |
+| **Gemini Aliases** | `gemini-pro` | `Gemini_3.1_Pro_High` |
+| | `gemini-pro-low` | `Gemini_3.1_Pro_Low` |
+| | `gemini-flash` | `Gemini_3.5_Flash_High` |
+| | `gemini-flash-medium` | `Gemini_3.5_Flash_Medium` |
+| | `gemini-flash-low` | `Gemini_3.5_Flash_Low` |
+| | `gemini-flash-lite` | `Gemini_3.1_Flash_Lite` |
+| **Simple Aliases** | `pro`, `flash`, `flash-lite` | (Mapped to corresponding Gemini models) |
+| **Formal Names** | `Gemini_3.1_Pro_High`, etc. | (Used as-is) |
+| **Default** | (Unknown model names) | `Gemini_3.5_Flash_High` |
+
+> [!TIP]
+> Partial matches are also supported for aliases (e.g., `claude-3-5-sonnet-20240620` maps to `Claude_Sonnet_4.6_Thinking`).
 
 ## Installation & Setup
 
@@ -135,30 +157,35 @@ curl http://localhost:8080/health
 
 ## Running with Docker
 
-You can run Claude2Gemini-CLI in a Docker container. Accounts are persisted in a Docker volume.
+Claude2Gemini-CLI can be run seamlessly in a Docker container. The included `docker-compose.yml` is configured to build the proxy and automatically install the non-IDE version of Antigravity (Language Server) from AUR.
 
-### 1. Build and Start the Container
+### 1. Authentication Setup
+
+Because the proxy delegates to the Antigravity Language Server, the container must be authenticated. There are two ways to handle authentication in Docker:
+
+#### Option A: Mount Host Configuration (Recommended)
+By default, `docker-compose.yml` mounts your host machine's `~/.config/Antigravity` directory into the container. 
+This means if you are already logged in to Antigravity on your host machine, the container will share your session automatically.
+No further account setup is needed!
+
+#### Option B: Use API Key Environment Variable
+If you prefer not to mount your config directory, you can set the `ANTIGRAVITY_API_KEY` environment variable in your `docker-compose.yml`:
+```yaml
+    environment:
+      - ANTIGRAVITY_API_KEY=your_api_key_here
+```
+
+### 2. Build and Start the Container
 
 ```bash
 docker compose up -d --build
 ```
 
-### 2. Manage Accounts in Docker
+The server will start and be accessible on your host machine at `http://localhost:8111`.
 
-Since the management CLI is interactive, you must use `docker compose exec` to run it inside the container:
+> [!NOTE]  
+> The initial build process downloads and compiles the Antigravity Language Server package from AUR. This may take a few minutes.
 
-```bash
-# Add a new account
-docker compose exec -it claude2gemini npm run account:add
-
-# List accounts
-docker compose exec -it claude2gemini npm run account:list
-
-# Remove an account
-docker compose exec -it claude2gemini npm run account:remove
-```
-
-Registered account data is persisted via the `gemini-accounts` volume.
 
 ## License
 

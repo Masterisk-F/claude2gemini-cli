@@ -1,14 +1,8 @@
-/**
- * Gemini ストリームイベント → Claude SSE イベント変換
- *
- * gemini-cli-sdk の sendStream() が生成する ServerGeminiStreamEvent を、
- * Claude Messages API の SSE (Server-Sent Events) 形式に変換する。
- */
-
 import { randomUUID } from 'node:crypto';
 import type { Response } from 'express';
 import { GeminiApiError } from '../gemini-backend.js';
 import { classifyError } from '../routes/messages.js';
+import type { BridgeMessage } from '../types.js';
 
 /**
  * SSE レスポンスヘッダを設定する
@@ -110,14 +104,13 @@ function sendMessageEnd(res: Response, outputTokens: number): void {
 }
 
 /**
- * Child プロセスからのストリーム (ChildMessage) を Claude SSE イベントに変換して送信する
+ * Antigravity Backend からのストリーム (BridgeMessage) を Claude SSE イベントに変換して送信する
  */
 export async function streamGeminiToClaudeSSE(
-  childStream: AsyncGenerator<any>,
+  bridgeStream: AsyncGenerator<BridgeMessage>,
   res: Response,
   model: string,
   sessionId: string,
-  sessionStore: typeof import('../session-store.js').sessionStore,
   allowedToolNames: string[]
 ): Promise<void> {
   const messageId = `msg_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
@@ -157,12 +150,12 @@ export async function streamGeminiToClaudeSSE(
   };
 
   try {
-    for await (const msg of childStream) {
+    for await (const msg of bridgeStream) {
       if (msg.type === 'stream_event') {
         const chunk = msg.event;
         if (chunk.type === 'model_info') {
           try {
-            const info = JSON.parse(chunk.value);
+            const info = typeof chunk.value === 'string' ? JSON.parse(chunk.value) : chunk.value;
             estimatedInputTokens = info.estimated_input_tokens || 0;
           } catch (e) {}
           continue;
@@ -189,12 +182,12 @@ export async function streamGeminiToClaudeSSE(
         const callId = msg.callId;
         const name = msg.name;
 
-        if (!allowedToolNames.includes(name)) {
+        if (allowedToolNames.length > 0 && !allowedToolNames.includes(name)) {
           continue;
         }
 
-        // Parent 側のセッションストアに toolCallId -> sessionId のマッピングを登録
-        sessionStore.addPendingToolCall(sessionId, callId);
+        // Stateless: no session-scoped tool_call registry needed — each request
+        // is resolved in isolation against the live backend cascade.
 
         if (textBlockStarted) {
           sendContentBlockStop(res, blockIndex);
@@ -225,73 +218,6 @@ export async function streamGeminiToClaudeSSE(
         sendContentBlockStop(res, blockIndex);
         blockIndex++;
         hasProducedAnyBlock = true;
-      } else if (msg.type === 'server_tool_call') {
-        if (!messageStartSent) {
-          sendMessageStart(res, messageId, model, estimatedInputTokens);
-          messageStartSent = true;
-        }
-        if (textBlockStarted) {
-          sendContentBlockStop(res, blockIndex);
-          blockIndex++;
-          textBlockStarted = false;
-        }
-
-        webSearchRequests++;
-
-        sendSSE(res, 'content_block_start', {
-          type: 'content_block_start',
-          index: blockIndex,
-          content_block: {
-            type: 'server_tool_use',
-            id: msg.callId,
-            name: msg.name,
-            input: {},
-          },
-        });
-
-        sendSSE(res, 'content_block_delta', {
-          type: 'content_block_delta',
-          index: blockIndex,
-          delta: {
-            type: 'input_json_delta',
-            partial_json: JSON.stringify(msg.args),
-          },
-        });
-
-        sendContentBlockStop(res, blockIndex);
-        blockIndex++;
-        hasProducedAnyBlock = true;
-      } else if (msg.type === 'server_tool_result') {
-        if (!messageStartSent) {
-          sendMessageStart(res, messageId, model, estimatedInputTokens);
-          messageStartSent = true;
-        }
-        // 先行するテキストブロックがあれば終了させる
-        if (textBlockStarted) {
-          sendContentBlockStop(res, blockIndex);
-          blockIndex++;
-          textBlockStarted = false;
-        }
-
-        // web_search_tool_result をストリームに出力する
-        sendSSE(res, 'content_block_start', {
-          type: 'content_block_start',
-          index: blockIndex,
-          content_block: {
-            type: 'web_search_tool_result',
-            tool_use_id: msg.callId,
-            content: msg.result
-          }
-        });
-
-        sendContentBlockStop(res, blockIndex);
-        blockIndex++;
-        hasProducedAnyBlock = true;
-
-        // 次のテキストブロック用にソース情報を保持（citations用）
-        if (Array.isArray(msg.result)) {
-          pendingCitations = pendingCitations.concat(msg.result);
-        }
       } else if (msg.type === 'turn_end') {
         if (!messageStartSent) {
           sendMessageStart(res, messageId, model, estimatedInputTokens);
@@ -314,6 +240,7 @@ export async function streamGeminiToClaudeSSE(
             output_tokens: msg.usage?.output_tokens || 0,
             cache_read_input_tokens: msg.usage?.cache_read_input_tokens || 0,
             cache_creation_input_tokens: msg.usage?.cache_creation_input_tokens || 0,
+            ...(msg.usage?.context_window_estimated_tokens !== undefined ? { context_window_estimated_tokens: msg.usage.context_window_estimated_tokens } : {}),
             ...(webSearchRequests > 0 ? { server_tool_use: { web_search_requests: webSearchRequests } } : {}),
           },
         });
@@ -328,7 +255,7 @@ export async function streamGeminiToClaudeSSE(
           sendContentBlockStop(res, blockIndex);
           textBlockStarted = false;
         }
-        throw new GeminiApiError(msg.message, msg.status);
+        throw new GeminiApiError(msg.message, (msg as any).status);
       }
     }
 

@@ -1,27 +1,40 @@
-FROM node:20-slim
+FROM archlinux:base-devel
 
 WORKDIR /app
 
-# git はサブモジュールの取得や依存で必要になる場合があります
-RUN apt-get update && apt-get install -y git && rm -rf /var/lib/apt/lists/*
+# Install Node.js, npm, git, sqlite (for reading auth status)
+RUN pacman -Syu --noconfirm nodejs npm git sqlite
 
-# package.json および lock ファイルをコピーして依存をインストール
+# Create a non-root user for makepkg
+RUN useradd -m -G wheel builder && \
+    echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+
+# Install Antigravity from AUR
+USER builder
+RUN cd /tmp && \
+    git clone https://aur.archlinux.org/antigravity.git && \
+    cd antigravity && \
+    makepkg -si --noconfirm && \
+    cd / && rm -rf /tmp/antigravity
+
+# Switch back to root
+USER root
+
+# Copy package files and local libraries
+COPY antigravity-client ./antigravity-client
 COPY package*.json ./
-RUN npm install
 
-# ソースコード全体をコピー
+# Install dependencies and explicitly build the local library
+RUN npm install && cd antigravity-client && npm install && npm run build
+
+# Copy source code
 COPY . .
 
-# gemini-cli サブモジュールのビルド時に生じるシンボリックリンク・バンドルエラーを回避
-RUN cd gemini-cli && \
-    rm -rf docs && \
-    npm install && npm run build
-
-# アプリケーションのポートを公開 (デフォルト: 8080)
+# Expose proxy port
 EXPOSE 8080
 
-# 認証時の強制ブラウザ起動を抑制する環境変数。これによりターミナルにURLが出力され手動認証が可能になる
+# Environment variables
 ENV NO_BROWSER=true
+ENV ANTIGRAVITY_LS_BINARY=/usr/bin/antigravity
 
-# コンテナ起動コマンド。デフォルトで npm run dev なのでこのままにしておく
 CMD ["npm", "run", "dev"]
